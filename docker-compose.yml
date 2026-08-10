@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: task1-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: task1
+      POSTGRES_USER: task1
+      POSTGRES_PASSWORD: task1_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
