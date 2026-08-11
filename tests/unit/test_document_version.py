@@ -10,11 +10,12 @@ from domain.document_version import (
 
 def make_version(
     status: DocumentProcessingStatus = DocumentProcessingStatus.PENDING,
+    version_number: int = 1,
 ) -> DocumentVersion:
     return DocumentVersion(
         document_version_id="version-1",
         document_id="document-1",
-        version_number=1,
+        version_number=version_number,
         content_hash="abc123",
         storage_uri="documents/document-1/version-1",
         processing_status=status,
@@ -98,6 +99,19 @@ def test_default_status_is_pending() -> None:
         version.processing_status
         == DocumentProcessingStatus.PENDING
     )
+
+
+@pytest.mark.parametrize("version_number", [1, 2, 3])
+def test_document_version_accepts_positive_version_numbers(version_number: int) -> None:
+    version = make_version(version_number=version_number)
+
+    assert version.version_number == version_number
+
+
+@pytest.mark.parametrize("version_number", [0, -1])
+def test_document_version_rejects_non_positive_version_numbers(version_number: int) -> None:
+    with pytest.raises(ValueError):
+        make_version(version_number=version_number)
 
 
 def test_document_version_is_immutable() -> None:

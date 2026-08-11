@@ -197,6 +197,41 @@ def test_run_contains_trigger_document_version_id() -> None:
     assert run.trigger_document_version_id == "document-version-1"
 
 
+@pytest.mark.parametrize(
+    ("baseline_run_id", "blocked_on_run_id"),
+    [
+        (None, None),
+        ("baseline-run-1", None),
+        (None, "blocked-run-1"),
+    ],
+)
+def test_run_allows_exclusive_baseline_and_blocker(
+    baseline_run_id: str | None,
+    blocked_on_run_id: str | None,
+) -> None:
+    run = Run(
+        run_id="run-1",
+        pile_id="pile-1",
+        run_type=RunType.INITIAL,
+        baseline_run_id=baseline_run_id,
+        blocked_on_run_id=blocked_on_run_id,
+    )
+
+    assert run.baseline_run_id == baseline_run_id
+    assert run.blocked_on_run_id == blocked_on_run_id
+
+
+def test_run_rejects_baseline_and_blocker_together() -> None:
+    with pytest.raises(ValidationError, match="cannot both be set"):
+        Run(
+            run_id="run-1",
+            pile_id="pile-1",
+            run_type=RunType.INITIAL,
+            baseline_run_id="baseline-run-1",
+            blocked_on_run_id="blocked-run-1",
+        )
+
+
 def test_run_is_immutable() -> None:
     run = Run(
         run_id="run-1",

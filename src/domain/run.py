@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 
 class RunType(StrEnum):
@@ -40,6 +40,15 @@ class Run(BaseModel):
     parent_run_id: str | None = None
     baseline_run_id: str | None = None
     blocked_on_run_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_baseline_and_blocker(self) -> "Run":
+        if self.baseline_run_id is not None and self.blocked_on_run_id is not None:
+            raise ValueError(
+                "baseline_run_id and blocked_on_run_id cannot both be set",
+            )
+
+        return self
 
 
 VALID_RUN_TRANSITIONS: dict[RunStatus, set[RunStatus]] = {

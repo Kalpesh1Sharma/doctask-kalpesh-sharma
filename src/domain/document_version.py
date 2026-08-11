@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class DocumentProcessingStatus(StrEnum):
@@ -14,7 +14,7 @@ class DocumentVersion(BaseModel):
 
     document_version_id: str
     document_id: str
-    version_number: int
+    version_number: int = Field(gt=0)
     content_hash: str
     storage_uri: str
     processing_status: DocumentProcessingStatus = (

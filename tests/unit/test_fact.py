@@ -1,3 +1,6 @@
+import json
+from math import inf, nan
+
 import pytest
 from pydantic import ValidationError
 
@@ -24,12 +27,46 @@ def make_fact(object_value: object = "100000", **overrides: object) -> Fact:
         True,
         ["monthly", 1000, False],
         {"amount": 100000, "currency": "USD"},
+        None,
     ],
 )
 def test_fact_supports_json_compatible_object_values(object_value: object) -> None:
     fact = make_fact(object_value)
 
-    assert fact.object_value == object_value
+    assert fact.model_dump(mode="json")["object_value"] == object_value
+    assert json.loads(fact.model_dump_json())["object_value"] == object_value
+
+
+def test_fact_object_value_is_deeply_immutable() -> None:
+    fact = make_fact(
+        {
+            "nested": {
+                "items": [
+                    {"amount": 100000},
+                ],
+            },
+        },
+    )
+
+    with pytest.raises(TypeError):
+        fact.object_value["nested"] = "changed"
+
+    with pytest.raises(AttributeError):
+        fact.object_value["nested"]["items"].append("changed")
+
+    with pytest.raises(TypeError):
+        fact.object_value["nested"]["items"][0]["amount"] = 1
+
+
+@pytest.mark.parametrize("object_value", [nan, inf, -inf])
+def test_fact_rejects_non_standard_numeric_values(object_value: float) -> None:
+    with pytest.raises(ValidationError, match="non-finite"):
+        make_fact(object_value)
+
+
+def test_fact_rejects_nested_non_standard_numeric_values() -> None:
+    with pytest.raises(ValidationError, match="non-finite"):
+        make_fact({"amounts": [100000, nan]})
 
 
 def test_fact_defaults_to_confirmed() -> None:
