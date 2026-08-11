@@ -1,4 +1,5 @@
 from psycopg import OperationalError
+from psycopg_pool import PoolTimeout
 
 from db.pool import pool
 
@@ -9,5 +10,5 @@ def check_database() -> bool:
             result = connection.execute("SELECT 1").fetchone()
 
         return result == (1,)
-    except OperationalError:
+    except (OperationalError, PoolTimeout):
         return False

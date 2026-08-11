@@ -1,18 +1,41 @@
 import pytest
+from pydantic import ValidationError
 
 from domain.fact import Fact, FactStatus
 
 
-def test_fact_defaults_to_confirmed() -> None:
-    fact = Fact(
-        fact_id="fact-1",
-        origin_run_id="run-1",
-        subject="Contract A",
-        predicate="has_value",
-        object_value="100000",
-    )
+def make_fact(object_value: object = "100000", **overrides: object) -> Fact:
+    values: dict[str, object] = {
+        "fact_id": "fact-1",
+        "origin_run_id": "run-1",
+        "subject": "Contract A",
+        "predicate": "has_value",
+        "object_value": object_value,
+    }
+    values.update(overrides)
+    return Fact(**values)
 
-    assert fact.status == FactStatus.CONFIRMED
+
+@pytest.mark.parametrize(
+    "object_value",
+    [
+        "100000",
+        100000,
+        True,
+        ["monthly", 1000, False],
+        {"amount": 100000, "currency": "USD"},
+    ],
+)
+def test_fact_supports_json_compatible_object_values(object_value: object) -> None:
+    fact = make_fact(object_value)
+
+    assert fact.object_value == object_value
+
+
+def test_fact_defaults_to_confirmed() -> None:
+    fact = make_fact()
+
+    assert fact.status is FactStatus.CONFIRMED
 
 
 @pytest.mark.parametrize(
@@ -24,16 +47,9 @@ def test_fact_defaults_to_confirmed() -> None:
     ],
 )
 def test_fact_supports_all_statuses(status: FactStatus) -> None:
-    fact = Fact(
-        fact_id="fact-1",
-        origin_run_id="run-1",
-        subject="Contract A",
-        predicate="has_value",
-        object_value="100000",
-        status=status,
-    )
+    fact = make_fact(status=status)
 
-    assert fact.status == status
+    assert fact.status is status
 
 
 @pytest.mark.parametrize(
@@ -48,17 +64,7 @@ def test_fact_supports_all_statuses(status: FactStatus) -> None:
     ],
 )
 def test_fact_is_immutable(field: str) -> None:
-    fact = Fact(
-        fact_id="fact-1",
-        origin_run_id="run-1",
-        subject="Contract A",
-        predicate="has_value",
-        object_value="100000",
-    )
+    fact = make_fact()
 
-    with pytest.raises((TypeError, ValueError)):
-        setattr(
-            fact,
-            field,
-            "changed",
-        )
+    with pytest.raises(ValidationError):
+        setattr(fact, field, "changed")

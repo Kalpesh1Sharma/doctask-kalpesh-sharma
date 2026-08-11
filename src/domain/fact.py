@@ -1,6 +1,6 @@
 from enum import StrEnum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, JsonValue
 
 
 class FactStatus(StrEnum):
@@ -16,5 +16,5 @@ class Fact(BaseModel):
     origin_run_id: str
     subject: str
     predicate: str
-    object_value: str
+    object_value: JsonValue
     status: FactStatus = FactStatus.CONFIRMED
