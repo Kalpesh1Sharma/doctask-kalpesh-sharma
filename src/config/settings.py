@@ -7,9 +7,7 @@ class Settings(BaseSettings):
     app_name: str = "task1"
     environment: str = "development"
 
-    database_url: str = (
-        "postgresql://task1:task1_dev_password@localhost:5432/task1"
-    )
+    database_url: str
 
     database_pool_min_size: int = 2
     database_pool_max_size: int = 10

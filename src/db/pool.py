@@ -18,7 +18,6 @@ def create_pool() -> ConnectionPool:
 
 
 pool = create_pool()
-pool.open()
 
 
 def get_connection() -> Iterator[Connection]:
