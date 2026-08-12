@@ -17,6 +17,14 @@ class RunStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class RunStage(StrEnum):
+    INGEST = "INGEST"
+    UNDERSTAND = "UNDERSTAND"
+    EXAMINE = "EXAMINE"
+    REVIEW = "REVIEW"
+    COMMIT = "COMMIT"
+
+
 class RunStepStatus(StrEnum):
     PENDING = "PENDING"
     RUNNING = "RUNNING"

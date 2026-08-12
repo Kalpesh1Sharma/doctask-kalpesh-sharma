@@ -3,6 +3,7 @@ from pydantic import ValidationError
 
 from domain.run import (
     Run,
+    RunStage,
     RunStatus,
     RunStepStatus,
     RunType,
@@ -26,6 +27,26 @@ def test_supported_run_types(run_type: RunType) -> None:
         RunType.INITIAL,
         RunType.UPDATE,
         RunType.MANUAL,
+    }
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        RunStage.INGEST,
+        RunStage.UNDERSTAND,
+        RunStage.EXAMINE,
+        RunStage.REVIEW,
+        RunStage.COMMIT,
+    ],
+)
+def test_supported_run_stages(stage: RunStage) -> None:
+    assert stage in {
+        RunStage.INGEST,
+        RunStage.UNDERSTAND,
+        RunStage.EXAMINE,
+        RunStage.REVIEW,
+        RunStage.COMMIT,
     }
 
 
