@@ -82,3 +82,20 @@ class RunFindingRepository:
         ).fetchall()
 
         return [RunFindingRecord.from_row(row) for row in rows]
+
+    def has_pending_for_run(self, run_id: str) -> bool:
+        row = self._connection.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM run_findings
+                JOIN findings ON findings.id = run_findings.finding_id
+                WHERE run_findings.run_id = %s::uuid
+                  AND findings.status = 'PENDING'::finding_status
+            )
+            """,
+            (run_id,),
+        ).fetchone()
+
+        assert row is not None
+        return cast(bool, row[0])

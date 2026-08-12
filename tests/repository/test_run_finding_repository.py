@@ -5,7 +5,7 @@ import pytest
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 
 from db.pool import pool
-from domain.finding import Finding, FindingType
+from domain.finding import Finding, FindingStatus, FindingType
 from domain.run_membership import RunMembershipRelation
 from repositories.finding_repository import FindingRepository
 from repositories.run_finding_repository import RunFindingRepository
@@ -81,13 +81,18 @@ def create_manual_run(connection, pile_id: str) -> str:
     return run_id
 
 
-def create_finding(connection, origin_run_id: str) -> str:
+def create_finding(
+    connection,
+    origin_run_id: str,
+    status: FindingStatus = FindingStatus.PENDING,
+) -> str:
     finding = Finding(
         finding_id=str(uuid4()),
         origin_run_id=origin_run_id,
         finding_type=FindingType.CONTRADICTION,
         title="Loan amounts conflict",
         severity="HIGH",
+        status=status,
     )
     return FindingRepository(connection).create(finding).finding_id
 
@@ -206,3 +211,71 @@ def test_caller_rollback_removes_uncommitted_membership(resources: RunFindingRes
         record = RunFindingRepository(connection).get(resources.origin_run_id, resources.finding_id)
 
     assert record is None
+
+
+def test_has_pending_for_run_finds_direct_pending_membership(
+    resources: RunFindingResources,
+) -> None:
+    with pool.connection() as connection:
+        repository = RunFindingRepository(connection)
+        repository.add(
+            resources.origin_run_id,
+            resources.finding_id,
+            RunMembershipRelation.CREATED,
+        )
+        connection.commit()
+
+        has_pending = repository.has_pending_for_run(resources.origin_run_id)
+
+    assert has_pending is True
+
+
+def test_has_pending_for_run_finds_carried_forward_pending_membership(
+    resources: RunFindingResources,
+) -> None:
+    with pool.connection() as connection:
+        repository = RunFindingRepository(connection)
+        repository.add(
+            resources.carried_run_id,
+            resources.finding_id,
+            RunMembershipRelation.CARRIED_FORWARD,
+        )
+        connection.commit()
+
+        has_pending = repository.has_pending_for_run(resources.carried_run_id)
+
+    assert has_pending is True
+
+
+def test_has_pending_for_run_ignores_resolved_memberships(
+    resources: RunFindingResources,
+) -> None:
+    with pool.connection() as connection:
+        resolved_finding_id = create_finding(
+            connection,
+            resources.origin_run_id,
+            status=FindingStatus.APPROVED,
+        )
+        repository = RunFindingRepository(connection)
+        repository.add(
+            resources.carried_run_id,
+            resolved_finding_id,
+            RunMembershipRelation.CARRIED_FORWARD,
+        )
+        connection.commit()
+
+        has_pending = repository.has_pending_for_run(resources.carried_run_id)
+
+    assert has_pending is False
+
+
+def test_has_pending_for_run_returns_false_for_known_empty_and_unknown_runs(
+    resources: RunFindingResources,
+) -> None:
+    with pool.connection() as connection:
+        repository = RunFindingRepository(connection)
+        known_empty = repository.has_pending_for_run(resources.origin_run_id)
+        unknown = repository.has_pending_for_run(str(uuid4()))
+
+    assert known_empty is False
+    assert unknown is False
