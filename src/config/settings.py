@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -11,6 +12,8 @@ class Settings(BaseSettings):
 
     database_pool_min_size: int = 2
     database_pool_max_size: int = 10
+
+    artifact_root: Path = Path("var/artifacts")
 
     model_config = SettingsConfigDict(
         env_file=".env",
