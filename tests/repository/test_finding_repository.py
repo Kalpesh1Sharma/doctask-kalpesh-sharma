@@ -6,7 +6,9 @@ from psycopg.errors import CheckViolation, ForeignKeyViolation, RaiseException
 
 from db.pool import pool
 from domain.finding import Finding, FindingStatus, FindingType
+from domain.run_rule_scope import RunRuleSetSnapshot, RunRuleSnapshot
 from repositories.finding_repository import FindingRepository
+from repositories.run_rule_scope_repository import RunRuleScopeRepository
 
 
 @dataclass(frozen=True)
@@ -32,39 +34,45 @@ def resources() -> FindingResources:
         pile_id = str(pile_row[0])
         origin_run_id = create_manual_run(connection, pile_id)
         rule_id = create_rule(connection, pile_id)
+        rule_set_row = connection.execute(
+            """
+            SELECT rule_sets.id, rule_sets.name, rule_sets.description, rule_sets.version,
+                   rules.rule_key, rules.title, rules.description, rules.severity, rules.definition
+            FROM rules
+            JOIN rule_sets ON rule_sets.id = rules.rule_set_id
+            WHERE rules.id = %s::uuid
+            """,
+            (rule_id,),
+        ).fetchone()
+        assert rule_set_row is not None
+        scope_repository = RunRuleScopeRepository(connection)
+        scope_repository.insert_rule_set_snapshot(
+            RunRuleSetSnapshot(
+                run_id=origin_run_id,
+                source_rule_set_id=str(rule_set_row[0]),
+                name=str(rule_set_row[1]),
+                description=rule_set_row[2],
+                version=int(rule_set_row[3]),
+            ),
+        )
+        scope_repository.insert_rule_snapshot(
+            RunRuleSnapshot(
+                run_id=origin_run_id,
+                source_rule_id=rule_id,
+                source_rule_set_id=str(rule_set_row[0]),
+                rule_key=str(rule_set_row[4]),
+                title=str(rule_set_row[5]),
+                description=rule_set_row[6],
+                severity=str(rule_set_row[7]),
+                definition=rule_set_row[8],
+            ),
+        )
+        scope_repository.complete_scope(origin_run_id)
         connection.commit()
 
     created_resources = FindingResources(pile_id, origin_run_id, rule_id)
 
-    try:
-        yield created_resources
-    finally:
-        with pool.connection() as connection:
-            connection.execute(
-                """
-                DELETE FROM finding_evidence
-                WHERE finding_id IN (
-                    SELECT id FROM findings WHERE origin_run_id = %s::uuid
-                )
-                """,
-                (created_resources.origin_run_id,),
-            )
-            connection.execute(
-                "DELETE FROM run_findings WHERE run_id = %s::uuid",
-                (created_resources.origin_run_id,),
-            )
-            connection.execute(
-                "DELETE FROM findings WHERE origin_run_id = %s::uuid",
-                (created_resources.origin_run_id,),
-            )
-            connection.execute("DELETE FROM rules WHERE id = %s::uuid", (created_resources.rule_id,))
-            connection.execute(
-                "DELETE FROM rule_sets WHERE pile_id = %s::uuid",
-                (created_resources.pile_id,),
-            )
-            connection.execute("DELETE FROM runs WHERE id = %s::uuid", (created_resources.origin_run_id,))
-            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (created_resources.pile_id,))
-            connection.commit()
+    yield created_resources
 
 
 def create_manual_run(connection, pile_id: str) -> str:
@@ -193,6 +201,29 @@ def test_database_rejects_unknown_origin_run_and_rule(resources: FindingResource
 
         with pytest.raises(ForeignKeyViolation):
             repository.create(make_finding(resources, rule_id=str(uuid4())))
+
+        connection.rollback()
+
+
+def test_database_rejects_existing_rule_without_origin_scope_snapshot(
+    resources: FindingResources,
+) -> None:
+    with pool.connection() as connection:
+        uncaptured_run_id = create_manual_run(connection, resources.pile_id)
+        uncaptured_rule_id = create_rule(connection, resources.pile_id)
+        connection.commit()
+
+        with pytest.raises(RaiseException, match="requires an origin-run rule snapshot"):
+            FindingRepository(connection).create(
+                Finding(
+                    finding_id=str(uuid4()),
+                    origin_run_id=uncaptured_run_id,
+                    finding_type=FindingType.RULE_VIOLATION,
+                    rule_id=uncaptured_rule_id,
+                    title="Uncaptured rule violation",
+                    severity="HIGH",
+                ),
+            )
 
         connection.rollback()
 
