@@ -4,6 +4,7 @@ from typing import cast
 
 from psycopg import Connection
 
+from domain.finding import FindingStatus, FindingType
 from domain.run_membership import RunMembershipRelation
 
 _RUN_FINDING_COLUMNS = """
@@ -11,6 +12,19 @@ _RUN_FINDING_COLUMNS = """
     finding_id,
     relation,
     created_at
+"""
+
+_RUN_FINDING_REVIEW_STATE_COLUMNS = """
+    run_findings.run_id,
+    findings.id,
+    run_findings.relation,
+    findings.origin_run_id,
+    findings.finding_type,
+    findings.rule_id,
+    findings.title,
+    findings.description,
+    findings.severity,
+    findings.status
 """
 
 
@@ -28,6 +42,35 @@ class RunFindingRecord:
             finding_id=str(row[1]),
             relation=RunMembershipRelation(str(row[2])),
             created_at=cast(datetime, row[3]),
+        )
+
+
+@dataclass(frozen=True)
+class RunFindingReviewStateRecord:
+    run_id: str
+    finding_id: str
+    relation: RunMembershipRelation
+    origin_run_id: str
+    finding_type: FindingType
+    rule_id: str | None
+    title: str
+    description: str | None
+    severity: str
+    status: FindingStatus
+
+    @classmethod
+    def from_row(cls, row: tuple[object, ...]) -> "RunFindingReviewStateRecord":
+        return cls(
+            run_id=str(row[0]),
+            finding_id=str(row[1]),
+            relation=RunMembershipRelation(str(row[2])),
+            origin_run_id=str(row[3]),
+            finding_type=FindingType(str(row[4])),
+            rule_id=str(row[5]) if row[5] is not None else None,
+            title=cast(str, row[6]),
+            description=cast(str | None, row[7]),
+            severity=cast(str, row[8]),
+            status=FindingStatus(str(row[9])),
         )
 
 
@@ -82,6 +125,20 @@ class RunFindingRepository:
         ).fetchall()
 
         return [RunFindingRecord.from_row(row) for row in rows]
+
+    def list_review_state_for_run(self, run_id: str) -> list[RunFindingReviewStateRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RUN_FINDING_REVIEW_STATE_COLUMNS}
+            FROM run_findings
+            JOIN findings ON findings.id = run_findings.finding_id
+            WHERE run_findings.run_id = %s::uuid
+            ORDER BY findings.id ASC
+            """,
+            (run_id,),
+        ).fetchall()
+
+        return [RunFindingReviewStateRecord.from_row(row) for row in rows]
 
     def has_pending_for_run(self, run_id: str) -> bool:
         row = self._connection.execute(

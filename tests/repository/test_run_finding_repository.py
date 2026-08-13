@@ -16,6 +16,7 @@ class RunFindingResources:
     pile_id: str
     origin_run_id: str
     carried_run_id: str
+    empty_run_id: str
     finding_id: str
 
 
@@ -35,10 +36,17 @@ def resources() -> RunFindingResources:
         pile_id = str(pile_row[0])
         origin_run_id = create_manual_run(connection, pile_id)
         carried_run_id = create_manual_run(connection, pile_id)
+        empty_run_id = create_manual_run(connection, pile_id)
         finding_id = create_finding(connection, origin_run_id)
         connection.commit()
 
-    created_resources = RunFindingResources(pile_id, origin_run_id, carried_run_id, finding_id)
+    created_resources = RunFindingResources(
+        pile_id,
+        origin_run_id,
+        carried_run_id,
+        empty_run_id,
+        finding_id,
+    )
 
     try:
         yield created_resources
@@ -54,16 +62,24 @@ def resources() -> RunFindingResources:
                 (created_resources.origin_run_id,),
             )
             connection.execute(
-                "DELETE FROM run_findings WHERE run_id IN (%s::uuid, %s::uuid)",
-                (created_resources.origin_run_id, created_resources.carried_run_id),
+                "DELETE FROM run_findings WHERE run_id IN (%s::uuid, %s::uuid, %s::uuid)",
+                (
+                    created_resources.origin_run_id,
+                    created_resources.carried_run_id,
+                    created_resources.empty_run_id,
+                ),
             )
             connection.execute(
                 "DELETE FROM findings WHERE origin_run_id = %s::uuid",
                 (created_resources.origin_run_id,),
             )
             connection.execute(
-                "DELETE FROM runs WHERE id IN (%s::uuid, %s::uuid)",
-                (created_resources.origin_run_id, created_resources.carried_run_id),
+                "DELETE FROM runs WHERE id IN (%s::uuid, %s::uuid, %s::uuid)",
+                (
+                    created_resources.origin_run_id,
+                    created_resources.carried_run_id,
+                    created_resources.empty_run_id,
+                ),
             )
             connection.execute("DELETE FROM piles WHERE id = %s::uuid", (created_resources.pile_id,))
             connection.commit()
@@ -274,8 +290,60 @@ def test_has_pending_for_run_returns_false_for_known_empty_and_unknown_runs(
 ) -> None:
     with pool.connection() as connection:
         repository = RunFindingRepository(connection)
-        known_empty = repository.has_pending_for_run(resources.origin_run_id)
+        known_empty = repository.has_pending_for_run(resources.empty_run_id)
         unknown = repository.has_pending_for_run(str(uuid4()))
 
     assert known_empty is False
     assert unknown is False
+
+
+def test_list_review_state_for_run_joins_current_finding_state_deterministically(
+    resources: RunFindingResources,
+) -> None:
+    with pool.connection() as connection:
+        approved_finding_id = create_finding(
+            connection,
+            resources.origin_run_id,
+            status=FindingStatus.APPROVED,
+        )
+        rejected_finding_id = create_finding(
+            connection,
+            resources.origin_run_id,
+            status=FindingStatus.REJECTED,
+        )
+        repository = RunFindingRepository(connection)
+        repository.add(
+            resources.carried_run_id,
+            resources.finding_id,
+            RunMembershipRelation.CARRIED_FORWARD,
+        )
+        repository.add(
+            resources.carried_run_id,
+            approved_finding_id,
+            RunMembershipRelation.CARRIED_FORWARD,
+        )
+        repository.add(
+            resources.carried_run_id,
+            rejected_finding_id,
+            RunMembershipRelation.CARRIED_FORWARD,
+        )
+        connection.commit()
+
+    with pool.connection() as connection:
+        repository = RunFindingRepository(connection)
+        records = repository.list_review_state_for_run(resources.carried_run_id)
+        known_empty = repository.list_review_state_for_run(resources.empty_run_id)
+        unknown = repository.list_review_state_for_run(str(uuid4()))
+
+    assert [record.finding_id for record in records] == sorted(
+        [resources.finding_id, approved_finding_id, rejected_finding_id],
+    )
+    assert {record.status for record in records} == {
+        FindingStatus.PENDING,
+        FindingStatus.APPROVED,
+        FindingStatus.REJECTED,
+    }
+    assert all(record.relation is RunMembershipRelation.CARRIED_FORWARD for record in records)
+    assert all(record.origin_run_id == resources.origin_run_id for record in records)
+    assert known_empty == []
+    assert unknown == []
