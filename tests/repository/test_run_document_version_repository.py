@@ -5,6 +5,7 @@ import pytest
 from psycopg.errors import ForeignKeyViolation, UniqueViolation
 
 from db.pool import pool
+from domain.document_version import DocumentProcessingStatus
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 
 
@@ -253,3 +254,31 @@ def test_caller_rollback_removes_uncommitted_membership(
         record = RunDocumentVersionRepository(connection).get(run_id, document_version_id)
 
     assert record is None
+
+
+def test_list_scope_for_run_joins_document_identity_and_readiness(
+    resources: RepositoryResources,
+) -> None:
+    run_id = create_manual_run(resources.pile_id)
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE document_versions SET processing_status = 'READY' WHERE id = %s::uuid",
+            (resources.document_version_ids[1],),
+        )
+        repository = RunDocumentVersionRepository(connection)
+        repository.add(run_id, resources.document_version_ids[2])
+        repository.add(run_id, resources.document_version_ids[1])
+        connection.commit()
+
+    with pool.connection() as connection:
+        records = RunDocumentVersionRepository(connection).list_scope_for_run(run_id)
+        missing = RunDocumentVersionRepository(connection).list_scope_for_run(str(uuid4()))
+
+    assert [record.document_version_id for record in records] == list(resources.document_version_ids[1:])
+    assert all(record.run_id == run_id for record in records)
+    assert all(record.document_id == resources.document_id for record in records)
+    assert all(record.document_pile_id == resources.pile_id for record in records)
+    assert records[0].version_number == 2
+    assert records[0].processing_status is DocumentProcessingStatus.READY
+    assert records[1].processing_status is DocumentProcessingStatus.PENDING
+    assert missing == []
