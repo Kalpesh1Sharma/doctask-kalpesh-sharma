@@ -161,6 +161,24 @@ class DocumentChunkRepository:
 
         return [DocumentChunkRecord.from_row(row) for row in rows]
 
+    def list_for_document_version_for_share(
+        self,
+        document_version_id: str,
+    ) -> list[DocumentChunkRecord]:
+        """Return a version's chunks while blocking concurrent content updates."""
+        rows = self._connection.execute(
+            f"""
+            SELECT {_DOCUMENT_CHUNK_COLUMNS}
+            FROM document_chunks
+            WHERE document_version_id = %s::uuid
+            ORDER BY chunk_index ASC
+            FOR SHARE
+            """,
+            (document_version_id,),
+        ).fetchall()
+
+        return [DocumentChunkRecord.from_row(row) for row in rows]
+
     def search_similar(
         self,
         query_embedding: Sequence[float],

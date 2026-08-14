@@ -324,3 +324,18 @@ def test_caller_rollback_removes_uncommitted_chunk(resources: ChunkResources) ->
         persisted = DocumentChunkRepository(connection).get_by_id(record.chunk_id)
 
     assert persisted is None
+
+
+def test_list_for_document_version_for_share_returns_deterministic_records(
+    resources: ChunkResources,
+) -> None:
+    second = create_chunk(resources.document_version_id, 2)
+    first = create_chunk(resources.document_version_id, 0)
+
+    with pool.connection() as connection:
+        locked = DocumentChunkRepository(connection).list_for_document_version_for_share(
+            resources.document_version_id,
+        )
+        connection.commit()
+
+    assert locked == [first, second]
