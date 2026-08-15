@@ -121,6 +121,20 @@ def test_get_by_id_returns_none_for_unknown_step() -> None:
     assert record is None
 
 
+def test_get_for_run_stage_attempt_returns_exact_step(pile_id: str) -> None:
+    run_id = create_manual_run(pile_id)
+
+    with pool.connection() as connection:
+        repository = RunStepRepository(connection)
+        expected = repository.create(run_id, RunStage.EXAMINE, 1)
+        repository.create(run_id, RunStage.EXAMINE, 2)
+        connection.commit()
+
+        found = repository.get_for_run_stage_attempt(run_id, RunStage.EXAMINE, 1)
+
+    assert found == expected
+
+
 def test_list_for_run_returns_steps_by_stage_then_attempt(pile_id: str) -> None:
     run_id = create_manual_run(pile_id)
 
@@ -230,6 +244,92 @@ def test_update_status_allows_valid_transitions_without_timestamps(pile_id: str)
     assert completed.completed_at is None
     assert completed.error_code is None
     assert completed.error_message is None
+
+
+def test_update_execution_state_uses_database_timestamps_and_error_metadata(pile_id: str) -> None:
+    run_id = create_manual_run(pile_id)
+
+    with pool.connection() as connection:
+        repository = RunStepRepository(connection)
+        created = repository.create(run_id, RunStage.INGEST, 1)
+        running = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.RUNNING,
+            mark_started=True,
+            clear_error=True,
+        )
+        assert running is not None
+        same_running = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.RUNNING,
+            mark_started=True,
+            clear_error=True,
+        )
+        assert same_running is not None
+        completed = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.COMPLETED,
+            mark_completed=True,
+            clear_error=True,
+        )
+        connection.commit()
+
+    assert running.started_at is not None
+    assert same_running.started_at == running.started_at
+    assert completed.completed_at is not None
+    assert completed.error_code is None
+    assert completed.error_message is None
+
+
+def test_awaiting_upstream_round_trip_preserves_start_and_completion_metadata(pile_id: str) -> None:
+    run_id = create_manual_run(pile_id)
+
+    with pool.connection() as connection:
+        repository = RunStepRepository(connection)
+        created = repository.create(run_id, RunStage.INGEST, 1)
+        running = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.RUNNING,
+            mark_started=True,
+            clear_error=True,
+        )
+        assert running is not None and running.started_at is not None
+        awaiting = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.AWAITING_UPSTREAM,
+            error_code="UPSTREAM_PENDING",
+            error_message="waiting for source readiness",
+        )
+        assert awaiting is not None
+        resumed = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.RUNNING,
+            mark_started=True,
+            clear_error=True,
+        )
+        assert resumed is not None
+        completed = repository.update_execution_state(
+            created.step_id,
+            RunStepStatus.COMPLETED,
+            mark_completed=True,
+            clear_error=True,
+        )
+        assert completed is not None
+        same_completed = repository.update_execution_state(
+            completed.step_id,
+            RunStepStatus.COMPLETED,
+            mark_completed=True,
+            clear_error=True,
+        )
+        connection.commit()
+
+    assert awaiting.started_at == running.started_at
+    assert awaiting.error_code == "UPSTREAM_PENDING"
+    assert resumed.started_at == running.started_at
+    assert resumed.error_code is None
+    assert completed.completed_at is not None
+    assert same_completed is not None
+    assert same_completed.completed_at == completed.completed_at
 
 
 def test_database_rejects_invalid_and_terminal_status_updates(pile_id: str) -> None:
