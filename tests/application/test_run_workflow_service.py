@@ -798,7 +798,7 @@ def test_existing_graph_reconciles_completed_understand_without_second_call() ->
         IdempotencyRepository(connection).mark_completed(
             "fact-extraction-v1",
             f"understand:{run_id}",
-            claim.claimed_at,
+            claim.claim_generation,
             "test",
         )
         connection.commit()
@@ -1825,7 +1825,7 @@ def _mark_operation_failed(scope: str, key: str) -> None:
         repository = IdempotencyRepository(connection)
         claimed = repository.claim(scope, key)
         assert claimed is not None and claimed.claimed_at is not None
-        failed = repository.mark_failed(scope, key, claimed.claimed_at)
+        failed = repository.mark_failed(scope, key, claimed.claim_generation)
         assert failed is not None
         connection.commit()
 

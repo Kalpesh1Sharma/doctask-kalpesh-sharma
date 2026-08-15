@@ -2,13 +2,19 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 from uuid import uuid4
 
 from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.idempotency_claim_takeover import (
+    DEFAULT_STALE_CLAIM_AFTER,
+    classify_in_progress,
+    reclaim_if_stale,
+    validate_stale_claim_after,
+)
 from api.application.prepare_update_run_service import (
     UpdatePreparationApplicationError,
     build_current_update_preparation_manifest,
@@ -39,6 +45,7 @@ from repositories.idempotency_repository import (
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
+    InProgressClaimState,
 )
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
@@ -131,7 +138,7 @@ class ExtractRunFactsResult:
 class _ClaimedOperation:
     request: FactExtractionRequest | UpdateFactExtractionRequest
     input_fingerprint: str
-    claim_token: datetime
+    claim_token: int
     idempotency_scope: str
     idempotency_key: str
     result_reference: str
@@ -162,11 +169,14 @@ class ExtractRunFactsService:
         provider: FactExtractionProvider,
         trusted_instructions: str,
         instruction_version: str,
+        *,
+        stale_claim_after: timedelta = DEFAULT_STALE_CLAIM_AFTER,
     ) -> None:
         self._connection_pool = connection_pool
         self._provider = provider
         self._trusted_instructions = trusted_instructions
         self._instruction_version = instruction_version
+        self._stale_claim_after = validate_stale_claim_after(stale_claim_after)
 
     def extract(self, command: ExtractRunFactsCommand) -> ExtractRunFactsResult:
         normalized_command = ExtractRunFactsCommand(
@@ -223,36 +233,39 @@ class ExtractRunFactsService:
         if run.run_type is RunType.UPDATE:
             return self._claim_or_replay_update_once(connection, run)
 
+        idempotency = IdempotencyRepository(connection)
+        key = self._idempotency_key(command.run_id)
+        existing = idempotency.get(_IDEMPOTENCY_SCOPE, key)
+        if existing is None:
+            if run.status is not RunStatus.RUNNING:
+                raise FactExtractionRunNotEligibleError(
+                    f"run {command.run_id} is not running fact extraction",
+                )
+            request = self._load_request(connection, command.run_id, for_share=False)
+            fingerprint = fact_extraction_input_fingerprint(request)
+            result_reference = self._result_reference(command.run_id, fingerprint)
+            claimed = idempotency.claim(_IDEMPOTENCY_SCOPE, key)
+            if claimed is not None:
+                return _ClaimedOperation(request, fingerprint, claimed.claim_generation, _IDEMPOTENCY_SCOPE, key, result_reference)
+            return self._resolve_authoritative_v1_existing(connection, command.run_id, idempotency)
+        if existing.status is IdempotencyStatus.FAILED:
+            raise FactExtractionPreviouslyFailedError("fact extraction previously failed")
+        if existing.status is IdempotencyStatus.COMPLETED:
+            return self._resolve_completed_v1_existing(connection, command.run_id, existing)
+        state = classify_in_progress(idempotency, existing, self._stale_claim_after)
+        if state is InProgressClaimState.MATCHING_FRESH:
+            raise FactExtractionInProgressError("fact extraction is already in progress")
+        if state is InProgressClaimState.CHANGED_OR_MISSING:
+            return self._resolve_authoritative_v1_existing(connection, command.run_id, idempotency)
+        if run.status is not RunStatus.RUNNING:
+            raise FactExtractionRunNotEligibleError(f"run {command.run_id} is not running fact extraction")
         request = self._load_request(connection, command.run_id, for_share=False)
         fingerprint = fact_extraction_input_fingerprint(request)
         result_reference = self._result_reference(command.run_id, fingerprint)
-        idempotency = IdempotencyRepository(connection)
-        existing = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-        if existing is not None:
-            return self._resolve_existing(existing, request, fingerprint, result_reference)
-
-        if run.status is not RunStatus.RUNNING:
-            raise FactExtractionRunNotEligibleError(
-                f"run {command.run_id} is not running fact extraction",
-            )
-
-        claimed = idempotency.claim(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-        if claimed is None:
-            existing = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-            if existing is None:
-                raise FactExtractionIdempotencyIntegrityError("claimed operation disappeared")
-            return self._resolve_existing(existing, request, fingerprint, result_reference)
-        if claimed.claimed_at is None:
-            raise FactExtractionIdempotencyIntegrityError("claim has no fencing token")
-
-        return _ClaimedOperation(
-            request,
-            fingerprint,
-            claimed.claimed_at,
-            _IDEMPOTENCY_SCOPE,
-            self._idempotency_key(command.run_id),
-            result_reference,
-        )
+        claimed = reclaim_if_stale(idempotency, existing, self._stale_claim_after)
+        if claimed is not None:
+            return _ClaimedOperation(request, fingerprint, claimed.claim_generation, _IDEMPOTENCY_SCOPE, key, result_reference)
+        return self._resolve_authoritative_v1_existing(connection, command.run_id, idempotency)
 
     def _claim_or_replay_update_once(
         self,
@@ -263,10 +276,25 @@ class ExtractRunFactsService:
         key = self._update_idempotency_key(run.run_id)
         existing = idempotency.get(_UPDATE_IDEMPOTENCY_SCOPE, key)
         if existing is not None:
+            if existing.status is IdempotencyStatus.FAILED:
+                raise FactExtractionPreviouslyFailedError("fact extraction previously failed")
+            if existing.status is IdempotencyStatus.COMPLETED:
+                return self._resolve_completed_update_existing(connection, run, existing)
+            state = classify_in_progress(idempotency, existing, self._stale_claim_after)
+            if state is InProgressClaimState.MATCHING_FRESH:
+                raise FactExtractionInProgressError("fact extraction is already in progress")
+            if state is InProgressClaimState.CHANGED_OR_MISSING:
+                return self._resolve_authoritative_update_existing(connection, run, idempotency)
+            if run.status is not RunStatus.RUNNING:
+                raise FactExtractionRunNotEligibleError(f"run {run.run_id} is not running fact extraction")
             request = self._load_update_request(connection, run, for_share=False)
             fingerprint = update_fact_extraction_input_fingerprint(request)
             result_reference = self._update_result_reference(run.run_id, fingerprint)
-            return self._resolve_existing(existing, request, fingerprint, result_reference)
+            self._require_fresh_update_fact_state(connection, request)
+            claimed = reclaim_if_stale(idempotency, existing, self._stale_claim_after)
+            if claimed is not None:
+                return _ClaimedOperation(request, fingerprint, claimed.claim_generation, _UPDATE_IDEMPOTENCY_SCOPE, key, result_reference)
+            return self._resolve_authoritative_update_existing(connection, run, idempotency)
 
         legacy = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(run.run_id))
         if legacy is not None:
@@ -287,15 +315,53 @@ class ExtractRunFactsService:
             if existing is None:
                 raise FactExtractionIdempotencyIntegrityError("claimed operation disappeared")
             return self._resolve_existing(existing, request, fingerprint, result_reference)
-        if claimed.claimed_at is None:
-            raise FactExtractionIdempotencyIntegrityError("claim has no fencing token")
         return _ClaimedOperation(
             request,
             fingerprint,
-            claimed.claimed_at,
+            claimed.claim_generation,
             _UPDATE_IDEMPOTENCY_SCOPE,
             key,
             result_reference,
+        )
+
+    def _resolve_authoritative_v1_existing(
+        self, connection: Connection, run_id: str, idempotency: IdempotencyRepository,
+    ) -> ExtractRunFactsResult:
+        current = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(run_id))
+        if current is None:
+            raise FactExtractionIdempotencyIntegrityError("claimed operation disappeared")
+        if current.status is IdempotencyStatus.FAILED:
+            raise FactExtractionPreviouslyFailedError("fact extraction previously failed")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise FactExtractionInProgressError("fact extraction is already in progress")
+        return self._resolve_completed_v1_existing(connection, run_id, current)
+
+    def _resolve_completed_v1_existing(
+        self, connection: Connection, run_id: str, existing: IdempotencyRecord,
+    ) -> ExtractRunFactsResult:
+        request = self._load_request(connection, run_id, for_share=False)
+        fingerprint = fact_extraction_input_fingerprint(request)
+        return self._resolve_existing(existing, request, fingerprint, self._result_reference(run_id, fingerprint))
+
+    def _resolve_authoritative_update_existing(
+        self, connection: Connection, run: RunRecord, idempotency: IdempotencyRepository,
+    ) -> ExtractRunFactsResult:
+        current = idempotency.get(_UPDATE_IDEMPOTENCY_SCOPE, self._update_idempotency_key(run.run_id))
+        if current is None:
+            raise FactExtractionIdempotencyIntegrityError("claimed operation disappeared")
+        if current.status is IdempotencyStatus.FAILED:
+            raise FactExtractionPreviouslyFailedError("fact extraction previously failed")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise FactExtractionInProgressError("fact extraction is already in progress")
+        return self._resolve_completed_update_existing(connection, run, current)
+
+    def _resolve_completed_update_existing(
+        self, connection: Connection, run: RunRecord, existing: IdempotencyRecord,
+    ) -> ExtractRunFactsResult:
+        request = self._load_update_request(connection, run, for_share=False)
+        fingerprint = update_fact_extraction_input_fingerprint(request)
+        return self._resolve_existing(
+            existing, request, fingerprint, self._update_result_reference(run.run_id, fingerprint),
         )
 
     def _resolve_existing(
@@ -398,11 +464,13 @@ class ExtractRunFactsService:
         for attempt in range(_MAX_TRANSACTION_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
-                    IdempotencyRepository(connection).mark_failed(
+                    failed = IdempotencyRepository(connection).mark_failed(
                         claimed.idempotency_scope,
                         claimed.idempotency_key,
                         claimed.claim_token,
                     )
+                    if failed is None:
+                        raise FactExtractionClaimLostError("fact extraction claim is no longer owned")
                     connection.commit()
                     return
             except (DeadlockDetected, SerializationFailure):

@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -18,6 +19,7 @@ from api.application.extract_run_facts_service import (
     LegacyUpdateFactExtractionConflictError,
     SourceEvidenceValidationError,
     SourceInputDriftError,
+    UpdateFactExtractionPreparationError,
 )
 from api.application.prepare_update_run_service import (
     PrepareUpdateRunCommand,
@@ -29,6 +31,7 @@ from domain.fact_extraction import (
     FactExtractionCandidate,
     FactExtractionRequest,
     FactExtractionResponse,
+    fact_extraction_input_fingerprint,
 )
 from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
 from repositories.run_repository import RunRepository
@@ -1155,26 +1158,28 @@ def test_update_reclaimed_claim_token_rolls_back_new_rows_and_preserves_carried_
     carried_update_resources: CarriedUpdateExtractionResources,
 ) -> None:
     resources = carried_update_resources
-    provider = FakeProvider(
-        FactExtractionResponse(
-            format="fact-extraction-v1",
-            candidates=(
-                FactExtractionCandidate(
-                    subject="trigger fact",
-                    predicate="equals",
-                    object_value=101,
-                    evidence=(
-                        FactEvidenceCandidate(
-                            chunk_id=resources.trigger_chunk_id,
-                            relative_start_offset=17,
-                            relative_end_offset=20,
-                            quoted_text="101",
-                        ),
+    carried_before = carried_snapshot(resources)
+    carried_ids_before = carried_fact_ids(resources)
+    stale_generation: list[int] = []
+    response = FactExtractionResponse(
+        format="fact-extraction-v1",
+        candidates=(
+            FactExtractionCandidate(
+                subject="trigger fact",
+                predicate="equals",
+                object_value=101,
+                evidence=(
+                    FactEvidenceCandidate(
+                        chunk_id=resources.trigger_chunk_id,
+                        relative_start_offset=17,
+                        relative_end_offset=20,
+                        quoted_text="101",
                     ),
                 ),
             ),
         ),
     )
+    provider = FakeProvider(response)
 
     def reclaim_claim(_: FactExtractionRequest) -> None:
         with pool.connection() as connection:
@@ -1184,11 +1189,16 @@ def test_update_reclaimed_claim_token_rolls_back_new_rows_and_preserves_carried_
                 f"understand-update:{resources.update_run_id}",
             )
             assert record is not None and record.claimed_at is not None
-            assert repository.reclaim(
+            stale_generation.append(record.claim_generation)
+            connection.execute("UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s", ("fact-extraction-update-v2", f"understand-update:{resources.update_run_id}"))
+            replacement = repository.reclaim_stale(
                 "fact-extraction-update-v2",
                 f"understand-update:{resources.update_run_id}",
-                record.claimed_at,
-            ) is not None
+                record.claim_generation,
+                timedelta(minutes=5),
+            )
+            assert replacement is not None
+            assert replacement.claim_generation == record.claim_generation + 1
             connection.commit()
 
     provider.before_return = reclaim_claim
@@ -1197,10 +1207,384 @@ def test_update_reclaimed_claim_token_rolls_back_new_rows_and_preserves_carried_
 
     record = update_extraction_record_for_run(resources.update_run_id)
     assert len(provider.calls) == 1
-    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert stale_generation
+    assert carried_snapshot(resources) == carried_before
+    assert carried_fact_ids(resources) == carried_ids_before == [resources.carried_fact_id]
     assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
     assert record is not None
     assert record.status is IdempotencyStatus.IN_PROGRESS
+    assert record.claim_generation == stale_generation[0] + 1
+
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            ("fact-extraction-update-v2", f"understand-update:{resources.update_run_id}"),
+        )
+        connection.commit()
+
+    recovery_provider = FakeProvider(response)
+    recovered = service(recovery_provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+    assert recovered.replayed is False
+    assert len(recovery_provider.calls) == 1
+
+    final = update_extraction_record_for_run(resources.update_run_id)
+    assert final is not None
+    assert final.status is IdempotencyStatus.COMPLETED
+    assert final.claim_generation > stale_generation[0]
+    assert carried_snapshot(resources) == carried_before
+    assert carried_fact_ids(resources) == carried_ids_before
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (1, 1, 1, 1)
+    with pool.connection() as connection:
+        created = connection.execute(
+            "SELECT subject, predicate, object_value FROM facts WHERE origin_run_id = %s::uuid",
+            (resources.update_run_id,),
+        ).fetchall()
+        memberships = connection.execute(
+            "SELECT fact_id, relation FROM run_facts WHERE run_id = %s::uuid ORDER BY relation, fact_id",
+            (resources.update_run_id,),
+        ).fetchall()
+        evidence = connection.execute(
+            "SELECT count(*) FROM evidence_spans WHERE document_version_id = %s::uuid",
+            (resources.trigger_version_id,),
+        ).fetchone()
+        links = connection.execute(
+            "SELECT count(*) FROM fact_evidence JOIN facts ON facts.id = fact_evidence.fact_id WHERE facts.origin_run_id = %s::uuid",
+            (resources.update_run_id,),
+        ).fetchone()
+    assert created == [("trigger fact", "equals", 101)]
+    assert sum(1 for _, relation in memberships if relation == "CREATED") == 1
+    assert sum(1 for _, relation in memberships if relation == "CARRIED_FORWARD") == 1
+    assert evidence == (1,)
+    assert links == (1,)
+
+
+def test_fresh_update_owner_precedes_phase4a_reconstruction(
+    carried_update_resources: CarriedUpdateExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = carried_update_resources
+    scope = "fact-extraction-update-v2"
+    key = f"understand-update:{resources.update_run_id}"
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    def invalid_request(*_args, **_kwargs):
+        raise UpdateFactExtractionPreparationError("current preparation is invalid")
+
+    monkeypatch.setattr(ExtractRunFactsService, "_load_update_request", invalid_request)
+    with pytest.raises(FactExtractionInProgressError):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, key)
+        assert current is not None
+        assert current.claim_generation == record.claim_generation
+        assert current.claimed_at == record.claimed_at
+
+
+def test_classification_change_to_completed_replays_without_provider(
+    resources: ExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = "fact-extraction-v1"
+    key = f"understand:{resources.run_id}"
+    with pool.connection() as connection:
+        observed = IdempotencyRepository(connection).claim(scope, key)
+        assert observed is not None
+        connection.commit()
+    provider = FakeProvider(response_for(resources))
+    owner = service(provider)
+    original_classifier = extraction_module.classify_in_progress
+
+    def complete_then_classify(repository, record, stale_after):
+        with pool.connection() as other:
+            request = owner._load_request(other, resources.run_id, for_share=False)
+            fingerprint = fact_extraction_input_fingerprint(request)
+            completed = IdempotencyRepository(other).mark_completed(
+                scope,
+                key,
+                observed.claim_generation,
+                owner._result_reference(resources.run_id, fingerprint),
+            )
+            assert completed is not None
+            other.commit()
+        state = original_classifier(repository, record, stale_after)
+        assert state.value == "CHANGED_OR_MISSING"
+        return state
+
+    monkeypatch.setattr(extraction_module, "classify_in_progress", complete_then_classify)
+    replay = owner.extract(ExtractRunFactsCommand(resources.run_id))
+    assert replay.replayed
+    assert provider.calls == []
+    with pool.connection() as connection:
+        durable = IdempotencyRepository(connection).get(scope, key)
+    assert durable is not None
+    assert durable.status is IdempotencyStatus.COMPLETED
+    assert durable.claim_generation == observed.claim_generation
+
+
+def test_classification_change_to_new_generation_returns_in_progress(
+    resources: ExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = "fact-extraction-v1"
+    key = f"understand:{resources.run_id}"
+    with pool.connection() as connection:
+        observed = IdempotencyRepository(connection).claim(scope, key)
+        assert observed is not None
+        connection.commit()
+    provider = FakeProvider(response_for(resources))
+    original_classifier = extraction_module.classify_in_progress
+
+    def reclaim_then_classify(repository, record, stale_after):
+        with pool.connection() as other:
+            other.execute(
+                "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+                (scope, key),
+            )
+            replacement = IdempotencyRepository(other).reclaim_stale(
+                scope, key, observed.claim_generation, timedelta(minutes=5),
+            )
+            assert replacement is not None
+            other.commit()
+        state = original_classifier(repository, record, stale_after)
+        assert state.value == "CHANGED_OR_MISSING"
+        return state
+
+    monkeypatch.setattr(extraction_module, "classify_in_progress", reclaim_then_classify)
+    with pytest.raises(FactExtractionInProgressError):
+        service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        durable = IdempotencyRepository(connection).get(scope, key)
+    assert durable is not None
+    assert durable.claim_generation == observed.claim_generation + 1
+
+
+def test_lost_stale_reclaim_cas_rereads_new_owner_without_provider(
+    resources: ExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = "fact-extraction-v1"
+    key = f"understand:{resources.run_id}"
+    with pool.connection() as connection:
+        observed = IdempotencyRepository(connection).claim(scope, key)
+        assert observed is not None
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.commit()
+    provider = FakeProvider(response_for(resources))
+    original_reclaim = extraction_module.reclaim_if_stale
+
+    def competing_reclaim(repository, record, stale_after):
+        with pool.connection() as other:
+            winner = IdempotencyRepository(other).reclaim_stale(
+                scope, key, observed.claim_generation, timedelta(minutes=5),
+            )
+            assert winner is not None
+            other.commit()
+        return original_reclaim(repository, record, stale_after)
+
+    monkeypatch.setattr(extraction_module, "reclaim_if_stale", competing_reclaim)
+    with pytest.raises(FactExtractionInProgressError):
+        service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        durable = IdempotencyRepository(connection).get(scope, key)
+    assert durable is not None
+    assert durable.claim_generation == observed.claim_generation + 1
+
+
+def test_threaded_stale_owner_completion_loses_fence_and_rolls_back_rows(
+    resources: ExtractionResources,
+) -> None:
+    a_started = threading.Event()
+    release_a = threading.Event()
+
+    def response(subject: str) -> FactExtractionResponse:
+        return FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject=subject,
+                    predicate="equals",
+                    object_value=100,
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.chunk_id,
+                            relative_start_offset=14,
+                            relative_end_offset=21,
+                            quoted_text="100 USD",
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+    provider_a = FakeProvider(response("owner-a"))
+    provider_b = FakeProvider(response("owner-b"))
+
+    def pause_a(_: FactExtractionRequest) -> None:
+        a_started.set()
+        assert release_a.wait(timeout=10)
+
+    provider_a.before_return = pause_a
+    worker_a = service(provider_a)
+    worker_b = service(provider_b)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future_a = executor.submit(worker_a.extract, ExtractRunFactsCommand(resources.run_id))
+        assert a_started.wait(timeout=10)
+        with pool.connection() as connection:
+            record = IdempotencyRepository(connection).get(
+                "fact-extraction-v1", f"understand:{resources.run_id}",
+            )
+            assert record is not None
+            original_generation = record.claim_generation
+            connection.execute(
+                "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+                ("fact-extraction-v1", f"understand:{resources.run_id}"),
+            )
+            connection.commit()
+        replacement = worker_b.extract(ExtractRunFactsCommand(resources.run_id))
+        assert not replacement.replayed
+        release_a.set()
+        with pytest.raises(FactExtractionClaimLostError):
+            future_a.result(timeout=10)
+
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).get(
+            "fact-extraction-v1", f"understand:{resources.run_id}",
+        )
+        rows = connection.execute(
+            "SELECT subject FROM facts WHERE origin_run_id = %s::uuid ORDER BY subject",
+            (resources.run_id,),
+        ).fetchall()
+        memberships = connection.execute(
+            "SELECT count(*) FROM run_facts WHERE run_id = %s::uuid",
+            (resources.run_id,),
+        ).fetchone()
+    assert record is not None
+    assert record.status is IdempotencyStatus.COMPLETED
+    assert record.claim_generation == original_generation + 1
+    assert [row[0] for row in rows] == ["owner-b"]
+    assert memberships == (1,)
+    assert len(provider_a.calls) == 1
+    assert len(provider_b.calls) == 1
+
+
+def test_threaded_stale_owner_provider_failure_loses_failure_fence(
+    resources: ExtractionResources,
+) -> None:
+    a_started = threading.Event()
+    release_a = threading.Event()
+
+    class BlockingFailureProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def extract(self, request: FactExtractionRequest) -> FactExtractionResponse:
+            self.calls += 1
+            a_started.set()
+            assert release_a.wait(timeout=10)
+            raise FactExtractionProviderError("old owner failed")
+
+    provider_a = BlockingFailureProvider()
+    provider_b = FakeProvider(response_for(resources))
+    worker_a = service(provider_a)  # type: ignore[arg-type]
+    worker_b = service(provider_b)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future_a = executor.submit(worker_a.extract, ExtractRunFactsCommand(resources.run_id))
+        assert a_started.wait(timeout=10)
+        with pool.connection() as connection:
+            record = IdempotencyRepository(connection).get("fact-extraction-v1", f"understand:{resources.run_id}")
+            assert record is not None
+            original_generation = record.claim_generation
+            connection.execute(
+                "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+                ("fact-extraction-v1", f"understand:{resources.run_id}"),
+            )
+            connection.commit()
+        worker_b.extract(ExtractRunFactsCommand(resources.run_id))
+        release_a.set()
+        with pytest.raises(FactExtractionClaimLostError):
+            future_a.result(timeout=10)
+    with pool.connection() as connection:
+        durable = IdempotencyRepository(connection).get("fact-extraction-v1", f"understand:{resources.run_id}")
+    assert durable is not None
+    assert durable.status is IdempotencyStatus.COMPLETED
+    assert durable.claim_generation == original_generation + 1
+    assert provider_a.calls == 1
+    assert len(provider_b.calls) == 1
+
+
+def test_stale_v1_claim_with_ineligible_run_does_not_reclaim(
+    resources: ExtractionResources,
+) -> None:
+    scope = "fact-extraction-v1"
+    key = f"understand:{resources.run_id}"
+    provider = FakeProvider(response_for(resources))
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.execute(
+            "UPDATE runs SET status = 'REVIEW_REQUIRED'::run_status WHERE id = %s::uuid",
+            (resources.run_id,),
+        )
+        connection.commit()
+    with pool.connection() as connection:
+        aged = IdempotencyRepository(connection).get(scope, key)
+    assert aged is not None and aged.claimed_at is not None
+    with pytest.raises(FactExtractionRunNotEligibleError):
+        service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, key)
+    assert current is not None
+    assert current.status is IdempotencyStatus.IN_PROGRESS
+    assert current.claim_generation == aged.claim_generation
+    assert current.claimed_at == aged.claimed_at
+
+
+def test_stale_update_v2_claim_with_prepared_scope_drift_does_not_reclaim(
+    carried_update_resources: CarriedUpdateExtractionResources,
+) -> None:
+    resources = carried_update_resources
+    scope = "fact-extraction-update-v2"
+    key = f"understand-update:{resources.update_run_id}"
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.execute(
+            "DELETE FROM run_document_versions WHERE run_id = %s::uuid AND document_version_id = %s::uuid",
+            (resources.update_run_id, resources.trigger_version_id),
+        )
+        connection.commit()
+    with pool.connection() as connection:
+        aged = IdempotencyRepository(connection).get(scope, key)
+    assert aged is not None and aged.claimed_at is not None
+    with pytest.raises(UpdateFactExtractionPreparationError):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, key)
+    assert current is not None
+    assert current.status is IdempotencyStatus.IN_PROGRESS
+    assert current.claim_generation == aged.claim_generation
+    assert current.claimed_at == aged.claimed_at
 
 
 @pytest.mark.parametrize("retryable_error", [DeadlockDetected, SerializationFailure])
@@ -1867,11 +2251,8 @@ def test_reclaimed_stale_token_rolls_back_all_staged_grounded_rows(
             record = repository.get("fact-extraction-v1", f"understand:{resources.run_id}")
             assert record is not None
             assert record.claimed_at is not None
-            assert repository.reclaim(
-                "fact-extraction-v1",
-                f"understand:{resources.run_id}",
-                record.claimed_at,
-            ) is not None
+            connection.execute("UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s", ("fact-extraction-v1", f"understand:{resources.run_id}"))
+            assert repository.reclaim_stale("fact-extraction-v1", f"understand:{resources.run_id}", record.claim_generation, timedelta(minutes=5)) is not None
             connection.commit()
 
     provider.before_return = reclaim_claim

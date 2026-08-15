@@ -3,13 +3,19 @@
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 from uuid import uuid4
 
 from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.idempotency_claim_takeover import (
+    DEFAULT_STALE_CLAIM_AFTER,
+    classify_in_progress,
+    reclaim_if_stale,
+    validate_stale_claim_after,
+)
 from domain.contradiction_detection import (
     ContradictionCandidatePair,
     ContradictionDetectionRequest,
@@ -30,10 +36,11 @@ from repositories.idempotency_repository import (
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
+    InProgressClaimState,
 )
 from repositories.run_fact_repository import RunFactReconciliationRecord, RunFactRepository
 from repositories.run_finding_repository import RunFindingRepository
-from repositories.run_repository import RunRepository
+from repositories.run_repository import RunRecord, RunRepository
 from services.contradiction_detection_provider import (
     ContradictionDetectionProvider,
     ContradictionDetectionProviderError,
@@ -115,7 +122,7 @@ class DetectRunContradictionsResult:
 class _ClaimedOperation:
     request: ContradictionDetectionRequest
     input_fingerprint: str
-    claim_token: datetime
+    claim_token: int
 
 
 @dataclass(frozen=True)
@@ -131,11 +138,14 @@ class DetectRunContradictionsService:
         provider: ContradictionDetectionProvider,
         trusted_instructions: str,
         instruction_version: str,
+        *,
+        stale_claim_after: timedelta = DEFAULT_STALE_CLAIM_AFTER,
     ) -> None:
         self._connection_pool = connection_pool
         self._provider = provider
         self._trusted_instructions = trusted_instructions
         self._instruction_version = instruction_version
+        self._stale_claim_after = validate_stale_claim_after(stale_claim_after)
 
     def detect(
         self,
@@ -196,29 +206,54 @@ class DetectRunContradictionsService:
         if run is None:
             raise ContradictionDetectionRunNotFoundError(f"run {command.run_id} does not exist")
 
+        idempotency = IdempotencyRepository(connection)
+        key = self._idempotency_key(command.run_id)
+        existing = idempotency.get(_IDEMPOTENCY_SCOPE, key)
+        if existing is None:
+            if run.status is not RunStatus.RUNNING:
+                raise ContradictionDetectionRunNotEligibleError(f"run {command.run_id} is not running contradiction detection")
+            request = self._load_request(connection, command.run_id)
+            fingerprint = contradiction_detection_input_fingerprint(request)
+            claimed = idempotency.claim(_IDEMPOTENCY_SCOPE, key)
+            if claimed is not None:
+                return _ClaimedOperation(request, fingerprint, claimed.claim_generation)
+            return self._resolve_authoritative_existing(connection, run, idempotency)
+        if existing.status is IdempotencyStatus.FAILED:
+            raise ContradictionDetectionPreviouslyFailedError("contradiction detection previously failed")
+        if existing.status is IdempotencyStatus.COMPLETED:
+            return self._resolve_completed_existing(connection, run, existing)
+        state = classify_in_progress(idempotency, existing, self._stale_claim_after)
+        if state is InProgressClaimState.MATCHING_FRESH:
+            raise ContradictionDetectionInProgressError("contradiction detection is already in progress")
+        if state is InProgressClaimState.CHANGED_OR_MISSING:
+            return self._resolve_authoritative_existing(connection, run, idempotency)
+        if run.status is not RunStatus.RUNNING:
+            raise ContradictionDetectionRunNotEligibleError(f"run {command.run_id} is not running contradiction detection")
         request = self._load_request(connection, command.run_id)
         fingerprint = contradiction_detection_input_fingerprint(request)
-        result_reference = self._result_reference(command.run_id, fingerprint)
-        idempotency = IdempotencyRepository(connection)
-        existing = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-        if existing is not None:
-            return self._resolve_existing(existing, request, fingerprint, result_reference)
+        claimed = reclaim_if_stale(idempotency, existing, self._stale_claim_after)
+        if claimed is not None:
+            return _ClaimedOperation(request, fingerprint, claimed.claim_generation)
+        return self._resolve_authoritative_existing(connection, run, idempotency)
 
-        if run.status is not RunStatus.RUNNING:
-            raise ContradictionDetectionRunNotEligibleError(
-                f"run {command.run_id} is not running contradiction detection",
-            )
+    def _resolve_authoritative_existing(
+        self, connection: Connection, run: RunRecord, idempotency: IdempotencyRepository,
+    ) -> DetectRunContradictionsResult:
+        current = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(run.run_id))
+        if current is None:
+            raise ContradictionIdempotencyIntegrityError("claimed operation disappeared")
+        if current.status is IdempotencyStatus.FAILED:
+            raise ContradictionDetectionPreviouslyFailedError("contradiction detection previously failed")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise ContradictionDetectionInProgressError("contradiction detection is already in progress")
+        return self._resolve_completed_existing(connection, run, current)
 
-        claimed = idempotency.claim(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-        if claimed is None:
-            existing = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(command.run_id))
-            if existing is None:
-                raise ContradictionIdempotencyIntegrityError("claimed operation disappeared")
-            return self._resolve_existing(existing, request, fingerprint, result_reference)
-        if claimed.claimed_at is None:
-            raise ContradictionIdempotencyIntegrityError("claim has no fencing token")
-
-        return _ClaimedOperation(request, fingerprint, claimed.claimed_at)
+    def _resolve_completed_existing(
+        self, connection: Connection, run: RunRecord, existing: IdempotencyRecord,
+    ) -> DetectRunContradictionsResult:
+        request = self._load_request(connection, run.run_id)
+        fingerprint = contradiction_detection_input_fingerprint(request)
+        return self._resolve_existing(existing, request, fingerprint, self._result_reference(run.run_id, fingerprint))
 
     def _resolve_existing(
         self,
@@ -307,11 +342,13 @@ class DetectRunContradictionsService:
         for attempt in range(_MAX_TRANSACTION_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
-                    IdempotencyRepository(connection).mark_failed(
+                    failed = IdempotencyRepository(connection).mark_failed(
                         _IDEMPOTENCY_SCOPE,
                         self._idempotency_key(claimed.request.run_id),
                         claimed.claim_token,
                     )
+                    if failed is None:
+                        raise ContradictionClaimLostError("contradiction detection claim is no longer owned")
                     connection.commit()
                     return
             except (DeadlockDetected, SerializationFailure):

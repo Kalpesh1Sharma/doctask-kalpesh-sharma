@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -497,28 +498,147 @@ def test_completed_reference_errors_and_existing_claim_outcomes(resources: Resou
     with pool.connection() as connection:
         current = IdempotencyRepository(connection).get("update-preparation-v1", f"prepare-update:{resources.update_run_id}")
         assert current is not None and current.claimed_at is not None
-        IdempotencyRepository(connection).mark_failed("update-preparation-v1", f"prepare-update:{resources.update_run_id}", current.claimed_at)
+        IdempotencyRepository(connection).mark_failed("update-preparation-v1", f"prepare-update:{resources.update_run_id}", current.claim_generation)
         connection.commit()
     with pytest.raises(UpdatePreparationPreviouslyFailedError):
         service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
 
 
+def test_fresh_owner_precedes_manifest_reconstruction_and_stale_owner_does_not_reclaim(
+    resources: Resources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scope = "update-preparation-v1"
+    key = f"prepare-update:{resources.update_run_id}"
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.commit()
+
+    def invalid_manifest(*_args):
+        raise UpdatePreparationBaselineError("current baseline is invalid")
+
+    monkeypatch.setattr(PrepareUpdateRunService, "_build_manifest", invalid_manifest)
+    with pytest.raises(UpdatePreparationInProgressError):
+        service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
+    with pool.connection() as connection:
+        unchanged = IdempotencyRepository(connection).get(scope, key)
+        assert unchanged is not None
+        assert unchanged.claim_generation == record.claim_generation
+        assert unchanged.claimed_at == record.claimed_at
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.commit()
+    with pytest.raises(UpdatePreparationBaselineError):
+        service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
+    with pool.connection() as connection:
+        unchanged = IdempotencyRepository(connection).get(scope, key)
+        assert unchanged is not None
+        assert unchanged.claim_generation == record.claim_generation
+
+
+def test_stale_claim_with_target_state_conflict_does_not_reclaim(resources: Resources) -> None:
+    scope = "update-preparation-v1"
+    key = f"prepare-update:{resources.update_run_id}"
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.execute(
+            "INSERT INTO run_document_versions (run_id, document_version_id) VALUES (%s::uuid, %s::uuid)",
+            (resources.update_run_id, resources.trigger_version_id),
+        )
+        connection.commit()
+    with pool.connection() as connection:
+        aged = IdempotencyRepository(connection).get(scope, key)
+    assert aged is not None and aged.claimed_at is not None
+    with pytest.raises(UpdatePreparationTargetStateConflictError):
+        service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, key)
+    assert current is not None
+    assert current.status is IdempotencyStatus.IN_PROGRESS
+    assert current.claim_generation == aged.claim_generation
+    assert current.claimed_at == aged.claimed_at
+
+
 def test_stale_claim_and_staged_database_failure_roll_back(resources: Resources, monkeypatch: pytest.MonkeyPatch) -> None:
     original = preparation_module.IdempotencyRepository.mark_completed
+    stale_generation: list[int] = []
 
     def reclaim_before_complete(repository, *args):
         with pool.connection() as other:
             current = IdempotencyRepository(other).get("update-preparation-v1", f"prepare-update:{resources.update_run_id}")
             assert current is not None and current.claimed_at is not None
-            assert IdempotencyRepository(other).reclaim("update-preparation-v1", f"prepare-update:{resources.update_run_id}", current.claimed_at) is not None
+            stale_generation.append(current.claim_generation)
+            other.execute("UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s", ("update-preparation-v1", f"prepare-update:{resources.update_run_id}"))
+            replacement = IdempotencyRepository(other).reclaim_stale(
+                "update-preparation-v1",
+                f"prepare-update:{resources.update_run_id}",
+                current.claim_generation,
+                timedelta(minutes=5),
+            )
+            assert replacement is not None
+            assert replacement.claim_generation == current.claim_generation + 1
             other.commit()
         return original(repository, *args)
 
     monkeypatch.setattr(preparation_module.IdempotencyRepository, "mark_completed", reclaim_before_complete)
     with pytest.raises(UpdatePreparationClaimLostError):
         service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
+
+    assert stale_generation
     assert target_state(resources.update_run_id) == ([], [])
-    assert preparation_record(resources.update_run_id).status is IdempotencyStatus.IN_PROGRESS  # type: ignore[union-attr]
+    replacement = preparation_record(resources.update_run_id)
+    assert replacement is not None
+    assert replacement.status is IdempotencyStatus.IN_PROGRESS
+    assert replacement.claim_generation == stale_generation[0] + 1
+
+    monkeypatch.setattr(preparation_module.IdempotencyRepository, "mark_completed", original)
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            ("update-preparation-v1", f"prepare-update:{resources.update_run_id}"),
+        )
+        connection.commit()
+
+    recovered = service().prepare(PrepareUpdateRunCommand(resources.update_run_id))
+    assert recovered.replayed is False
+    final = preparation_record(resources.update_run_id)
+    assert final is not None
+    assert final.status is IdempotencyStatus.COMPLETED
+    assert final.claim_generation > stale_generation[0]
+
+    expected_versions = sorted(
+        change.target_document_version_id for change in recovered.manifest.document_changes
+    )
+    expected_facts = sorted(recovered.manifest.carried_fact_ids)
+    versions, facts = target_state(resources.update_run_id)
+    assert sorted(versions) == expected_versions
+    assert sorted(facts) == expected_facts
+    assert expected_versions == sorted([resources.retained_version_id, resources.trigger_version_id])
+    assert expected_facts == sorted([resources.retained_confirmed_id, resources.retained_disputed_id])
+    with pool.connection() as connection:
+        version_count = connection.execute(
+            "SELECT count(*) FROM run_document_versions WHERE run_id = %s::uuid",
+            (resources.update_run_id,),
+        ).fetchone()
+        fact_count = connection.execute(
+            "SELECT count(*) FROM run_facts WHERE run_id = %s::uuid",
+            (resources.update_run_id,),
+        ).fetchone()
+        relations = connection.execute(
+            "SELECT relation FROM run_facts WHERE run_id = %s::uuid",
+            (resources.update_run_id,),
+        ).fetchall()
+    assert version_count == (len(expected_versions),)
+    assert fact_count == (len(expected_facts),)
+    assert all(row[0] == "CARRIED_FORWARD" for row in relations)
 
 
 def test_input_drift_after_claim_writes_no_target_memberships(resources: Resources, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,3 +1,6 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -7,6 +10,7 @@ from db.pool import pool
 from repositories.idempotency_repository import (
     IdempotencyRepository,
     IdempotencyStatus,
+    InProgressClaimState,
 )
 
 
@@ -49,6 +53,7 @@ def test_claim_and_get_persist_initial_record(scope: str) -> None:
     assert record.scope == scope
     assert record.key == "operation"
     assert record.status is IdempotencyStatus.IN_PROGRESS
+    assert record.claim_generation == 1
     assert record.result_reference is None
     assert record.claimed_at is not None
     assert record.created_at is not None
@@ -90,7 +95,7 @@ def test_mark_completed_sets_result_reference_and_completion_time(scope: str) ->
         completed = IdempotencyRepository(connection).mark_completed(
             record.scope,
             record.key,
-            record.claimed_at,
+            record.claim_generation,
             "result-123",
         )
         connection.commit()
@@ -119,7 +124,7 @@ def test_mark_failed_preserves_result_and_completion_fields(scope: str) -> None:
         failed = IdempotencyRepository(connection).mark_failed(
             record.scope,
             record.key,
-            record.claimed_at,
+            record.claim_generation,
         )
         connection.commit()
 
@@ -137,15 +142,14 @@ def test_get_returns_none_for_unknown_operation(scope: str) -> None:
 
 
 def test_current_claim_operations_return_none_for_missing_record(scope: str) -> None:
-    token = claim(scope).claimed_at
-    assert token is not None
+    generation = claim(scope).claim_generation
 
     with pool.connection() as connection:
         repository = IdempotencyRepository(connection)
 
-        assert repository.reclaim(scope, "unknown", token) is None
-        assert repository.mark_completed(scope, "unknown", token, "result") is None
-        assert repository.mark_failed(scope, "unknown", token) is None
+        assert repository.reclaim_stale(scope, "unknown", generation, timedelta(minutes=5)) is None
+        assert repository.mark_completed(scope, "unknown", generation, "result") is None
+        assert repository.mark_failed(scope, "unknown", generation) is None
 
 
 def test_reclaim_fences_the_previous_claim_token(scope: str) -> None:
@@ -155,7 +159,13 @@ def test_reclaim_fences_the_previous_claim_token(scope: str) -> None:
     with pool.connection() as stale_connection, pool.connection() as reclaim_connection:
         stale_repository = IdempotencyRepository(stale_connection)
         reclaim_repository = IdempotencyRepository(reclaim_connection)
-        reclaimed = reclaim_repository.reclaim(scope, original.key, original.claimed_at)
+        reclaim_connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, original.key),
+        )
+        reclaimed = reclaim_repository.reclaim_stale(
+            scope, original.key, original.claim_generation, timedelta(minutes=5),
+        )
         reclaim_connection.commit()
 
         assert reclaimed is not None
@@ -163,15 +173,16 @@ def test_reclaim_fences_the_previous_claim_token(scope: str) -> None:
         assert reclaimed.claimed_at is not None
         assert reclaimed.claimed_at != original.claimed_at
 
-        stale_reclaim = stale_repository.reclaim(
+        stale_reclaim = stale_repository.reclaim_stale(
             original.scope,
             original.key,
-            original.claimed_at,
+            original.claim_generation,
+            timedelta(minutes=5),
         )
         stale_completion = stale_repository.mark_completed(
             original.scope,
             original.key,
-            original.claimed_at,
+            original.claim_generation,
             "stale-result",
         )
         stale_connection.commit()
@@ -179,7 +190,7 @@ def test_reclaim_fences_the_previous_claim_token(scope: str) -> None:
         current_completion = reclaim_repository.mark_completed(
             reclaimed.scope,
             reclaimed.key,
-            reclaimed.claimed_at,
+            reclaimed.claim_generation,
             "current-result",
         )
         reclaim_connection.commit()
@@ -191,6 +202,168 @@ def test_reclaim_fences_the_previous_claim_token(scope: str) -> None:
     assert current_completion.result_reference == "current-result"
 
 
+def test_classification_uses_database_time_and_observed_generation(scope: str) -> None:
+    record = claim(scope)
+    with pool.connection() as connection:
+        repository = IdempotencyRepository(connection)
+        assert repository.classify_in_progress(
+            scope, record.key, record.claim_generation, timedelta(minutes=5),
+        ) is InProgressClaimState.MATCHING_FRESH
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, record.key),
+        )
+        assert repository.classify_in_progress(
+            scope, record.key, record.claim_generation, timedelta(minutes=5),
+        ) is InProgressClaimState.MATCHING_STALE
+        connection.commit()
+
+
+def test_classification_reports_changed_owner_or_terminal_state(scope: str) -> None:
+    record = claim(scope)
+    with pool.connection() as connection:
+        repository = IdempotencyRepository(connection)
+        assert repository.mark_completed(scope, record.key, record.claim_generation, "done")
+        assert repository.classify_in_progress(
+            scope, record.key, record.claim_generation, timedelta(minutes=5),
+        ) is InProgressClaimState.CHANGED_OR_MISSING
+        connection.rollback()
+
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, record.key),
+        )
+        replacement = repository.reclaim_stale(
+            scope, record.key, record.claim_generation, timedelta(minutes=5),
+        )
+        assert replacement is not None
+        assert replacement.claim_generation == record.claim_generation + 1
+        assert repository.classify_in_progress(
+            scope, record.key, record.claim_generation, timedelta(minutes=5),
+        ) is InProgressClaimState.CHANGED_OR_MISSING
+        connection.commit()
+
+
+def test_only_one_stale_reclaimer_wins_and_failed_owner_is_fenced(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as first, pool.connection() as second:
+        first_repository = IdempotencyRepository(first)
+        second_repository = IdempotencyRepository(second)
+        first.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, original.key),
+        )
+        first.commit()
+        winner = first_repository.reclaim_stale(
+            scope, original.key, original.claim_generation, timedelta(minutes=5),
+        )
+        first.commit()
+        loser = second_repository.reclaim_stale(
+            scope, original.key, original.claim_generation, timedelta(minutes=5),
+        )
+        assert winner is not None
+        assert loser is None
+        assert second_repository.mark_failed(scope, original.key, original.claim_generation) is None
+        assert second_repository.mark_failed(scope, winner.key, winner.claim_generation) is not None
+        second.commit()
+
+
+def test_two_concurrent_stale_reclaimers_have_one_generation_winner(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, original.key),
+        )
+        connection.commit()
+    barrier = threading.Barrier(2)
+
+    def reclaim() -> int | None:
+        with pool.connection() as connection:
+            barrier.wait(timeout=5)
+            winner = IdempotencyRepository(connection).reclaim_stale(
+                scope, original.key, original.claim_generation, timedelta(minutes=5),
+            )
+            connection.commit()
+            return winner.claim_generation if winner is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        results = list(workers.map(lambda _: reclaim(), range(2)))
+    assert results.count(original.claim_generation + 1) == 1
+    assert results.count(None) == 1
+
+
+def test_completion_and_stale_reclaim_race_have_one_authoritative_winner(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, original.key),
+        )
+        connection.commit()
+    barrier = threading.Barrier(2)
+
+    def complete() -> bool:
+        with pool.connection() as connection:
+            barrier.wait(timeout=5)
+            completed = IdempotencyRepository(connection).mark_completed(
+                scope, original.key, original.claim_generation, "winner",
+            )
+            connection.commit()
+            return completed is not None
+
+    def reclaim() -> int | None:
+        with pool.connection() as connection:
+            barrier.wait(timeout=5)
+            reclaimed = IdempotencyRepository(connection).reclaim_stale(
+                scope, original.key, original.claim_generation, timedelta(minutes=5),
+            )
+            connection.commit()
+            return reclaimed.claim_generation if reclaimed is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        completion = workers.submit(complete)
+        reclaim_result = workers.submit(reclaim)
+        completion_won = completion.result()
+        reclaimed_generation = reclaim_result.result()
+    assert completion_won ^ (reclaimed_generation == original.claim_generation + 1)
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, original.key)
+    assert current is not None
+    if completion_won:
+        assert current.status is IdempotencyStatus.COMPLETED
+        assert current.claim_generation == original.claim_generation
+    else:
+        assert current.status is IdempotencyStatus.IN_PROGRESS
+        assert current.claim_generation == original.claim_generation + 1
+
+
+def test_successful_stale_reclaim_rolls_back_to_original_owner(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, original.key),
+        )
+        connection.commit()
+    with pool.connection() as connection:
+        before = IdempotencyRepository(connection).get(scope, original.key)
+        assert before is not None and before.claimed_at is not None
+    with pool.connection() as connection:
+        replacement = IdempotencyRepository(connection).reclaim_stale(
+            scope, original.key, original.claim_generation, timedelta(minutes=5),
+        )
+        assert replacement is not None
+        assert replacement.claim_generation == original.claim_generation + 1
+        connection.rollback()
+    with pool.connection() as connection:
+        durable = IdempotencyRepository(connection).get(scope, original.key)
+    assert durable is not None
+    assert durable.status is IdempotencyStatus.IN_PROGRESS
+    assert durable.claim_generation == original.claim_generation
+    assert durable.claimed_at == before.claimed_at
+
+
 def test_current_claim_operations_return_none_for_stale_or_non_progress_record(
     scope: str,
 ) -> None:
@@ -199,12 +372,12 @@ def test_current_claim_operations_return_none_for_stale_or_non_progress_record(
 
     with pool.connection() as connection:
         repository = IdempotencyRepository(connection)
-        assert repository.mark_failed(record.scope, record.key, record.claimed_at) is not None
+        assert repository.mark_failed(record.scope, record.key, record.claim_generation) is not None
         connection.commit()
 
-        assert repository.reclaim(record.scope, record.key, record.claimed_at) is None
-        assert repository.mark_completed(record.scope, record.key, record.claimed_at, "result") is None
-        assert repository.mark_failed(record.scope, record.key, record.claimed_at) is None
+        assert repository.reclaim_stale(record.scope, record.key, record.claim_generation, timedelta(minutes=5)) is None
+        assert repository.mark_completed(record.scope, record.key, record.claim_generation, "result") is None
+        assert repository.mark_failed(record.scope, record.key, record.claim_generation) is None
 
 
 def test_caller_rollback_removes_uncommitted_claim(scope: str) -> None:

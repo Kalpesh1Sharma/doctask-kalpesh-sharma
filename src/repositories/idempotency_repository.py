@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import cast
 
@@ -12,6 +12,12 @@ class IdempotencyStatus(StrEnum):
     FAILED = "FAILED"
 
 
+class InProgressClaimState(StrEnum):
+    MATCHING_FRESH = "MATCHING_FRESH"
+    MATCHING_STALE = "MATCHING_STALE"
+    CHANGED_OR_MISSING = "CHANGED_OR_MISSING"
+
+
 _IDEMPOTENCY_COLUMNS = """
     id,
     scope,
@@ -19,6 +25,7 @@ _IDEMPOTENCY_COLUMNS = """
     status,
     result_reference,
     claimed_at,
+    claim_generation,
     created_at,
     completed_at
 """
@@ -36,6 +43,7 @@ class IdempotencyRecord:
     status: IdempotencyStatus
     result_reference: str | None
     claimed_at: datetime | None
+    claim_generation: int
     created_at: datetime
     completed_at: datetime | None
 
@@ -48,8 +56,9 @@ class IdempotencyRecord:
             status=IdempotencyStatus(str(row[3])),
             result_reference=_optional_string(row[4]),
             claimed_at=cast(datetime | None, row[5]),
-            created_at=cast(datetime, row[6]),
-            completed_at=cast(datetime | None, row[7]),
+            claim_generation=int(row[6]),
+            created_at=cast(datetime, row[7]),
+            completed_at=cast(datetime | None, row[8]),
         )
 
 
@@ -64,13 +73,15 @@ class IdempotencyRepository:
                 scope,
                 key,
                 status,
-                claimed_at
+                claimed_at,
+                claim_generation
             )
             VALUES (
                 %s,
                 %s,
                 'IN_PROGRESS'::idempotency_status,
-                clock_timestamp()
+                clock_timestamp(),
+                1
             )
             ON CONFLICT (scope, key) DO NOTHING
             RETURNING {_IDEMPOTENCY_COLUMNS}
@@ -93,23 +104,57 @@ class IdempotencyRepository:
 
         return IdempotencyRecord.from_row(row) if row is not None else None
 
-    def reclaim(
+    def classify_in_progress(
         self,
         scope: str,
         key: str,
-        claim_token: datetime,
+        observed_generation: int,
+        stale_after: timedelta,
+    ) -> InProgressClaimState:
+        row = self._connection.execute(
+            """
+            SELECT CASE
+                WHEN status = 'IN_PROGRESS'::idempotency_status
+                 AND claim_generation = %s
+                 AND claimed_at <= clock_timestamp() - %s::interval
+                    THEN 'MATCHING_STALE'
+                WHEN status = 'IN_PROGRESS'::idempotency_status
+                 AND claim_generation = %s
+                    THEN 'MATCHING_FRESH'
+                ELSE 'CHANGED_OR_MISSING'
+            END
+            FROM idempotency_records
+            WHERE scope = %s AND key = %s
+            """,
+            (observed_generation, stale_after, observed_generation, scope, key),
+        ).fetchone()
+        return (
+            InProgressClaimState(str(row[0]))
+            if row is not None
+            else InProgressClaimState.CHANGED_OR_MISSING
+        )
+
+    def reclaim_stale(
+        self,
+        scope: str,
+        key: str,
+        observed_generation: int,
+        stale_after: timedelta,
     ) -> IdempotencyRecord | None:
         row = self._connection.execute(
             f"""
             UPDATE idempotency_records
-            SET claimed_at = clock_timestamp()
+            SET
+                claim_generation = claim_generation + 1,
+                claimed_at = clock_timestamp()
             WHERE scope = %s
               AND key = %s
               AND status = 'IN_PROGRESS'::idempotency_status
-              AND claimed_at = %s::timestamptz
+              AND claim_generation = %s
+              AND claimed_at <= clock_timestamp() - %s::interval
             RETURNING {_IDEMPOTENCY_COLUMNS}
             """,
-            (scope, key, claim_token),
+            (scope, key, observed_generation, stale_after),
         ).fetchone()
 
         return IdempotencyRecord.from_row(row) if row is not None else None
@@ -118,7 +163,7 @@ class IdempotencyRepository:
         self,
         scope: str,
         key: str,
-        claim_token: datetime,
+        owner_generation: int,
         result_reference: str | None,
     ) -> IdempotencyRecord | None:
         row = self._connection.execute(
@@ -131,10 +176,10 @@ class IdempotencyRepository:
             WHERE scope = %s
               AND key = %s
               AND status = 'IN_PROGRESS'::idempotency_status
-              AND claimed_at = %s::timestamptz
+              AND claim_generation = %s
             RETURNING {_IDEMPOTENCY_COLUMNS}
             """,
-            (result_reference, scope, key, claim_token),
+            (result_reference, scope, key, owner_generation),
         ).fetchone()
 
         return IdempotencyRecord.from_row(row) if row is not None else None
@@ -143,7 +188,7 @@ class IdempotencyRepository:
         self,
         scope: str,
         key: str,
-        claim_token: datetime,
+        owner_generation: int,
     ) -> IdempotencyRecord | None:
         row = self._connection.execute(
             f"""
@@ -152,10 +197,10 @@ class IdempotencyRepository:
             WHERE scope = %s
               AND key = %s
               AND status = 'IN_PROGRESS'::idempotency_status
-              AND claimed_at = %s::timestamptz
+              AND claim_generation = %s
             RETURNING {_IDEMPOTENCY_COLUMNS}
             """,
-            (scope, key, claim_token),
+            (scope, key, owner_generation),
         ).fetchone()
 
         return IdempotencyRecord.from_row(row) if row is not None else None

@@ -2,13 +2,19 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 from uuid import uuid4
 
 from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.idempotency_claim_takeover import (
+    DEFAULT_STALE_CLAIM_AFTER,
+    classify_in_progress,
+    reclaim_if_stale,
+    validate_stale_claim_after,
+)
 from domain.fact import FactStatus
 from domain.fact_extraction import normalize_uuid
 from domain.finding import Finding, FindingStatus, FindingType
@@ -31,10 +37,11 @@ from repositories.idempotency_repository import (
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
+    InProgressClaimState,
 )
 from repositories.run_fact_repository import RunFactReconciliationRecord, RunFactRepository
 from repositories.run_finding_repository import RunFindingRepository
-from repositories.run_repository import RunRepository
+from repositories.run_repository import RunRecord, RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
 from services.rule_evaluation_provider import RuleEvaluationProvider, RuleEvaluationProviderError
 
@@ -122,7 +129,7 @@ class EvaluateRunRulesResult:
 class _Claim:
     request: RuleEvaluationRequest
     fingerprint: str
-    token: datetime
+    token: int
 
 
 @dataclass(frozen=True)
@@ -138,11 +145,14 @@ class EvaluateRunRulesService:
         provider: RuleEvaluationProvider,
         trusted_instructions: str,
         instruction_version: str,
+        *,
+        stale_claim_after: timedelta = DEFAULT_STALE_CLAIM_AFTER,
     ) -> None:
         self._connection_pool = connection_pool
         self._provider = provider
         self._trusted_instructions = trusted_instructions
         self._instruction_version = instruction_version
+        self._stale_claim_after = validate_stale_claim_after(stale_claim_after)
 
     def evaluate(self, command: EvaluateRunRulesCommand) -> EvaluateRunRulesResult:
         run_id = self._normalize_run_id(command.run_id)
@@ -186,24 +196,53 @@ class EvaluateRunRulesService:
         run = RunRepository(connection).get_for_update(run_id)
         if run is None:
             raise RuleEvaluationRunNotFoundError(f"run {run_id} does not exist")
-        request = self._load_request(connection, run_id)
-        fingerprint = rule_evaluation_input_fingerprint(request)
-        reference = self._reference(run_id, fingerprint)
         repository = IdempotencyRepository(connection)
         existing = repository.get(_SCOPE, self._key(run_id))
-        if existing is not None:
-            return self._resolve_existing(existing, request, fingerprint, reference)
+        if existing is None:
+            if run.status is not RunStatus.RUNNING:
+                raise RuleEvaluationRunNotEligibleError(f"run {run_id} is not running rule evaluation")
+            request = self._load_request(connection, run_id)
+            fingerprint = rule_evaluation_input_fingerprint(request)
+            record = repository.claim(_SCOPE, self._key(run_id))
+            if record is not None:
+                return _Claim(request, fingerprint, record.claim_generation)
+            return self._resolve_authoritative_existing(connection, run, repository)
+        if existing.status is IdempotencyStatus.FAILED:
+            raise RuleEvaluationPreviouslyFailedError("rule evaluation previously failed")
+        if existing.status is IdempotencyStatus.COMPLETED:
+            return self._resolve_completed_existing(connection, run, existing)
+        state = classify_in_progress(repository, existing, self._stale_claim_after)
+        if state is InProgressClaimState.MATCHING_FRESH:
+            raise RuleEvaluationInProgressError("rule evaluation is already in progress")
+        if state is InProgressClaimState.CHANGED_OR_MISSING:
+            return self._resolve_authoritative_existing(connection, run, repository)
         if run.status is not RunStatus.RUNNING:
             raise RuleEvaluationRunNotEligibleError(f"run {run_id} is not running rule evaluation")
-        record = repository.claim(_SCOPE, self._key(run_id))
-        if record is None:
-            existing = repository.get(_SCOPE, self._key(run_id))
-            if existing is None:
-                raise RuleEvaluationIdempotencyIntegrityError("claimed operation disappeared")
-            return self._resolve_existing(existing, request, fingerprint, reference)
-        if record.claimed_at is None:
-            raise RuleEvaluationIdempotencyIntegrityError("claim has no fencing token")
-        return _Claim(request, fingerprint, record.claimed_at)
+        request = self._load_request(connection, run_id)
+        fingerprint = rule_evaluation_input_fingerprint(request)
+        record = reclaim_if_stale(repository, existing, self._stale_claim_after)
+        if record is not None:
+            return _Claim(request, fingerprint, record.claim_generation)
+        return self._resolve_authoritative_existing(connection, run, repository)
+
+    def _resolve_authoritative_existing(
+        self, connection: Connection, run: RunRecord, repository: IdempotencyRepository,
+    ) -> EvaluateRunRulesResult:
+        current = repository.get(_SCOPE, self._key(run.run_id))
+        if current is None:
+            raise RuleEvaluationIdempotencyIntegrityError("claimed operation disappeared")
+        if current.status is IdempotencyStatus.FAILED:
+            raise RuleEvaluationPreviouslyFailedError("rule evaluation previously failed")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise RuleEvaluationInProgressError("rule evaluation is already in progress")
+        return self._resolve_completed_existing(connection, run, current)
+
+    def _resolve_completed_existing(
+        self, connection: Connection, run: RunRecord, existing: IdempotencyRecord,
+    ) -> EvaluateRunRulesResult:
+        request = self._load_request(connection, run.run_id)
+        fingerprint = rule_evaluation_input_fingerprint(request)
+        return self._resolve_existing(existing, request, fingerprint, self._reference(run.run_id, fingerprint))
 
     def _resolve_existing(
         self,
@@ -265,9 +304,11 @@ class EvaluateRunRulesService:
         for attempt in range(_MAX_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
-                    IdempotencyRepository(connection).mark_failed(
+                    failed = IdempotencyRepository(connection).mark_failed(
                         _SCOPE, self._key(claim.request.run_id), claim.token,
                     )
+                    if failed is None:
+                        raise RuleEvaluationClaimLostError("rule-evaluation claim is no longer owned")
                     connection.commit()
                     return
             except (DeadlockDetected, SerializationFailure):

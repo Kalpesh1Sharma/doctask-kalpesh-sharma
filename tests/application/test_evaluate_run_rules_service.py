@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -502,11 +503,63 @@ def test_completed_replay_conflict_integrity_and_prior_claim_outcomes() -> None:
     with pool.connection() as connection:
         current = IdempotencyRepository(connection).get("rule-evaluation-v1", f"examine-rules:{candidate.run_id}")
         assert current is not None and current.claimed_at is not None
-        IdempotencyRepository(connection).mark_failed("rule-evaluation-v1", f"examine-rules:{candidate.run_id}", current.claimed_at)
+        IdempotencyRepository(connection).mark_failed("rule-evaluation-v1", f"examine-rules:{candidate.run_id}", current.claim_generation)
         connection.commit()
     with pytest.raises(RuleEvaluationPreviouslyFailedError):
         service(silent).evaluate(EvaluateRunRulesCommand(candidate.run_id))
     assert silent.calls == []
+
+
+def test_fresh_owner_precedes_scope_and_fact_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resources = create_resources()
+    scope = "rule-evaluation-v1"
+    key = f"examine-rules:{resources.run_id}"
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.commit()
+    provider = FakeProvider(no_violation(resources))
+
+    def invalid_request(*_args):
+        raise RuleScopeNotCapturedError("current scope is missing")
+
+    monkeypatch.setattr(EvaluateRunRulesService, "_load_request", invalid_request)
+    with pytest.raises(RuleEvaluationInProgressError):
+        service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+    assert provider.calls == []
+
+
+def test_stale_claim_with_ineligible_run_does_not_reclaim() -> None:
+    resources = create_resources()
+    scope = "rule-evaluation-v1"
+    key = f"examine-rules:{resources.run_id}"
+    provider = FakeProvider(no_violation(resources))
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).claim(scope, key)
+        assert record is not None
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            (scope, key),
+        )
+        connection.execute(
+            "UPDATE runs SET status = 'REVIEW_REQUIRED'::run_status WHERE id = %s::uuid",
+            (resources.run_id,),
+        )
+        connection.commit()
+    with pool.connection() as connection:
+        aged = IdempotencyRepository(connection).get(scope, key)
+    assert aged is not None and aged.claimed_at is not None
+    with pytest.raises(RuleEvaluationRunNotEligibleError):
+        service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+    assert provider.calls == []
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, key)
+    assert current is not None
+    assert current.status is IdempotencyStatus.IN_PROGRESS
+    assert current.claim_generation == aged.claim_generation
+    assert current.claimed_at == aged.claimed_at
 
 
 def test_reclaimed_stale_claim_and_post_staging_database_failure_roll_back(
@@ -514,20 +567,81 @@ def test_reclaimed_stale_claim_and_post_staging_database_failure_roll_back(
 ) -> None:
     resources = create_resources()
     provider = FakeProvider(response_for(resources))
+    stale_generation: list[int] = []
 
     def reclaim(_: RuleEvaluationRequest) -> None:
         with pool.connection() as connection:
             repository = IdempotencyRepository(connection)
             current = repository.get("rule-evaluation-v1", f"examine-rules:{resources.run_id}")
             assert current is not None and current.claimed_at is not None
-            assert repository.reclaim("rule-evaluation-v1", f"examine-rules:{resources.run_id}", current.claimed_at) is not None
+            stale_generation.append(current.claim_generation)
+            connection.execute("UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s", ("rule-evaluation-v1", f"examine-rules:{resources.run_id}"))
+            replacement = repository.reclaim_stale(
+                "rule-evaluation-v1",
+                f"examine-rules:{resources.run_id}",
+                current.claim_generation,
+                timedelta(minutes=5),
+            )
+            assert replacement is not None
+            assert replacement.claim_generation == current.claim_generation + 1
             connection.commit()
 
     provider.before_return = reclaim
     with pytest.raises(RuleEvaluationClaimLostError):
         service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+
+    assert stale_generation
     assert finding_count(resources) == 0
-    assert record(resources).status is IdempotencyStatus.IN_PROGRESS  # type: ignore[union-attr]
+    replacement = record(resources)
+    assert replacement is not None
+    assert replacement.status is IdempotencyStatus.IN_PROGRESS
+    assert replacement.claim_generation == stale_generation[0] + 1
+    with pool.connection() as connection:
+        run_findings = connection.execute(
+            "SELECT count(*) FROM run_findings WHERE run_id = %s::uuid",
+            (resources.run_id,),
+        ).fetchone()
+        finding_evidence = connection.execute(
+            "SELECT count(*) FROM finding_evidence WHERE finding_id IN (SELECT id FROM findings WHERE origin_run_id = %s::uuid)",
+            (resources.run_id,),
+        ).fetchone()
+        connection.execute(
+            "UPDATE idempotency_records SET claimed_at = clock_timestamp() - interval '6 minutes' WHERE scope = %s AND key = %s",
+            ("rule-evaluation-v1", f"examine-rules:{resources.run_id}"),
+        )
+        connection.commit()
+    assert run_findings == (0,)
+    assert finding_evidence == (0,)
+
+    recovery_provider = FakeProvider(response_for(resources))
+    recovered = service(recovery_provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+    assert recovered.replayed is False
+    assert len(recovery_provider.calls) == 1
+
+    final = record(resources)
+    assert final is not None
+    assert final.status is IdempotencyStatus.COMPLETED
+    assert final.claim_generation > stale_generation[0]
+    assert finding_count(resources) == 1
+    with pool.connection() as connection:
+        findings = connection.execute(
+            "SELECT id, finding_type, rule_id, status FROM findings WHERE origin_run_id = %s::uuid",
+            (resources.run_id,),
+        ).fetchall()
+        memberships = connection.execute(
+            "SELECT finding_id, relation FROM run_findings WHERE run_id = %s::uuid",
+            (resources.run_id,),
+        ).fetchall()
+        evidence = connection.execute(
+            "SELECT evidence_span_id FROM finding_evidence WHERE finding_id = %s::uuid ORDER BY evidence_span_id",
+            (str(findings[0][0]),),
+        ).fetchall()
+    assert len(findings) == 1
+    assert findings[0][1] == "RULE_VIOLATION"
+    assert str(findings[0][2]) == resources.rule_id
+    assert findings[0][3] == "PENDING"
+    assert memberships == [(findings[0][0], "CREATED")]
+    assert [str(row[0]) for row in evidence] == [resources.evidence_id]
 
     broken = create_resources()
     original = evaluation_module.IdempotencyRepository.mark_completed

@@ -182,7 +182,7 @@ def test_shape_valid_but_wrong_stored_fingerprint_is_application_integrity_error
 
 
 def test_migrations_apply_to_a_clean_database_in_order() -> None:
-    """Exercise 001 -> 002 -> 003 without relying on the shared test database."""
+    """Exercise 001 -> 002 -> 003 -> 004 without the shared test database."""
     database_name = f"task1_phase4b_{uuid4().hex}"
     connection_info = conninfo_to_dict(get_settings().database_url)
     connection_info["dbname"] = "postgres"
@@ -191,6 +191,7 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
         Path("sql/migrations/001_schema_v2_7.sql"),
         Path("sql/migrations/002_run_rule_scope.sql"),
         Path("sql/migrations/003_update_review.sql"),
+        Path("sql/migrations/004_idempotency_claim_generation.sql"),
     )
     with connect(admin_info, autocommit=True) as admin:
         admin.execute(f'CREATE DATABASE "{database_name}"')
@@ -199,6 +200,10 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
         database_info["dbname"] = database_name
         with connect(make_conninfo(**database_info)) as isolated:
             for migration_path in migration_paths:
+                if migration_path.name == "004_idempotency_claim_generation.sql":
+                    isolated.execute(
+                        "INSERT INTO idempotency_records (scope, key, status, claimed_at) VALUES ('migration-004', 'legacy', 'COMPLETED'::idempotency_status, clock_timestamp())",
+                    )
                 isolated.execute(migration_path.read_text(encoding="utf-8"))
                 isolated.commit()
             table_count = isolated.execute(
@@ -224,11 +229,66 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                 "validate_update_change_set_insert()",
                 "validate_update_review_decision_insert()",
             )
+            generation = isolated.execute(
+                "SELECT claim_generation FROM idempotency_records WHERE scope = 'migration-004' AND key = 'legacy'",
+            ).fetchone()
+            assert generation == (0,)
+            default = isolated.execute(
+                "SELECT column_default FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'idempotency_records' AND column_name = 'claim_generation'",
+            ).fetchone()
+            assert default is not None and "1" in str(default[0])
+            future = isolated.execute(
+                "INSERT INTO idempotency_records (scope, key, status, claimed_at) VALUES ('migration-004', 'future', 'IN_PROGRESS'::idempotency_status, clock_timestamp()) RETURNING claim_generation",
+            ).fetchone()
+            assert future == (1,)
     finally:
         with connect(admin_info, autocommit=True) as admin:
             admin.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (database_name,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+
+
+def test_migration_004_rejects_malformed_legacy_in_progress_claim() -> None:
+    database_name = f"task1_phase5b_bad_{uuid4().hex}"
+    connection_info = conninfo_to_dict(get_settings().database_url)
+    connection_info["dbname"] = "postgres"
+    admin_info = make_conninfo(**connection_info)
+    migrations = (
+        Path("sql/migrations/001_schema_v2_7.sql"),
+        Path("sql/migrations/002_run_rule_scope.sql"),
+        Path("sql/migrations/003_update_review.sql"),
+    )
+    with connect(admin_info, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{database_name}"')
+    try:
+        database_info = dict(connection_info)
+        database_info["dbname"] = database_name
+        with connect(make_conninfo(**database_info)) as isolated:
+            for migration in migrations:
+                isolated.execute(migration.read_text(encoding="utf-8"))
+                isolated.commit()
+            isolated.execute(
+                "INSERT INTO idempotency_records (scope, key, status, claimed_at) VALUES ('bad-004', 'null-lease', 'IN_PROGRESS'::idempotency_status, NULL)",
+            )
+            isolated.commit()
+            with pytest.raises(RaiseException, match="NULL claimed_at"):
+                isolated.execute(
+                    Path("sql/migrations/004_idempotency_claim_generation.sql").read_text(
+                        encoding="utf-8",
+                    ),
+                )
+            isolated.rollback()
+            row = isolated.execute(
+                "SELECT claimed_at FROM idempotency_records WHERE scope = 'bad-004'",
+            ).fetchone()
+            assert row == (None,)
+    finally:
+        with connect(admin_info, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
                 (database_name,),
             )
             admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')

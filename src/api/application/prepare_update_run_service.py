@@ -2,12 +2,18 @@
 
 import re
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import timedelta
 
 from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.idempotency_claim_takeover import (
+    DEFAULT_STALE_CLAIM_AFTER,
+    classify_in_progress,
+    reclaim_if_stale,
+    validate_stale_claim_after,
+)
 from domain.document_version import DocumentProcessingStatus
 from domain.fact import FactStatus
 from domain.fact_extraction import normalize_uuid
@@ -25,6 +31,7 @@ from repositories.idempotency_repository import (
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
+    InProgressClaimState,
 )
 from repositories.run_document_version_repository import (
     RunDocumentVersionRepository,
@@ -113,7 +120,7 @@ class PrepareUpdateRunResult:
 class _Claim:
     manifest: UpdatePreparationManifest
     input_fingerprint: str
-    token: datetime
+    token: int
 
 
 def build_current_update_preparation_manifest(
@@ -223,8 +230,14 @@ def build_current_update_preparation_manifest(
 
 
 class PrepareUpdateRunService:
-    def __init__(self, connection_pool: ConnectionPool) -> None:
+    def __init__(
+        self,
+        connection_pool: ConnectionPool,
+        *,
+        stale_claim_after: timedelta = DEFAULT_STALE_CLAIM_AFTER,
+    ) -> None:
         self._connection_pool = connection_pool
+        self._stale_claim_after = validate_stale_claim_after(stale_claim_after)
 
     def prepare(self, command: PrepareUpdateRunCommand) -> PrepareUpdateRunResult:
         run_id = self._normalize_run_id(command.run_id)
@@ -258,25 +271,67 @@ class PrepareUpdateRunService:
         run = RunRepository(connection).get_for_update(run_id)
         if run is None:
             raise UpdatePreparationRunNotFoundError(f"run {run_id} does not exist")
-        manifest = self._build_manifest(connection, run)
-        fingerprint = update_preparation_fingerprint(manifest)
-        reference = self._reference(run_id, fingerprint)
         idempotency = IdempotencyRepository(connection)
         existing = idempotency.get(_SCOPE, self._key(run_id))
-        if existing is not None:
-            return self._resolve_existing(existing, manifest, fingerprint, reference)
+        if existing is None:
+            self._validate_fresh_run(run)
+            self._require_empty_target_state(connection, run_id)
+            manifest = self._build_manifest(connection, run)
+            fingerprint = update_preparation_fingerprint(manifest)
+            claimed = idempotency.claim(_SCOPE, self._key(run_id))
+            if claimed is not None:
+                return _Claim(manifest, fingerprint, claimed.claim_generation)
+            return self._resolve_authoritative_existing(connection, run, idempotency)
+
+        if existing.status is IdempotencyStatus.FAILED:
+            raise UpdatePreparationPreviouslyFailedError("UPDATE preparation previously failed")
+        if existing.status is IdempotencyStatus.COMPLETED:
+            return self._resolve_completed_existing(connection, run, existing)
+
+        state = classify_in_progress(idempotency, existing, self._stale_claim_after)
+        if state is InProgressClaimState.MATCHING_FRESH:
+            raise UpdatePreparationInProgressError("UPDATE preparation is already in progress")
+        if state is InProgressClaimState.CHANGED_OR_MISSING:
+            return self._resolve_authoritative_existing(connection, run, idempotency)
 
         self._validate_fresh_run(run)
         self._require_empty_target_state(connection, run_id)
-        claimed = idempotency.claim(_SCOPE, self._key(run_id))
-        if claimed is None:
-            existing = idempotency.get(_SCOPE, self._key(run_id))
-            if existing is None:
-                raise UpdatePreparationIdempotencyIntegrityError("claimed operation disappeared")
-            return self._resolve_existing(existing, manifest, fingerprint, reference)
-        if claimed.claimed_at is None:
-            raise UpdatePreparationIdempotencyIntegrityError("claim has no fencing token")
-        return _Claim(manifest, fingerprint, claimed.claimed_at)
+        manifest = self._build_manifest(connection, run)
+        fingerprint = update_preparation_fingerprint(manifest)
+        claimed = reclaim_if_stale(idempotency, existing, self._stale_claim_after)
+        if claimed is not None:
+            return _Claim(manifest, fingerprint, claimed.claim_generation)
+        return self._resolve_authoritative_existing(connection, run, idempotency)
+
+    def _resolve_authoritative_existing(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        idempotency: IdempotencyRepository,
+    ) -> PrepareUpdateRunResult:
+        current = idempotency.get(_SCOPE, self._key(run.run_id))
+        if current is None:
+            raise UpdatePreparationIdempotencyIntegrityError("claimed operation disappeared")
+        if current.status is IdempotencyStatus.FAILED:
+            raise UpdatePreparationPreviouslyFailedError("UPDATE preparation previously failed")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise UpdatePreparationInProgressError("UPDATE preparation is already in progress")
+        return self._resolve_completed_existing(connection, run, current)
+
+    def _resolve_completed_existing(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        existing: IdempotencyRecord,
+    ) -> PrepareUpdateRunResult:
+        manifest = self._build_manifest(connection, run)
+        fingerprint = update_preparation_fingerprint(manifest)
+        return self._resolve_existing(
+            existing,
+            manifest,
+            fingerprint,
+            self._reference(run.run_id, fingerprint),
+        )
 
     def _persist(self, claim: _Claim) -> None:
         for attempt in range(_MAX_ATTEMPTS):
