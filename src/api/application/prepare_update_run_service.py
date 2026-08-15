@@ -116,6 +116,112 @@ class _Claim:
     token: datetime
 
 
+def build_current_update_preparation_manifest(
+    connection: Connection,
+    update_run: RunRecord,
+) -> UpdatePreparationManifest:
+    """Reconstruct an UPDATE preparation manifest without changing durable state."""
+    if update_run.baseline_run_id is None or update_run.trigger_document_version_id is None:
+        raise UpdatePreparationRunNotEligibleError("UPDATE Run requires baseline and trigger")
+    baseline = RunRepository(connection).get_by_id(update_run.baseline_run_id)
+    if (
+        baseline is None
+        or baseline.pile_id != update_run.pile_id
+        or baseline.status is not RunStatus.COMPLETED
+    ):
+        raise UpdatePreparationBaselineError("baseline must be a completed Run in the same pile")
+
+    trigger = DocumentVersionRepository(connection).get_by_id(
+        update_run.trigger_document_version_id,
+    )
+    if trigger is None:
+        raise UpdatePreparationTriggerError("trigger document version does not exist")
+    trigger_document = DocumentRepository(connection).get_by_id(trigger.document_id)
+    if (
+        trigger_document is None
+        or trigger_document.pile_id != update_run.pile_id
+        or trigger.processing_status is not DocumentProcessingStatus.READY
+    ):
+        raise UpdatePreparationTriggerError("trigger must be a READY version in the Run pile")
+
+    baseline_scope = RunDocumentVersionRepository(connection).list_scope_for_run(
+        baseline.run_id,
+    )
+    by_document: dict[str, RunDocumentVersionScopeRecord] = {}
+    for item in baseline_scope:
+        if (
+            item.document_pile_id != update_run.pile_id
+            or item.processing_status is not DocumentProcessingStatus.READY
+        ):
+            raise UpdatePreparationBaselineScopeError(
+                "baseline contains a non-READY or cross-pile document version",
+            )
+        if item.document_id in by_document:
+            raise UpdatePreparationBaselineScopeError(
+                "baseline contains multiple versions for one document",
+            )
+        by_document[item.document_id] = item
+
+    baseline_for_trigger = by_document.get(trigger.document_id)
+    if baseline_for_trigger is not None:
+        if baseline_for_trigger.document_version_id == trigger.document_version_id:
+            raise UpdatePreparationTriggerError("trigger already belongs to baseline scope")
+        if trigger.version_number <= baseline_for_trigger.version_number:
+            raise UpdatePreparationTriggerError("trigger version must advance the baseline document")
+
+    changes: list[UpdateDocumentChange] = []
+    for document_id, item in by_document.items():
+        if document_id == trigger.document_id:
+            changes.append(UpdateDocumentChange(
+                document_id=document_id,
+                kind=UpdateDocumentChangeKind.REPLACED,
+                baseline_document_version_id=item.document_version_id,
+                target_document_version_id=trigger.document_version_id,
+                target_version_number=trigger.version_number,
+                target_content_hash=trigger.content_hash,
+            ))
+        else:
+            changes.append(UpdateDocumentChange(
+                document_id=document_id,
+                kind=UpdateDocumentChangeKind.RETAINED,
+                baseline_document_version_id=item.document_version_id,
+                target_document_version_id=item.document_version_id,
+                target_version_number=item.version_number,
+                target_content_hash=item.content_hash,
+            ))
+    if baseline_for_trigger is None:
+        changes.append(UpdateDocumentChange(
+            document_id=trigger.document_id,
+            kind=UpdateDocumentChangeKind.ADDED,
+            baseline_document_version_id=None,
+            target_document_version_id=trigger.document_version_id,
+            target_version_number=trigger.version_number,
+            target_content_hash=trigger.content_hash,
+        ))
+
+    retained_versions = {
+        change.target_document_version_id
+        for change in changes
+        if change.kind is UpdateDocumentChangeKind.RETAINED
+    }
+    carried_fact_ids = tuple(
+        record.fact_id
+        for record in RunFactRepository(connection).list_reconciliation_input_for_run(
+            baseline.run_id,
+        )
+        if record.status in {FactStatus.CONFIRMED, FactStatus.DISPUTED}
+        and record.evidence
+        and all(item.document_version_id in retained_versions for item in record.evidence)
+    )
+    return UpdatePreparationManifest(
+        run_id=update_run.run_id,
+        baseline_run_id=baseline.run_id,
+        trigger_document_version_id=trigger.document_version_id,
+        document_changes=tuple(changes),
+        carried_fact_ids=carried_fact_ids,
+    )
+
+
 class PrepareUpdateRunService:
     def __init__(self, connection_pool: ConnectionPool) -> None:
         self._connection_pool = connection_pool
@@ -217,105 +323,7 @@ class PrepareUpdateRunService:
         connection: Connection,
         update_run: RunRecord,
     ) -> UpdatePreparationManifest:
-        if update_run.baseline_run_id is None or update_run.trigger_document_version_id is None:
-            raise UpdatePreparationRunNotEligibleError("UPDATE Run requires baseline and trigger")
-        baseline = RunRepository(connection).get_by_id(update_run.baseline_run_id)
-        if (
-            baseline is None
-            or baseline.pile_id != update_run.pile_id
-            or baseline.status is not RunStatus.COMPLETED
-        ):
-            raise UpdatePreparationBaselineError("baseline must be a completed Run in the same pile")
-
-        trigger = DocumentVersionRepository(connection).get_by_id(
-            update_run.trigger_document_version_id,
-        )
-        if trigger is None:
-            raise UpdatePreparationTriggerError("trigger document version does not exist")
-        trigger_document = DocumentRepository(connection).get_by_id(trigger.document_id)
-        if (
-            trigger_document is None
-            or trigger_document.pile_id != update_run.pile_id
-            or trigger.processing_status is not DocumentProcessingStatus.READY
-        ):
-            raise UpdatePreparationTriggerError("trigger must be a READY version in the Run pile")
-
-        baseline_scope = RunDocumentVersionRepository(connection).list_scope_for_run(
-            baseline.run_id,
-        )
-        by_document: dict[str, RunDocumentVersionScopeRecord] = {}
-        for item in baseline_scope:
-            if (
-                item.document_pile_id != update_run.pile_id
-                or item.processing_status is not DocumentProcessingStatus.READY
-            ):
-                raise UpdatePreparationBaselineScopeError(
-                    "baseline contains a non-READY or cross-pile document version",
-                )
-            if item.document_id in by_document:
-                raise UpdatePreparationBaselineScopeError(
-                    "baseline contains multiple versions for one document",
-                )
-            by_document[item.document_id] = item
-
-        baseline_for_trigger = by_document.get(trigger.document_id)
-        if baseline_for_trigger is not None:
-            if baseline_for_trigger.document_version_id == trigger.document_version_id:
-                raise UpdatePreparationTriggerError("trigger already belongs to baseline scope")
-            if trigger.version_number <= baseline_for_trigger.version_number:
-                raise UpdatePreparationTriggerError("trigger version must advance the baseline document")
-
-        changes: list[UpdateDocumentChange] = []
-        for document_id, item in by_document.items():
-            if document_id == trigger.document_id:
-                changes.append(UpdateDocumentChange(
-                    document_id=document_id,
-                    kind=UpdateDocumentChangeKind.REPLACED,
-                    baseline_document_version_id=item.document_version_id,
-                    target_document_version_id=trigger.document_version_id,
-                    target_version_number=trigger.version_number,
-                    target_content_hash=trigger.content_hash,
-                ))
-            else:
-                changes.append(UpdateDocumentChange(
-                    document_id=document_id,
-                    kind=UpdateDocumentChangeKind.RETAINED,
-                    baseline_document_version_id=item.document_version_id,
-                    target_document_version_id=item.document_version_id,
-                    target_version_number=item.version_number,
-                    target_content_hash=item.content_hash,
-                ))
-        if baseline_for_trigger is None:
-            changes.append(UpdateDocumentChange(
-                document_id=trigger.document_id,
-                kind=UpdateDocumentChangeKind.ADDED,
-                baseline_document_version_id=None,
-                target_document_version_id=trigger.document_version_id,
-                target_version_number=trigger.version_number,
-                target_content_hash=trigger.content_hash,
-            ))
-
-        retained_versions = {
-            change.target_document_version_id
-            for change in changes
-            if change.kind is UpdateDocumentChangeKind.RETAINED
-        }
-        carried_fact_ids = tuple(
-            record.fact_id
-            for record in RunFactRepository(connection).list_reconciliation_input_for_run(
-                baseline.run_id,
-            )
-            if record.status in {FactStatus.CONFIRMED, FactStatus.DISPUTED}
-            and record.evidence
-            and all(item.document_version_id in retained_versions for item in record.evidence)
-        )
-        return UpdatePreparationManifest(
-            run_id=update_run.run_id,
-            baseline_run_id=baseline.run_id,
-            trigger_document_version_id=trigger.document_version_id,
-            document_changes=tuple(changes),
-            carried_fact_ids=carried_fact_ids,
-        )
+        return build_current_update_preparation_manifest(connection, update_run)
 
     def _resolve_existing(
         self,

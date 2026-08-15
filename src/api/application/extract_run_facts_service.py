@@ -9,6 +9,10 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.prepare_update_run_service import (
+    UpdatePreparationApplicationError,
+    build_current_update_preparation_manifest,
+)
 from domain.evidence import EvidenceSpan
 from domain.fact import Fact, FactStatus
 from domain.fact_extraction import (
@@ -17,13 +21,16 @@ from domain.fact_extraction import (
     FactExtractionRequest,
     FactExtractionResponse,
     FactExtractionSourceChunk,
+    UpdateFactExtractionRequest,
     fact_candidate_key,
     fact_extraction_input_fingerprint,
     normalize_uuid,
     sha256_text,
+    update_fact_extraction_input_fingerprint,
 )
-from domain.run import RunStatus
+from domain.run import RunStatus, RunType
 from domain.run_membership import RunMembershipRelation
+from domain.update_preparation import update_preparation_fingerprint
 from repositories.document_chunk_repository import DocumentChunkRecord, DocumentChunkRepository
 from repositories.evidence_span_repository import EvidenceSpanRepository
 from repositories.fact_evidence_repository import FactEvidenceRepository
@@ -35,10 +42,12 @@ from repositories.idempotency_repository import (
 )
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
-from repositories.run_repository import RunRepository
+from repositories.run_repository import RunRecord, RunRepository
 from services.fact_extraction_provider import FactExtractionProvider, FactExtractionProviderError
 
 _IDEMPOTENCY_SCOPE = "fact-extraction-v1"
+_UPDATE_IDEMPOTENCY_SCOPE = "fact-extraction-update-v2"
+_PREPARATION_SCOPE = "update-preparation-v1"
 _MAX_TRANSACTION_ATTEMPTS = 3
 
 
@@ -94,6 +103,18 @@ class FactExtractionProviderFailure(FactExtractionApplicationError):
     pass
 
 
+class UpdateFactExtractionPreparationError(FactExtractionApplicationError):
+    pass
+
+
+class UpdateFactExtractionTargetStateConflictError(FactExtractionApplicationError):
+    pass
+
+
+class LegacyUpdateFactExtractionConflictError(FactExtractionApplicationError):
+    pass
+
+
 @dataclass(frozen=True)
 class ExtractRunFactsCommand:
     run_id: str
@@ -108,9 +129,12 @@ class ExtractRunFactsResult:
 
 @dataclass(frozen=True)
 class _ClaimedOperation:
-    request: FactExtractionRequest
+    request: FactExtractionRequest | UpdateFactExtractionRequest
     input_fingerprint: str
     claim_token: datetime
+    idempotency_scope: str
+    idempotency_key: str
+    result_reference: str
 
 
 @dataclass(frozen=True)
@@ -196,6 +220,9 @@ class ExtractRunFactsService:
         if run is None:
             raise FactExtractionRunNotFoundError(f"run {command.run_id} does not exist")
 
+        if run.run_type is RunType.UPDATE:
+            return self._claim_or_replay_update_once(connection, run)
+
         request = self._load_request(connection, command.run_id, for_share=False)
         fingerprint = fact_extraction_input_fingerprint(request)
         result_reference = self._result_reference(command.run_id, fingerprint)
@@ -218,16 +245,74 @@ class ExtractRunFactsService:
         if claimed.claimed_at is None:
             raise FactExtractionIdempotencyIntegrityError("claim has no fencing token")
 
-        return _ClaimedOperation(request, fingerprint, claimed.claimed_at)
+        return _ClaimedOperation(
+            request,
+            fingerprint,
+            claimed.claimed_at,
+            _IDEMPOTENCY_SCOPE,
+            self._idempotency_key(command.run_id),
+            result_reference,
+        )
+
+    def _claim_or_replay_update_once(
+        self,
+        connection: Connection,
+        run: RunRecord,
+    ) -> _ClaimedOperation | ExtractRunFactsResult:
+        idempotency = IdempotencyRepository(connection)
+        key = self._update_idempotency_key(run.run_id)
+        existing = idempotency.get(_UPDATE_IDEMPOTENCY_SCOPE, key)
+        if existing is not None:
+            request = self._load_update_request(connection, run, for_share=False)
+            fingerprint = update_fact_extraction_input_fingerprint(request)
+            result_reference = self._update_result_reference(run.run_id, fingerprint)
+            return self._resolve_existing(existing, request, fingerprint, result_reference)
+
+        legacy = idempotency.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(run.run_id))
+        if legacy is not None:
+            raise LegacyUpdateFactExtractionConflictError(
+                "UPDATE Run has a legacy full-scope fact extraction operation",
+            )
+        request = self._load_update_request(connection, run, for_share=False)
+        fingerprint = update_fact_extraction_input_fingerprint(request)
+        result_reference = self._update_result_reference(run.run_id, fingerprint)
+        if run.status is not RunStatus.RUNNING:
+            raise FactExtractionRunNotEligibleError(
+                f"run {run.run_id} is not running fact extraction",
+            )
+        self._require_fresh_update_fact_state(connection, request)
+        claimed = idempotency.claim(_UPDATE_IDEMPOTENCY_SCOPE, key)
+        if claimed is None:
+            existing = idempotency.get(_UPDATE_IDEMPOTENCY_SCOPE, key)
+            if existing is None:
+                raise FactExtractionIdempotencyIntegrityError("claimed operation disappeared")
+            return self._resolve_existing(existing, request, fingerprint, result_reference)
+        if claimed.claimed_at is None:
+            raise FactExtractionIdempotencyIntegrityError("claim has no fencing token")
+        return _ClaimedOperation(
+            request,
+            fingerprint,
+            claimed.claimed_at,
+            _UPDATE_IDEMPOTENCY_SCOPE,
+            key,
+            result_reference,
+        )
 
     def _resolve_existing(
         self,
         existing: IdempotencyRecord,
-        request: FactExtractionRequest,
+        request: FactExtractionRequest | UpdateFactExtractionRequest,
         fingerprint: str,
         result_reference: str,
     ) -> ExtractRunFactsResult:
         if existing.status is IdempotencyStatus.COMPLETED:
+            if isinstance(request, UpdateFactExtractionRequest) and not self._is_update_reference(
+                existing.result_reference,
+                request.run_id,
+            ):
+                raise FactExtractionIdempotencyIntegrityError(
+                    "completed UPDATE fact extraction has malformed result reference",
+                )
             if existing.result_reference != result_reference:
                 raise FactExtractionInputConflictError(
                     "the run already completed fact extraction for different source input",
@@ -265,8 +350,19 @@ class ExtractRunFactsService:
                 f"run {claimed.request.run_id} is no longer running fact extraction",
             )
 
-        current_request = self._load_request(connection, claimed.request.run_id, for_share=True)
-        if fact_extraction_input_fingerprint(current_request) != claimed.input_fingerprint:
+        if isinstance(claimed.request, UpdateFactExtractionRequest):
+            try:
+                current_request = self._load_update_request(connection, run, for_share=True)
+            except UpdateFactExtractionPreparationError as error:
+                raise SourceInputDriftError(
+                    "UPDATE preparation state changed while provider work was in progress",
+                ) from error
+            current_fingerprint = update_fact_extraction_input_fingerprint(current_request)
+            self._require_fresh_update_fact_state(connection, current_request)
+        else:
+            current_request = self._load_request(connection, claimed.request.run_id, for_share=True)
+            current_fingerprint = fact_extraction_input_fingerprint(current_request)
+        if current_fingerprint != claimed.input_fingerprint:
             raise SourceInputDriftError("run source input changed while provider work was in progress")
 
         evidence_repository = EvidenceSpanRepository(connection)
@@ -290,10 +386,10 @@ class ExtractRunFactsService:
                 fact_evidence_repository.add(stored_fact.fact_id, evidence_ids[identity])
 
         completed = IdempotencyRepository(connection).mark_completed(
-            _IDEMPOTENCY_SCOPE,
-            self._idempotency_key(claimed.request.run_id),
+            claimed.idempotency_scope,
+            claimed.idempotency_key,
             claimed.claim_token,
-            self._result_reference(claimed.request.run_id, claimed.input_fingerprint),
+            claimed.result_reference,
         )
         if completed is None:
             raise FactExtractionClaimLostError("fact extraction claim is no longer owned")
@@ -303,8 +399,8 @@ class ExtractRunFactsService:
             try:
                 with self._connection_pool.connection() as connection:
                     IdempotencyRepository(connection).mark_failed(
-                        _IDEMPOTENCY_SCOPE,
-                        self._idempotency_key(claimed.request.run_id),
+                        claimed.idempotency_scope,
+                        claimed.idempotency_key,
                         claimed.claim_token,
                     )
                     connection.commit()
@@ -344,6 +440,126 @@ class ExtractRunFactsService:
                 for chunk in chunks
             ),
         )
+
+    def _load_update_request(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        *,
+        for_share: bool,
+    ) -> UpdateFactExtractionRequest:
+        if (
+            run.run_type is not RunType.UPDATE
+            or run.baseline_run_id is None
+            or run.trigger_document_version_id is None
+        ):
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE extraction requires an UPDATE Run with baseline and trigger",
+            )
+        try:
+            preparation = build_current_update_preparation_manifest(connection, run)
+        except UpdatePreparationApplicationError as error:
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE preparation state is invalid",
+            ) from error
+        preparation_fingerprint = self._preparation_fingerprint(connection, run.run_id)
+        expected_preparation_fingerprint = self._update_preparation_fingerprint(preparation)
+        if preparation_fingerprint != expected_preparation_fingerprint:
+            raise UpdateFactExtractionPreparationError(
+                "completed UPDATE preparation does not match current preparation state",
+            )
+
+        expected_version_ids = {
+            change.target_document_version_id for change in preparation.document_changes
+        }
+        target_memberships = RunDocumentVersionRepository(connection).list_for_run(run.run_id)
+        target_version_ids = {
+            membership.document_version_id for membership in target_memberships
+        }
+        if (
+            len(target_memberships) != len(target_version_ids)
+            or target_version_ids != expected_version_ids
+            or run.trigger_document_version_id not in target_version_ids
+        ):
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE document scope does not match completed preparation",
+            )
+
+        run_facts = RunFactRepository(connection).list_for_run(run.run_id)
+        carried_ids = {
+            membership.fact_id
+            for membership in run_facts
+            if membership.relation is RunMembershipRelation.CARRIED_FORWARD
+        }
+        expected_carried_ids = set(preparation.carried_fact_ids)
+        if carried_ids != expected_carried_ids:
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE carried Fact memberships do not match completed preparation",
+            )
+
+        chunk_repository = DocumentChunkRepository(connection)
+        chunks = self._list_chunks(
+            chunk_repository,
+            (run.trigger_document_version_id,),
+            for_share=for_share,
+        )
+        return UpdateFactExtractionRequest(
+            run_id=run.run_id,
+            baseline_run_id=run.baseline_run_id,
+            trigger_document_version_id=run.trigger_document_version_id,
+            preparation_fingerprint=preparation_fingerprint,
+            instruction_version=self._instruction_version,
+            trusted_instructions=self._trusted_instructions,
+            document_version_ids=(run.trigger_document_version_id,),
+            source_chunks=tuple(
+                FactExtractionSourceChunk(
+                    chunk_id=chunk.chunk_id,
+                    document_version_id=chunk.document_version_id,
+                    chunk_index=chunk.chunk_index,
+                    page_number=chunk.page_number,
+                    content=chunk.content,
+                    content_digest=sha256_text(chunk.content),
+                )
+                for chunk in chunks
+            ),
+        )
+
+    def _preparation_fingerprint(self, connection: Connection, run_id: str) -> str:
+        record = IdempotencyRepository(connection).get(
+            _PREPARATION_SCOPE,
+            self._update_preparation_key(run_id),
+        )
+        if record is None or record.status is not IdempotencyStatus.COMPLETED:
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE preparation has not completed",
+            )
+        if record.result_reference is None:
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE preparation has malformed result reference",
+            )
+        prefix = f"update-preparation:{run_id}:"
+        fingerprint = record.result_reference.removeprefix(prefix)
+        if (
+            not record.result_reference.startswith(prefix)
+            or not self._is_fingerprint(fingerprint)
+        ):
+            raise UpdateFactExtractionPreparationError(
+                "UPDATE preparation has malformed result reference",
+            )
+        return fingerprint
+
+    def _require_fresh_update_fact_state(
+        self,
+        connection: Connection,
+        request: UpdateFactExtractionRequest,
+    ) -> None:
+        if any(
+            membership.relation is RunMembershipRelation.CREATED
+            for membership in RunFactRepository(connection).list_for_run(request.run_id)
+        ):
+            raise UpdateFactExtractionTargetStateConflictError(
+                "fresh UPDATE extraction cannot add to an existing created Fact set",
+            )
 
     def _list_chunks(
         self,
@@ -457,3 +673,34 @@ class ExtractRunFactsService:
 
     def _result_reference(self, run_id: str, fingerprint: str) -> str:
         return f"fact-extraction:{run_id}:{fingerprint}"
+
+    @staticmethod
+    def _update_idempotency_key(run_id: str) -> str:
+        return f"understand-update:{run_id}"
+
+    @staticmethod
+    def _update_preparation_key(run_id: str) -> str:
+        return f"prepare-update:{run_id}"
+
+    @staticmethod
+    def _update_result_reference(run_id: str, fingerprint: str) -> str:
+        return f"fact-extraction-update:{run_id}:{fingerprint}"
+
+    @staticmethod
+    def _update_preparation_fingerprint(preparation) -> str:
+        return update_preparation_fingerprint(preparation)
+
+    @staticmethod
+    def _is_fingerprint(value: str) -> bool:
+        return (
+            value.startswith("sha256:")
+            and len(value) == len("sha256:") + 64
+            and all(character in "0123456789abcdef" for character in value[7:])
+        )
+
+    @classmethod
+    def _is_update_reference(cls, value: str | None, run_id: str) -> bool:
+        if value is None:
+            return False
+        prefix = f"fact-extraction-update:{run_id}:"
+        return value.startswith(prefix) and cls._is_fingerprint(value.removeprefix(prefix))

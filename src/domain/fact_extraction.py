@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, JsonValue, field_validator, model_validator
 
 _EXTRACTION_FORMAT = "fact-extraction-v1"
+_UPDATE_EXTRACTION_FORMAT = "fact-extraction-update-v2"
 
 
 def normalize_uuid(value: str, field_name: str) -> str:
@@ -169,6 +170,69 @@ class FactExtractionRequest(BaseModel):
         return self
 
 
+class UpdateFactExtractionRequest(BaseModel):
+    """The trigger-only provider input for a prepared UPDATE Run."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    format: Literal["fact-extraction-update-v2"] = _UPDATE_EXTRACTION_FORMAT
+    run_id: str
+    baseline_run_id: str
+    trigger_document_version_id: str
+    preparation_fingerprint: str
+    instruction_version: str
+    trusted_instructions: str
+    document_version_ids: tuple[str, ...]
+    source_chunks: tuple[FactExtractionSourceChunk, ...]
+
+    @field_validator("run_id", "baseline_run_id", "trigger_document_version_id")
+    @classmethod
+    def normalize_identifiers(cls, value: str, info) -> str:
+        return normalize_uuid(value, info.field_name)
+
+    @field_validator("preparation_fingerprint")
+    @classmethod
+    def validate_preparation_fingerprint(cls, value: str) -> str:
+        if not isinstance(value, str) or not value.startswith("sha256:"):
+            raise ValueError("preparation_fingerprint must be a canonical SHA-256 fingerprint")
+        digest = value.removeprefix("sha256:")
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("preparation_fingerprint must be a canonical SHA-256 fingerprint")
+        return value
+
+    @field_validator("document_version_ids")
+    @classmethod
+    def normalize_document_version_ids(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        normalized_values = tuple(
+            normalize_uuid(value, "document_version_ids") for value in values
+        )
+        if len(set(normalized_values)) != len(normalized_values):
+            raise ValueError("document_version_ids cannot contain duplicates")
+        return normalized_values
+
+    @field_validator("source_chunks")
+    @classmethod
+    def normalize_source_order(
+        cls,
+        source_chunks: tuple[FactExtractionSourceChunk, ...],
+    ) -> tuple[FactExtractionSourceChunk, ...]:
+        chunk_ids = [chunk.chunk_id for chunk in source_chunks]
+        if len(set(chunk_ids)) != len(chunk_ids):
+            raise ValueError("source_chunks cannot contain duplicate chunk IDs")
+        return tuple(sorted(source_chunks, key=lambda chunk: (chunk.chunk_index, chunk.chunk_id)))
+
+    @model_validator(mode="after")
+    def validate_trigger_only_scope(self) -> "UpdateFactExtractionRequest":
+        if self.document_version_ids != (self.trigger_document_version_id,):
+            raise ValueError("UPDATE extraction must include exactly the trigger document version")
+        if any(
+            chunk.document_version_id != self.trigger_document_version_id
+            for chunk in self.source_chunks
+        ):
+            raise ValueError("UPDATE source chunks must belong to the trigger document version")
+        return self
+
+
 def canonical_fact_extraction_input_bytes(request: FactExtractionRequest) -> bytes:
     return json.dumps(
         request.model_dump(mode="json"),
@@ -181,6 +245,27 @@ def canonical_fact_extraction_input_bytes(request: FactExtractionRequest) -> byt
 
 def fact_extraction_input_fingerprint(request: FactExtractionRequest) -> str:
     return f"sha256:{hashlib.sha256(canonical_fact_extraction_input_bytes(request)).hexdigest()}"
+
+
+def canonical_update_fact_extraction_input_bytes(
+    request: UpdateFactExtractionRequest,
+) -> bytes:
+    return json.dumps(
+        request.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
+def update_fact_extraction_input_fingerprint(
+    request: UpdateFactExtractionRequest,
+) -> str:
+    return (
+        "sha256:"
+        f"{hashlib.sha256(canonical_update_fact_extraction_input_bytes(request)).hexdigest()}"
+    )
 
 
 def fact_candidate_key(candidate: FactExtractionCandidate) -> str:

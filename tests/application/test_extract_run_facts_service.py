@@ -15,8 +15,13 @@ from api.application.extract_run_facts_service import (
     FactExtractionInputConflictError,
     FactExtractionProviderFailure,
     FactExtractionRunNotEligibleError,
+    LegacyUpdateFactExtractionConflictError,
     SourceEvidenceValidationError,
     SourceInputDriftError,
+)
+from api.application.prepare_update_run_service import (
+    PrepareUpdateRunCommand,
+    PrepareUpdateRunService,
 )
 from db.pool import pool
 from domain.fact_extraction import (
@@ -38,6 +43,36 @@ class ExtractionResources:
     chunk_id: str
     other_document_version_id: str
     other_chunk_id: str
+
+
+@dataclass(frozen=True)
+class UpdateExtractionResources:
+    pile_id: str
+    baseline_run_id: str
+    update_run_id: str
+    retained_version_id: str
+    retained_chunk_id: str
+    trigger_version_id: str
+    trigger_chunk_id: str
+
+
+@dataclass(frozen=True)
+class CarriedUpdateExtractionResources:
+    pile_id: str
+    baseline_run_id: str
+    update_run_id: str
+    older_origin_run_id: str
+    retained_version_id: str
+    retained_chunk_id: str
+    replaced_version_id: str
+    replaced_chunk_id: str
+    trigger_version_id: str
+    trigger_chunk_id: str
+    carried_fact_id: str
+    replaced_fact_id: str
+    mixed_fact_id: str
+    retained_evidence_id: str
+    replaced_evidence_id: str
 
 
 class FakeProvider:
@@ -135,6 +170,299 @@ def resources() -> ExtractionResources:
                 "DELETE FROM document_versions WHERE id IN (%s::uuid, %s::uuid)",
                 (created.document_version_id, created.other_document_version_id),
             )
+            connection.execute("DELETE FROM documents WHERE pile_id = %s::uuid", (created.pile_id,))
+            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (created.pile_id,))
+            connection.commit()
+
+
+@pytest.fixture
+def update_resources() -> UpdateExtractionResources:
+    with pool.connection() as connection:
+        pile_id = create_pile(connection)
+        baseline = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status, completed_at)
+            VALUES (%s::uuid, 'MANUAL', 'COMPLETED', now())
+            RETURNING id
+            """,
+            (pile_id,),
+        ).fetchone()
+        assert baseline is not None
+        retained_version_id, retained_chunk_id = create_document_version_with_chunk(
+            connection, pile_id, "retained", "Retained source.",
+        )
+        replaced_version_id, _ = create_document_version_with_chunk(
+            connection, pile_id, "changed", "Original source.",
+        )
+        connection.execute(
+            """
+            UPDATE document_versions
+            SET processing_status = 'READY'::document_version_status
+            WHERE id IN (%s::uuid, %s::uuid)
+            """,
+            (retained_version_id, replaced_version_id),
+        )
+        document = connection.execute(
+            "SELECT document_id FROM document_versions WHERE id = %s::uuid",
+            (replaced_version_id,),
+        ).fetchone()
+        assert document is not None
+        trigger = connection.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_number, content_hash, storage_uri, processing_status
+            )
+            VALUES (%s::uuid, 2, %s, %s, 'READY')
+            RETURNING id
+            """,
+            (str(document[0]), f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
+        ).fetchone()
+        assert trigger is not None
+        trigger_version_id = str(trigger[0])
+        trigger_chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (document_version_id, chunk_index, content, content_hash, page_number)
+            VALUES (%s::uuid, 0, %s, %s, 7)
+            RETURNING id
+            """,
+            (trigger_version_id, "Changed amount is 101 USD.", f"sha256:{uuid4().hex}"),
+        ).fetchone()
+        assert trigger_chunk is not None
+        update = connection.execute(
+            """
+            INSERT INTO runs (
+                pile_id, run_type, status, baseline_run_id, trigger_document_version_id
+            )
+            VALUES (%s::uuid, 'UPDATE', 'PENDING', %s::uuid, %s::uuid)
+            RETURNING id
+            """,
+            (pile_id, str(baseline[0]), trigger_version_id),
+        ).fetchone()
+        assert update is not None
+        update_run_id = str(update[0])
+        connection.execute(
+            """
+            INSERT INTO run_document_versions (run_id, document_version_id)
+            VALUES (%s::uuid, %s::uuid), (%s::uuid, %s::uuid)
+            """,
+            (str(baseline[0]), retained_version_id, str(baseline[0]), replaced_version_id),
+        )
+        connection.commit()
+
+    created = UpdateExtractionResources(
+        pile_id,
+        str(baseline[0]),
+        update_run_id,
+        retained_version_id,
+        retained_chunk_id,
+        trigger_version_id,
+        str(trigger_chunk[0]),
+    )
+    PrepareUpdateRunService(pool).prepare(PrepareUpdateRunCommand(created.update_run_id))
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE runs SET status = 'RUNNING'::run_status WHERE id = %s::uuid",
+            (created.update_run_id,),
+        )
+        connection.commit()
+    try:
+        yield created
+    finally:
+        with pool.connection() as connection:
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE key IN (%s, %s, %s)",
+                (
+                    f"understand-update:{created.update_run_id}",
+                    f"understand:{created.update_run_id}",
+                    f"prepare-update:{created.update_run_id}",
+                ),
+            )
+            connection.execute(
+                "DELETE FROM fact_evidence WHERE fact_id IN (SELECT id FROM facts WHERE origin_run_id = %s::uuid)",
+                (created.update_run_id,),
+            )
+            connection.execute("DELETE FROM run_facts WHERE run_id = %s::uuid", (created.update_run_id,))
+            connection.execute("DELETE FROM facts WHERE origin_run_id = %s::uuid", (created.update_run_id,))
+            connection.execute(
+                "DELETE FROM evidence_spans WHERE document_version_id IN (SELECT id FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid))",
+                (created.pile_id,),
+            )
+            connection.execute("DELETE FROM run_document_versions WHERE run_id IN (SELECT id FROM runs WHERE pile_id = %s::uuid)", (created.pile_id,))
+            connection.execute("DELETE FROM document_chunks WHERE document_version_id IN (SELECT id FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid))", (created.pile_id,))
+            connection.execute("DELETE FROM runs WHERE pile_id = %s::uuid", (created.pile_id,))
+            connection.execute("DELETE FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid)", (created.pile_id,))
+            connection.execute("DELETE FROM documents WHERE pile_id = %s::uuid", (created.pile_id,))
+            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (created.pile_id,))
+            connection.commit()
+
+
+@pytest.fixture
+def carried_update_resources() -> CarriedUpdateExtractionResources:
+    with pool.connection() as connection:
+        pile_id = create_pile(connection)
+        baseline = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status, completed_at)
+            VALUES (%s::uuid, 'MANUAL', 'COMPLETED', now())
+            RETURNING id
+            """,
+            (pile_id,),
+        ).fetchone()
+        older_origin = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status)
+            VALUES (%s::uuid, 'MANUAL', 'PENDING')
+            RETURNING id
+            """,
+            (pile_id,),
+        ).fetchone()
+        assert baseline is not None and older_origin is not None
+        retained_version_id, retained_chunk_id = create_document_version_with_chunk(
+            connection, pile_id, f"retained-{uuid4()}", "Retained source.",
+        )
+        replaced_version_id, replaced_chunk_id = create_document_version_with_chunk(
+            connection, pile_id, f"replaced-{uuid4()}", "Replaced source.",
+        )
+        connection.execute(
+            """
+            UPDATE document_versions
+            SET processing_status = 'READY'::document_version_status
+            WHERE id IN (%s::uuid, %s::uuid)
+            """,
+            (retained_version_id, replaced_version_id),
+        )
+        document = connection.execute(
+            "SELECT document_id FROM document_versions WHERE id = %s::uuid",
+            (replaced_version_id,),
+        ).fetchone()
+        assert document is not None
+        trigger = connection.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_number, content_hash, storage_uri, processing_status
+            )
+            VALUES (%s::uuid, 2, %s, %s, 'READY')
+            RETURNING id
+            """,
+            (str(document[0]), f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
+        ).fetchone()
+        assert trigger is not None
+        trigger_version_id = str(trigger[0])
+        trigger_chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (document_version_id, chunk_index, content, content_hash)
+            VALUES (%s::uuid, 0, %s, %s)
+            RETURNING id
+            """,
+            (trigger_version_id, "Trigger value is 101.", f"sha256:{uuid4().hex}"),
+        ).fetchone()
+        assert trigger_chunk is not None
+        retained_evidence = connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            )
+            VALUES (%s::uuid, %s::uuid, 0, 8, 'Retained', %s)
+            RETURNING id
+            """,
+            (retained_version_id, retained_chunk_id, f"sha256:{uuid4().hex}"),
+        ).fetchone()
+        replaced_evidence = connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            )
+            VALUES (%s::uuid, %s::uuid, 0, 8, 'Replaced', %s)
+            RETURNING id
+            """,
+            (replaced_version_id, replaced_chunk_id, f"sha256:{uuid4().hex}"),
+        ).fetchone()
+        assert retained_evidence is not None and replaced_evidence is not None
+
+        def add_baseline_fact(subject: str, evidence_ids: tuple[str, ...]) -> str:
+            fact = connection.execute(
+                """
+                INSERT INTO facts (origin_run_id, subject, predicate, object_value, status)
+                VALUES (%s::uuid, %s, 'equals', '1'::jsonb, 'CONFIRMED'::fact_status)
+                RETURNING id
+                """,
+                (str(older_origin[0]), subject),
+            ).fetchone()
+            assert fact is not None
+            fact_id = str(fact[0])
+            connection.execute(
+                """
+                INSERT INTO run_facts (run_id, fact_id, relation)
+                VALUES (%s::uuid, %s::uuid, 'CARRIED_FORWARD'::run_membership_relation)
+                """,
+                (str(baseline[0]), fact_id),
+            )
+            for evidence_id in evidence_ids:
+                connection.execute(
+                    "INSERT INTO fact_evidence (fact_id, evidence_span_id) VALUES (%s::uuid, %s::uuid)",
+                    (fact_id, evidence_id),
+                )
+            return fact_id
+
+        carried_fact_id = add_baseline_fact("retained fact", (str(retained_evidence[0]),))
+        replaced_fact_id = add_baseline_fact("replaced fact", (str(replaced_evidence[0]),))
+        mixed_fact_id = add_baseline_fact(
+            "mixed fact",
+            (str(retained_evidence[0]), str(replaced_evidence[0])),
+        )
+        update = connection.execute(
+            """
+            INSERT INTO runs (
+                pile_id, run_type, status, baseline_run_id, trigger_document_version_id
+            )
+            VALUES (%s::uuid, 'UPDATE', 'PENDING', %s::uuid, %s::uuid)
+            RETURNING id
+            """,
+            (pile_id, str(baseline[0]), trigger_version_id),
+        ).fetchone()
+        assert update is not None
+        update_run_id = str(update[0])
+        connection.execute(
+            """
+            INSERT INTO run_document_versions (run_id, document_version_id)
+            VALUES (%s::uuid, %s::uuid), (%s::uuid, %s::uuid)
+            """,
+            (str(baseline[0]), retained_version_id, str(baseline[0]), replaced_version_id),
+        )
+        connection.commit()
+
+    created = CarriedUpdateExtractionResources(
+        pile_id, str(baseline[0]), update_run_id, str(older_origin[0]), retained_version_id,
+        retained_chunk_id, replaced_version_id, replaced_chunk_id, trigger_version_id,
+        str(trigger_chunk[0]), carried_fact_id, replaced_fact_id, mixed_fact_id,
+        str(retained_evidence[0]), str(replaced_evidence[0]),
+    )
+    PrepareUpdateRunService(pool).prepare(PrepareUpdateRunCommand(created.update_run_id))
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE runs SET status = 'RUNNING'::run_status WHERE id = %s::uuid",
+            (created.update_run_id,),
+        )
+        connection.commit()
+    try:
+        yield created
+    finally:
+        with pool.connection() as connection:
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE key LIKE %s",
+                (f"%{created.update_run_id}%",),
+            )
+            connection.execute(
+                "DELETE FROM fact_evidence WHERE fact_id IN (SELECT id FROM facts WHERE origin_run_id IN (SELECT id FROM runs WHERE pile_id = %s::uuid))",
+                (created.pile_id,),
+            )
+            connection.execute("DELETE FROM run_facts WHERE run_id IN (SELECT id FROM runs WHERE pile_id = %s::uuid)", (created.pile_id,))
+            connection.execute("DELETE FROM facts WHERE origin_run_id IN (SELECT id FROM runs WHERE pile_id = %s::uuid)", (created.pile_id,))
+            connection.execute("DELETE FROM evidence_spans WHERE document_version_id IN (SELECT id FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid))", (created.pile_id,))
+            connection.execute("DELETE FROM run_document_versions WHERE run_id IN (SELECT id FROM runs WHERE pile_id = %s::uuid)", (created.pile_id,))
+            connection.execute("DELETE FROM document_chunks WHERE document_version_id IN (SELECT id FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid))", (created.pile_id,))
+            connection.execute("DELETE FROM runs WHERE pile_id = %s::uuid", (created.pile_id,))
+            connection.execute("DELETE FROM document_versions WHERE document_id IN (SELECT id FROM documents WHERE pile_id = %s::uuid)", (created.pile_id,))
             connection.execute("DELETE FROM documents WHERE pile_id = %s::uuid", (created.pile_id,))
             connection.execute("DELETE FROM piles WHERE id = %s::uuid", (created.pile_id,))
             connection.commit()
@@ -259,6 +587,850 @@ def extraction_record(resources: ExtractionResources):
             "fact-extraction-v1",
             f"understand:{resources.run_id}",
         )
+
+
+def update_response_for(resources: UpdateExtractionResources) -> FactExtractionResponse:
+    return FactExtractionResponse(
+        format="fact-extraction-v1",
+        candidates=(
+            FactExtractionCandidate(
+                subject="changed amount",
+                predicate="equals",
+                object_value=101,
+                evidence=(
+                    FactEvidenceCandidate(
+                        chunk_id=resources.trigger_chunk_id,
+                        relative_start_offset=18,
+                        relative_end_offset=25,
+                        quoted_text="101 USD",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def update_extraction_record(resources: UpdateExtractionResources):
+    with pool.connection() as connection:
+        return IdempotencyRepository(connection).get(
+            "fact-extraction-update-v2",
+            f"understand-update:{resources.update_run_id}",
+        )
+
+
+def update_grounded_counts(run_id: str, trigger_version_id: str) -> tuple[int, int, int, int]:
+    with pool.connection() as connection:
+        facts = connection.execute(
+            "SELECT count(*) FROM facts WHERE origin_run_id = %s::uuid",
+            (run_id,),
+        ).fetchone()
+        created = connection.execute(
+            "SELECT count(*) FROM run_facts WHERE run_id = %s::uuid AND relation = 'CREATED'::run_membership_relation",
+            (run_id,),
+        ).fetchone()
+        evidence = connection.execute(
+            "SELECT count(*) FROM evidence_spans WHERE document_version_id = %s::uuid",
+            (trigger_version_id,),
+        ).fetchone()
+        links = connection.execute(
+            """
+            SELECT count(*) FROM fact_evidence
+            JOIN facts ON facts.id = fact_evidence.fact_id
+            WHERE facts.origin_run_id = %s::uuid
+            """,
+            (run_id,),
+        ).fetchone()
+    assert facts is not None and created is not None and evidence is not None and links is not None
+    return int(facts[0]), int(created[0]), int(evidence[0]), int(links[0])
+
+
+def carried_fact_ids(resources: CarriedUpdateExtractionResources) -> list[str]:
+    with pool.connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT fact_id FROM run_facts
+            WHERE run_id = %s::uuid AND relation = 'CARRIED_FORWARD'::run_membership_relation
+            ORDER BY fact_id
+            """,
+            (resources.update_run_id,),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def carried_snapshot(resources: CarriedUpdateExtractionResources) -> tuple[object, ...]:
+    with pool.connection() as connection:
+        fact = connection.execute(
+            """
+            SELECT origin_run_id, subject, predicate, object_value, status
+            FROM facts WHERE id = %s::uuid
+            """,
+            (resources.carried_fact_id,),
+        ).fetchone()
+        links = connection.execute(
+            """
+            SELECT evidence_span_id FROM fact_evidence
+            WHERE fact_id = %s::uuid ORDER BY evidence_span_id
+            """,
+            (resources.carried_fact_id,),
+        ).fetchall()
+    assert fact is not None
+    return (*fact, tuple(str(row[0]) for row in links))
+
+
+def test_update_replaced_extraction_exposes_trigger_only_and_replays_after_progression(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    provider = FakeProvider(update_response_for(update_resources))
+    extractor = service(provider)
+
+    first = extractor.extract(ExtractRunFactsCommand(update_resources.update_run_id.upper()))
+
+    assert first.replayed is False
+    assert len(provider.calls) == 1
+    request = provider.calls[0]
+    assert request.format == "fact-extraction-update-v2"
+    assert request.document_version_ids == (update_resources.trigger_version_id,)
+    assert [chunk.chunk_id for chunk in request.source_chunks] == [update_resources.trigger_chunk_id]
+    assert update_resources.retained_chunk_id not in [chunk.chunk_id for chunk in request.source_chunks]
+    record = update_extraction_record(update_resources)
+    assert record is not None
+    assert record.status is IdempotencyStatus.COMPLETED
+    assert record.result_reference == (
+        f"fact-extraction-update:{update_resources.update_run_id}:{first.input_fingerprint}"
+    )
+    with pool.connection() as connection:
+        membership = connection.execute(
+            "SELECT relation FROM run_facts WHERE run_id = %s::uuid ORDER BY created_at DESC LIMIT 1",
+            (update_resources.update_run_id,),
+        ).fetchone()
+        evidence = connection.execute(
+            "SELECT document_version_id FROM evidence_spans WHERE chunk_id = %s::uuid",
+            (update_resources.trigger_chunk_id,),
+        ).fetchone()
+        connection.execute(
+            "UPDATE runs SET status = 'REVIEW_REQUIRED'::run_status WHERE id = %s::uuid",
+            (update_resources.update_run_id,),
+        )
+        connection.commit()
+    assert membership == ("CREATED",)
+    assert evidence is not None
+    assert str(evidence[0]) == update_resources.trigger_version_id
+    with pool.connection() as connection:
+        legacy = IdempotencyRepository(connection).claim(
+            "fact-extraction-v1",
+            f"understand:{update_resources.update_run_id}",
+        )
+        assert legacy is not None
+        connection.commit()
+
+    replay = extractor.extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert replay.replayed is True
+    assert replay.input_fingerprint == first.input_fingerprint
+    assert len(provider.calls) == 1
+
+
+def test_update_preparation_scope_drift_fails_before_provider(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        connection.execute(
+            "DELETE FROM run_document_versions WHERE run_id = %s::uuid AND document_version_id = %s::uuid",
+            (update_resources.update_run_id, update_resources.retained_version_id),
+        )
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    with pytest.raises(extraction_module.UpdateFactExtractionPreparationError):
+        service(provider).extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert provider.calls == []
+    assert update_extraction_record(update_resources) is None
+
+
+def test_update_added_trigger_exposes_only_added_version_and_zero_fact_completes(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        version_id, chunk_id = create_document_version_with_chunk(
+            connection,
+            update_resources.pile_id,
+            "added",
+            "Added source is 404.",
+        )
+        connection.execute(
+            "UPDATE document_versions SET processing_status = 'READY'::document_version_status WHERE id = %s::uuid",
+            (version_id,),
+        )
+        run = connection.execute(
+            """
+            INSERT INTO runs (
+                pile_id, run_type, status, baseline_run_id, trigger_document_version_id
+            )
+            VALUES (%s::uuid, 'UPDATE', 'PENDING', %s::uuid, %s::uuid)
+            RETURNING id
+            """,
+            (update_resources.pile_id, update_resources.baseline_run_id, version_id),
+        ).fetchone()
+        assert run is not None
+        added_run_id = str(run[0])
+        connection.commit()
+    try:
+        PrepareUpdateRunService(pool).prepare(PrepareUpdateRunCommand(added_run_id))
+        with pool.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET status = 'RUNNING'::run_status WHERE id = %s::uuid",
+                (added_run_id,),
+            )
+            connection.commit()
+        provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+        result = service(provider).extract(ExtractRunFactsCommand(added_run_id))
+
+        assert result.replayed is False
+        assert len(provider.calls) == 1
+        assert provider.calls[0].document_version_ids == (version_id,)
+        assert [chunk.chunk_id for chunk in provider.calls[0].source_chunks] == [chunk_id]
+        assert update_resources.retained_chunk_id not in [
+            chunk.chunk_id for chunk in provider.calls[0].source_chunks
+        ]
+        with pool.connection() as connection:
+            facts = connection.execute(
+                "SELECT count(*) FROM facts WHERE origin_run_id = %s::uuid",
+                (added_run_id,),
+            ).fetchone()
+            record = IdempotencyRepository(connection).get(
+                "fact-extraction-update-v2",
+                f"understand-update:{added_run_id}",
+            )
+        assert facts == (0,)
+        assert record is not None
+        assert record.status is IdempotencyStatus.COMPLETED
+    finally:
+        with pool.connection() as connection:
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE key IN (%s, %s)",
+                (f"understand-update:{added_run_id}", f"prepare-update:{added_run_id}"),
+            )
+            connection.execute("DELETE FROM run_document_versions WHERE run_id = %s::uuid", (added_run_id,))
+            connection.execute("DELETE FROM runs WHERE id = %s::uuid", (added_run_id,))
+            connection.execute("DELETE FROM document_chunks WHERE document_version_id = %s::uuid", (version_id,))
+            connection.execute("DELETE FROM document_versions WHERE id = %s::uuid", (version_id,))
+            connection.execute("DELETE FROM documents WHERE logical_key = %s", ("added",))
+            connection.commit()
+
+
+def test_update_legacy_v1_operation_conflicts_before_provider(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim(
+            "fact-extraction-v1",
+            f"understand:{update_resources.update_run_id}",
+        )
+        assert claimed is not None
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    with pytest.raises(LegacyUpdateFactExtractionConflictError):
+        service(provider).extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert provider.calls == []
+    assert update_extraction_record(update_resources) is None
+
+
+def test_unprepared_historical_update_legacy_v1_operation_conflicts_before_phase4a_validation() -> None:
+    with pool.connection() as connection:
+        pile_id = create_pile(connection)
+        baseline = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status, completed_at)
+            VALUES (%s::uuid, 'MANUAL', 'COMPLETED', now())
+            RETURNING id
+            """,
+            (pile_id,),
+        ).fetchone()
+        assert baseline is not None
+        trigger_version_id, trigger_chunk_id = create_document_version_with_chunk(
+            connection,
+            pile_id,
+            f"legacy-trigger-{uuid4()}",
+            "Historical trigger source.",
+        )
+        connection.execute(
+            "UPDATE document_versions SET processing_status = 'READY'::document_version_status WHERE id = %s::uuid",
+            (trigger_version_id,),
+        )
+        update = connection.execute(
+            """
+            INSERT INTO runs (
+                pile_id, run_type, status, baseline_run_id, trigger_document_version_id
+            )
+            VALUES (%s::uuid, 'UPDATE', 'RUNNING', %s::uuid, %s::uuid)
+            RETURNING id
+            """,
+            (pile_id, str(baseline[0]), trigger_version_id),
+        ).fetchone()
+        assert update is not None
+        update_run_id = str(update[0])
+        legacy = IdempotencyRepository(connection).claim(
+            "fact-extraction-v1",
+            f"understand:{update_run_id}",
+        )
+        assert legacy is not None
+        connection.commit()
+    try:
+        provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+        with pytest.raises(LegacyUpdateFactExtractionConflictError):
+            service(provider).extract(ExtractRunFactsCommand(update_run_id))
+
+        assert provider.calls == []
+        assert update_extraction_record_for_run(update_run_id) is None
+        assert update_grounded_counts(update_run_id, trigger_version_id) == (0, 0, 0, 0)
+    finally:
+        with pool.connection() as connection:
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE key IN (%s, %s)",
+                (f"understand:{update_run_id}", f"understand-update:{update_run_id}"),
+            )
+            connection.execute("DELETE FROM runs WHERE id IN (%s::uuid, %s::uuid)", (update_run_id, str(baseline[0])))
+            connection.execute("DELETE FROM document_chunks WHERE id = %s::uuid", (trigger_chunk_id,))
+            connection.execute("DELETE FROM document_versions WHERE id = %s::uuid", (trigger_version_id,))
+            connection.execute("DELETE FROM documents WHERE pile_id = %s::uuid", (pile_id,))
+            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (pile_id,))
+            connection.commit()
+
+
+@pytest.mark.parametrize(
+    ("result_reference", "error_type"),
+    [
+        ("not-a-v2-reference", extraction_module.FactExtractionIdempotencyIntegrityError),
+        ("different", FactExtractionInputConflictError),
+    ],
+)
+def test_update_completed_reference_must_match_before_provider(
+    update_resources: UpdateExtractionResources,
+    result_reference: str,
+    error_type: type[Exception],
+) -> None:
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+    extractor = service(provider)
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim(
+            "fact-extraction-update-v2",
+            f"understand-update:{update_resources.update_run_id}",
+        )
+        assert claimed is not None
+        if result_reference == "different":
+            result_reference = (
+                f"fact-extraction-update:{update_resources.update_run_id}:sha256:" + "f" * 64
+            )
+        connection.execute(
+            """
+            UPDATE idempotency_records
+            SET status = 'COMPLETED'::idempotency_status, result_reference = %s, completed_at = now()
+            WHERE scope = 'fact-extraction-update-v2' AND key = %s
+            """,
+            (result_reference, f"understand-update:{update_resources.update_run_id}"),
+        )
+        connection.commit()
+
+    with pytest.raises(error_type):
+        extractor.extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert provider.calls == []
+
+
+def test_update_fresh_created_membership_conflicts_before_provider(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        fact = connection.execute(
+            """
+            INSERT INTO facts (origin_run_id, subject, predicate, object_value, status)
+            VALUES (%s::uuid, 'unexpected', 'equals', '1'::jsonb, 'CONFIRMED'::fact_status)
+            RETURNING id
+            """,
+            (update_resources.update_run_id,),
+        ).fetchone()
+        assert fact is not None
+        connection.execute(
+            """
+            INSERT INTO run_facts (run_id, fact_id, relation)
+            VALUES (%s::uuid, %s::uuid, 'CREATED'::run_membership_relation)
+            """,
+            (update_resources.update_run_id, str(fact[0])),
+        )
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    with pytest.raises(extraction_module.UpdateFactExtractionTargetStateConflictError):
+        service(provider).extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert provider.calls == []
+    assert update_extraction_record(update_resources) is None
+
+
+def test_update_carries_only_retained_fact_and_preserves_historical_provenance(
+    carried_update_resources: CarriedUpdateExtractionResources,
+) -> None:
+    resources = carried_update_resources
+    before = carried_snapshot(resources)
+
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert resources.replaced_fact_id not in carried_fact_ids(resources)
+    assert resources.mixed_fact_id not in carried_fact_ids(resources)
+
+    provider = FakeProvider(
+        FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject="trigger fact",
+                    predicate="equals",
+                    object_value=101,
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.trigger_chunk_id,
+                            relative_start_offset=17,
+                            relative_end_offset=20,
+                            quoted_text="101",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    after = carried_snapshot(resources)
+    assert before == after
+    assert str(after[0]) == resources.older_origin_run_id
+    assert after[-1] == (resources.retained_evidence_id,)
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (1, 1, 1, 1)
+
+
+def test_update_carried_membership_drift_fails_before_claim_or_provider(
+    carried_update_resources: CarriedUpdateExtractionResources,
+) -> None:
+    resources = carried_update_resources
+    with pool.connection() as connection:
+        connection.execute(
+            "DELETE FROM run_facts WHERE run_id = %s::uuid AND fact_id = %s::uuid",
+            (resources.update_run_id, resources.carried_fact_id),
+        )
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    with pytest.raises(extraction_module.UpdateFactExtractionPreparationError):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    assert provider.calls == []
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
+    assert update_extraction_record_for_run(resources.update_run_id) is None
+
+
+@pytest.mark.parametrize("state", ["missing", "in_progress", "null", "malformed", "different"])
+def test_update_preparation_reference_must_be_completed_and_exact_before_provider(
+    update_resources: UpdateExtractionResources,
+    state: str,
+) -> None:
+    run_id = update_resources.update_run_id
+    with pool.connection() as connection:
+        if state == "missing":
+            connection.execute(
+                "DELETE FROM idempotency_records WHERE scope = 'update-preparation-v1' AND key = %s",
+                (f"prepare-update:{run_id}",),
+            )
+        elif state == "in_progress":
+            connection.execute(
+                """
+                UPDATE idempotency_records SET status = 'IN_PROGRESS'::idempotency_status,
+                    result_reference = NULL, completed_at = NULL
+                WHERE scope = 'update-preparation-v1' AND key = %s
+                """,
+                (f"prepare-update:{run_id}",),
+            )
+        elif state == "null":
+            connection.execute(
+                """
+                UPDATE idempotency_records SET result_reference = NULL
+                WHERE scope = 'update-preparation-v1' AND key = %s
+                """,
+                (f"prepare-update:{run_id}",),
+            )
+        elif state == "malformed":
+            connection.execute(
+                """
+                UPDATE idempotency_records SET result_reference = 'update-preparation:bad'
+                WHERE scope = 'update-preparation-v1' AND key = %s
+                """,
+                (f"prepare-update:{run_id}",),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE idempotency_records
+                SET result_reference = %s
+                WHERE scope = 'update-preparation-v1' AND key = %s
+                """,
+                (f"update-preparation:{run_id}:sha256:" + "f" * 64, f"prepare-update:{run_id}"),
+            )
+        connection.commit()
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    with pytest.raises(extraction_module.UpdateFactExtractionPreparationError):
+        service(provider).extract(ExtractRunFactsCommand(run_id))
+
+    assert provider.calls == []
+    assert update_extraction_record(update_resources) is None
+    assert update_grounded_counts(run_id, update_resources.trigger_version_id) == (0, 0, 0, 0)
+
+
+def test_update_non_trigger_evidence_is_rejected_and_marks_claim_failed(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    invalid = FactExtractionResponse(
+        format="fact-extraction-v1",
+        candidates=(
+            FactExtractionCandidate(
+                subject="invalid",
+                predicate="equals",
+                object_value=1,
+                evidence=(
+                    FactEvidenceCandidate(
+                        chunk_id=update_resources.retained_chunk_id,
+                        relative_start_offset=0,
+                        relative_end_offset=8,
+                        quoted_text="Retained",
+                    ),
+                ),
+            ),
+        ),
+    )
+    provider = FakeProvider(invalid)
+
+    with pytest.raises(SourceEvidenceValidationError):
+        service(provider).extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    record = update_extraction_record(update_resources)
+    assert len(provider.calls) == 1
+    assert update_grounded_counts(
+        update_resources.update_run_id,
+        update_resources.trigger_version_id,
+    ) == (0, 0, 0, 0)
+    assert record is not None
+    assert record.status is IdempotencyStatus.FAILED
+
+
+def test_update_provider_failure_marks_v2_claim_failed_without_changing_carried_state(
+    carried_update_resources: CarriedUpdateExtractionResources,
+) -> None:
+    resources = carried_update_resources
+    provider = FailingProvider()
+
+    with pytest.raises(FactExtractionProviderFailure):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    record = update_extraction_record_for_run(resources.update_run_id)
+    assert provider.calls == 1
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
+    assert record is not None
+    assert record.status is IdempotencyStatus.FAILED
+
+
+def update_extraction_record_for_run(run_id: str):
+    with pool.connection() as connection:
+        return IdempotencyRepository(connection).get(
+            "fact-extraction-update-v2",
+            f"understand-update:{run_id}",
+        )
+
+
+def test_update_reclaimed_claim_token_rolls_back_new_rows_and_preserves_carried_state(
+    carried_update_resources: CarriedUpdateExtractionResources,
+) -> None:
+    resources = carried_update_resources
+    provider = FakeProvider(
+        FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject="trigger fact",
+                    predicate="equals",
+                    object_value=101,
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.trigger_chunk_id,
+                            relative_start_offset=17,
+                            relative_end_offset=20,
+                            quoted_text="101",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    def reclaim_claim(_: FactExtractionRequest) -> None:
+        with pool.connection() as connection:
+            repository = IdempotencyRepository(connection)
+            record = repository.get(
+                "fact-extraction-update-v2",
+                f"understand-update:{resources.update_run_id}",
+            )
+            assert record is not None and record.claimed_at is not None
+            assert repository.reclaim(
+                "fact-extraction-update-v2",
+                f"understand-update:{resources.update_run_id}",
+                record.claimed_at,
+            ) is not None
+            connection.commit()
+
+    provider.before_return = reclaim_claim
+    with pytest.raises(FactExtractionClaimLostError):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    record = update_extraction_record_for_run(resources.update_run_id)
+    assert len(provider.calls) == 1
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
+    assert record is not None
+    assert record.status is IdempotencyStatus.IN_PROGRESS
+
+
+@pytest.mark.parametrize("retryable_error", [DeadlockDetected, SerializationFailure])
+def test_update_retryable_persistence_failure_reuses_provider_and_preserves_carried_state(
+    carried_update_resources: CarriedUpdateExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+    retryable_error: type[Exception],
+) -> None:
+    resources = carried_update_resources
+    attempts = 0
+    original_mark_completed = extraction_module.IdempotencyRepository.mark_completed
+
+    def fail_once_after_staging(repository, *args):
+        nonlocal attempts
+        attempts += 1
+        completed = original_mark_completed(repository, *args)
+        if attempts == 1:
+            raise retryable_error("retry UPDATE persistence")
+        return completed
+
+    monkeypatch.setattr(extraction_module.IdempotencyRepository, "mark_completed", fail_once_after_staging)
+    provider = FakeProvider(
+        FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject="trigger fact",
+                    predicate="equals",
+                    object_value=101,
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.trigger_chunk_id,
+                            relative_start_offset=17,
+                            relative_end_offset=20,
+                            quoted_text="101",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    record = update_extraction_record_for_run(resources.update_run_id)
+    assert attempts == 2
+    assert len(provider.calls) == 1
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (1, 1, 1, 1)
+    assert record is not None
+    assert record.status is IdempotencyStatus.COMPLETED
+
+
+@pytest.mark.parametrize("retryable_error", [DeadlockDetected, SerializationFailure])
+def test_update_retry_exhaustion_rolls_back_new_rows_and_keeps_claim_recoverable(
+    carried_update_resources: CarriedUpdateExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+    retryable_error: type[Exception],
+) -> None:
+    resources = carried_update_resources
+    attempts = 0
+    original_mark_completed = extraction_module.IdempotencyRepository.mark_completed
+
+    def fail_every_staged_attempt(repository, *args):
+        nonlocal attempts
+        attempts += 1
+        original_mark_completed(repository, *args)
+        raise retryable_error("retry UPDATE persistence")
+
+    monkeypatch.setattr(extraction_module.IdempotencyRepository, "mark_completed", fail_every_staged_attempt)
+    provider = FakeProvider(
+        FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject="trigger fact",
+                    predicate="equals",
+                    object_value=101,
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.trigger_chunk_id,
+                            relative_start_offset=17,
+                            relative_end_offset=20,
+                            quoted_text="101",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(retryable_error):
+        service(provider).extract(ExtractRunFactsCommand(resources.update_run_id))
+
+    record = update_extraction_record_for_run(resources.update_run_id)
+    assert attempts == 3
+    assert len(provider.calls) == 1
+    assert carried_fact_ids(resources) == [resources.carried_fact_id]
+    assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
+    assert record is not None
+    assert record.status is IdempotencyStatus.IN_PROGRESS
+
+
+def test_update_provider_runs_after_preflight_lock_release(
+    update_resources: UpdateExtractionResources,
+) -> None:
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+
+    def acquire_run_lock(_: FactExtractionRequest) -> None:
+        with pool.connection() as connection:
+            connection.execute("SET LOCAL lock_timeout = '100ms'")
+            assert RunRepository(connection).get_for_update(update_resources.update_run_id) is not None
+            connection.commit()
+
+    provider.before_return = acquire_run_lock
+    service(provider).extract(ExtractRunFactsCommand(update_resources.update_run_id))
+
+    assert len(provider.calls) == 1
+
+
+def test_update_preflight_holds_run_lock_until_claim_commit(
+    update_resources: UpdateExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    claimed = threading.Event()
+    release = threading.Event()
+    original_claim = extraction_module.IdempotencyRepository.claim
+
+    def pause_claim(repository, scope, key):
+        record = original_claim(repository, scope, key)
+        if scope == "fact-extraction-update-v2":
+            claimed.set()
+            assert release.wait(timeout=5)
+        return record
+
+    monkeypatch.setattr(extraction_module.IdempotencyRepository, "claim", pause_claim)
+    provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service(provider).extract, ExtractRunFactsCommand(update_resources.update_run_id))
+        assert claimed.wait(timeout=5)
+        with pool.connection() as connection:
+            connection.execute("SET LOCAL lock_timeout = '100ms'")
+            with pytest.raises(LockNotAvailable):
+                RunRepository(connection).get_for_update(update_resources.update_run_id)
+            connection.rollback()
+        release.set()
+        future.result(timeout=5)
+
+
+def test_update_persistence_holds_run_and_trigger_chunk_locks_until_commit(
+    update_resources: UpdateExtractionResources,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staged = threading.Event()
+    release = threading.Event()
+    original_create = extraction_module.EvidenceSpanRepository.create
+
+    def pause_after_staging(repository, span):
+        stored = original_create(repository, span)
+        staged.set()
+        assert release.wait(timeout=5)
+        return stored
+
+    monkeypatch.setattr(extraction_module.EvidenceSpanRepository, "create", pause_after_staging)
+    extraction_service = service(FakeProvider(update_response_for(update_resources)))
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(extraction_service.extract, ExtractRunFactsCommand(update_resources.update_run_id))
+        assert staged.wait(timeout=5)
+        with pool.connection() as connection:
+            connection.execute("SET LOCAL lock_timeout = '100ms'")
+            with pytest.raises(LockNotAvailable):
+                RunRepository(connection).get_for_update(update_resources.update_run_id)
+            connection.rollback()
+        with pool.connection() as connection:
+            connection.execute("SET LOCAL lock_timeout = '100ms'")
+            with pytest.raises(LockNotAvailable):
+                connection.execute(
+                    "UPDATE document_chunks SET content = 'blocked' WHERE id = %s::uuid",
+                    (update_resources.trigger_chunk_id,),
+                )
+            connection.rollback()
+        with pool.connection() as connection:
+            connection.execute(
+                "UPDATE document_chunks SET content = 'retained may change' WHERE id = %s::uuid",
+                (update_resources.retained_chunk_id,),
+            )
+            connection.commit()
+        release.set()
+        future.result(timeout=5)
+
+
+def test_initial_run_uses_v1_full_scope_without_update_v2_claim(resources: ExtractionResources) -> None:
+    with pool.connection() as connection:
+        row = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status)
+            VALUES (%s::uuid, 'INITIAL', 'RUNNING')
+            RETURNING id
+            """,
+            (resources.pile_id,),
+        ).fetchone()
+        assert row is not None
+        initial_run_id = str(row[0])
+        connection.execute(
+            """
+            INSERT INTO run_document_versions (run_id, document_version_id)
+            VALUES (%s::uuid, %s::uuid), (%s::uuid, %s::uuid)
+            """,
+            (initial_run_id, resources.document_version_id, initial_run_id, resources.other_document_version_id),
+        )
+        connection.commit()
+    try:
+        provider = FakeProvider(FactExtractionResponse(format="fact-extraction-v1", candidates=()))
+        service(provider).extract(ExtractRunFactsCommand(initial_run_id))
+        with pool.connection() as connection:
+            v1 = IdempotencyRepository(connection).get("fact-extraction-v1", f"understand:{initial_run_id}")
+            v2 = IdempotencyRepository(connection).get("fact-extraction-update-v2", f"understand-update:{initial_run_id}")
+        assert len(provider.calls) == 1
+        assert {chunk.document_version_id for chunk in provider.calls[0].source_chunks} == {
+            resources.document_version_id,
+            resources.other_document_version_id,
+        }
+        assert v1 is not None and v1.status is IdempotencyStatus.COMPLETED
+        assert v2 is None
+    finally:
+        with pool.connection() as connection:
+            connection.execute("DELETE FROM idempotency_records WHERE key = %s", (f"understand:{initial_run_id}",))
+            connection.execute("DELETE FROM run_document_versions WHERE run_id = %s::uuid", (initial_run_id,))
+            connection.execute("DELETE FROM runs WHERE id = %s::uuid", (initial_run_id,))
+            connection.commit()
 
 
 def test_extracts_grounded_fact_with_chunk_relative_evidence(resources: ExtractionResources) -> None:
