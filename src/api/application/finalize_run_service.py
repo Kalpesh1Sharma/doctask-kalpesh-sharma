@@ -6,18 +6,24 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.build_update_change_set_service import (
+    build_current_update_change_set_manifest,
+)
 from domain.render_input import (
     RenderInputManifest,
     build_render_input_manifest,
     render_input_fingerprint,
 )
 from domain.review_state import ReviewStateMembership, build_review_state_snapshot
-from domain.run import RunStatus
+from domain.run import RunStatus, RunType
+from domain.update_review import UpdateReviewDecisionType, update_change_set_fingerprint
 from repositories.audit_event_repository import AuditEventRecord, AuditEventRepository
 from repositories.output_repository import OutputRecord, OutputRepository
 from repositories.render_input_repository import RenderInputRepository
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_repository import RunRecord, RunRepository
+from repositories.update_change_set_repository import UpdateChangeSetRepository
+from repositories.update_review_decision_repository import UpdateReviewDecisionRepository
 from services.local_artifact_storage import ArtifactIntegrityError, LocalArtifactStorage
 
 _MAX_TRANSACTION_ATTEMPTS = 3
@@ -64,6 +70,18 @@ class FinalizationIntegrityError(FinalizeRunApplicationError):
 
 
 class FinalArtifactIntegrityError(FinalizeRunApplicationError):
+    pass
+
+
+class UpdateApprovalMissingError(FinalizeRunApplicationError):
+    pass
+
+
+class UpdateApprovalRejectedError(FinalizeRunApplicationError):
+    pass
+
+
+class UpdateApprovalStaleError(FinalizeRunApplicationError):
     pass
 
 
@@ -162,6 +180,8 @@ class FinalizeRunService:
         self._require_fresh_status(run)
 
         manifest = self._build_manifest(connection, command.run_id)
+        if run.run_type is RunType.UPDATE:
+            self._require_update_approval(connection, run, manifest)
         fingerprint = render_input_fingerprint(manifest)
         if fingerprint != command.expected_render_input_fingerprint:
             raise RenderInputDriftError("authoritative render input no longer matches preparation")
@@ -192,6 +212,27 @@ class FinalizeRunService:
             render_input_fingerprint=fingerprint,
             replayed=False,
         )
+
+    def _require_update_approval(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        render_manifest: RenderInputManifest,
+    ) -> None:
+        change_set = UpdateChangeSetRepository(connection).get_by_run_id(run.run_id)
+        if change_set is None:
+            raise UpdateApprovalMissingError("UPDATE Run has no durable change set")
+        change_set.to_manifest()
+        decision = UpdateReviewDecisionRepository(connection).get_by_change_set_id(
+            change_set.change_set_id,
+        )
+        if decision is None:
+            raise UpdateApprovalMissingError("UPDATE change set has no approval")
+        if decision.decision is UpdateReviewDecisionType.REJECTED:
+            raise UpdateApprovalRejectedError("UPDATE change set was rejected")
+        current_change_set = build_current_update_change_set_manifest(connection, run)
+        if update_change_set_fingerprint(current_change_set) != change_set.change_set_fingerprint:
+            raise UpdateApprovalStaleError("approved UPDATE change set no longer matches current state")
 
     def _replay_or_conflict(
         self,
