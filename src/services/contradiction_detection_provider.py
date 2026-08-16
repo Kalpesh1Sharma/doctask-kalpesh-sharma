@@ -15,3 +15,7 @@ class ContradictionDetectionProvider(Protocol):
 
 class ContradictionDetectionProviderError(RuntimeError):
     """Raised when a provider cannot complete a structured detection request."""
+
+
+class ContradictionDetectionInvalidResponseError(ContradictionDetectionProviderError):
+    """Raised when a provider returns unusable structured output."""

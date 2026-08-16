@@ -12,3 +12,7 @@ class FactExtractionProvider(Protocol):
 
 class FactExtractionProviderError(RuntimeError):
     """Raised when a provider cannot complete a structured extraction request."""
+
+
+class FactExtractionInvalidResponseError(FactExtractionProviderError):
+    """Raised when a provider returns unusable structured output."""

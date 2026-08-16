@@ -16,6 +16,7 @@ from api.application.idempotency_claim_takeover import (
     reclaim_if_stale,
     validate_stale_claim_after,
 )
+from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
 from domain.contradiction_detection import (
     ContradictionCandidatePair,
     ContradictionDetectionRequest,
@@ -28,7 +29,7 @@ from domain.contradiction_detection import (
 )
 from domain.fact import FactStatus
 from domain.finding import Finding, FindingStatus, FindingType
-from domain.run import RunStatus
+from domain.run import RunStage, RunStatus
 from domain.run_membership import RunMembershipRelation
 from repositories.finding_evidence_repository import FindingEvidenceRepository
 from repositories.finding_repository import FindingRepository
@@ -43,6 +44,7 @@ from repositories.run_fact_repository import RunFactReconciliationRecord, RunFac
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_repository import RunRecord, RunRepository
 from services.contradiction_detection_provider import (
+    ContradictionDetectionInvalidResponseError,
     ContradictionDetectionProvider,
     ContradictionDetectionProviderError,
 )
@@ -162,15 +164,34 @@ class DetectRunContradictionsService:
         return self._execute_claimed(claimed)
 
     def _execute_claimed(self, claimed: _ClaimedOperation) -> DetectRunContradictionsResult:
+        receipt = start_provider_usage(
+            self._connection_pool,
+            run_id=claimed.request.run_id,
+            stage=RunStage.EXAMINE,
+            operation_scope=_IDEMPOTENCY_SCOPE,
+            operation_key=self._idempotency_key(claimed.request.run_id),
+            claim_generation=claimed.claim_token,
+            provider=self._provider,
+        )
         try:
-            response = self._provider.detect(claimed.request)
-            finding_plans = self._build_finding_plans(claimed.request, response)
+            try:
+                response = self._provider.detect(claimed.request)
+                finding_plans = self._build_finding_plans(claimed.request, response)
+            finally:
+                finish_provider_usage(
+                    self._connection_pool, receipt, getattr(self._provider, "last_usage", None),
+                )
         except InvalidContradictionDetectionResponseError:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
             raise
         except ContradictionDetectionApplicationError:
             self._mark_failed(claimed)
             raise
+        except ContradictionDetectionInvalidResponseError as error:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
+            raise InvalidContradictionDetectionResponseError(
+                "contradiction detection provider returned invalid structured output",
+            ) from error
         except ContradictionDetectionProviderError as error:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise ContradictionDetectionProviderFailure(

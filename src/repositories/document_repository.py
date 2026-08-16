@@ -39,6 +39,27 @@ class DocumentRecord:
         )
 
 
+@dataclass(frozen=True)
+class CurrentDocumentVersionRecord:
+    document_id: str
+    pile_id: str
+    logical_key: str
+    document_version_id: str
+    version_number: int
+    processing_status: str
+
+    @classmethod
+    def from_row(cls, row: tuple[object, ...]) -> "CurrentDocumentVersionRecord":
+        return cls(
+            document_id=str(row[0]),
+            pile_id=str(row[1]),
+            logical_key=cast(str, row[2]),
+            document_version_id=str(row[3]),
+            version_number=cast(int, row[4]),
+            processing_status=cast(str, row[5]),
+        )
+
+
 class DocumentRepository:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
@@ -101,6 +122,31 @@ class DocumentRepository:
 
         return DocumentRecord.from_row(row) if row is not None else None
 
+    def create_or_get_for_update(self, pile_id: str, logical_key: str) -> DocumentRecord:
+        """Serialize version allocation on the durable logical-document row."""
+        row = self._connection.execute(
+            f"""
+            INSERT INTO documents (pile_id, logical_key)
+            VALUES (%s::uuid, %s)
+            ON CONFLICT (pile_id, logical_key) DO NOTHING
+            RETURNING {_DOCUMENT_COLUMNS}
+            """,
+            (pile_id, logical_key),
+        ).fetchone()
+        if row is not None:
+            return DocumentRecord.from_row(row)
+        existing = self._connection.execute(
+            f"""
+            SELECT {_DOCUMENT_COLUMNS}
+            FROM documents
+            WHERE pile_id = %s::uuid AND logical_key = %s
+            FOR UPDATE
+            """,
+            (pile_id, logical_key),
+        ).fetchone()
+        assert existing is not None
+        return DocumentRecord.from_row(existing)
+
     def set_current_version(
         self,
         document_id: str,
@@ -117,3 +163,18 @@ class DocumentRepository:
         ).fetchone()
 
         return DocumentRecord.from_row(row) if row is not None else None
+
+    def list_current_versions_for_pile(self, pile_id: str) -> list[CurrentDocumentVersionRecord]:
+        rows = self._connection.execute(
+            """
+            SELECT documents.id, documents.pile_id, documents.logical_key,
+                   document_versions.id, document_versions.version_number,
+                   document_versions.processing_status
+            FROM documents
+            JOIN document_versions ON document_versions.id = documents.current_version_id
+            WHERE documents.pile_id = %s::uuid
+            ORDER BY documents.id ASC, document_versions.version_number ASC, document_versions.id ASC
+            """,
+            (pile_id,),
+        ).fetchall()
+        return [CurrentDocumentVersionRecord.from_row(row) for row in rows]

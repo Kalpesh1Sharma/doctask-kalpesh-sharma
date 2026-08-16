@@ -9,6 +9,15 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.commit_final_report_service import (
+    CommitArtifactPublicationError,
+    CommitFinalReportClaimLostError,
+    CommitFinalReportCommand,
+    CommitFinalReportInProgressError,
+    CommitFinalReportIntegrityError,
+    CommitFinalReportPreviouslyFailedError,
+    CommitFinalReportService,
+)
 from api.application.detect_run_contradictions_service import (
     ContradictionClaimLostError,
     ContradictionDetectionInProgressError,
@@ -92,6 +101,7 @@ from repositories.idempotency_repository import (
     IdempotencyRepository,
     IdempotencyStatus,
 )
+from repositories.provider_usage_repository import ProviderUsageRepository
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_finding_repository import RunFindingRepository
@@ -100,12 +110,13 @@ from repositories.run_repository import RunRecord, RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
 from repositories.run_step_repository import RunStepRecord, RunStepRepository
 
-_STAGES = (RunStage.INGEST, RunStage.UNDERSTAND, RunStage.EXAMINE, RunStage.REVIEW)
+_STAGES = (RunStage.INGEST, RunStage.UNDERSTAND, RunStage.EXAMINE, RunStage.REVIEW, RunStage.COMMIT)
 _FACT_SCOPE = "fact-extraction-v1"
 _UPDATE_FACT_SCOPE = "fact-extraction-update-v2"
 _PREPARATION_SCOPE = "update-preparation-v1"
 _CONTRADICTION_SCOPE = "contradiction-detection-v1"
 _RULE_SCOPE = "rule-evaluation-v1"
+_COMMIT_SCOPE = "final-report-render-v1"
 
 
 class RunWorkflowError(Exception):
@@ -226,6 +237,7 @@ class RunWorkflowService:
         extract_run_facts_service: ExtractRunFactsService,
         detect_run_contradictions_service: DetectRunContradictionsService,
         evaluate_run_rules_service: EvaluateRunRulesService,
+        commit_final_report_service: CommitFinalReportService | None = None,
     ) -> None:
         self._connection_pool = connection_pool
         self._prepare_update = prepare_update_run_service
@@ -233,6 +245,7 @@ class RunWorkflowService:
         self._extract_facts = extract_run_facts_service
         self._detect_contradictions = detect_run_contradictions_service
         self._evaluate_rules = evaluate_run_rules_service
+        self._commit_final_report = commit_final_report_service
 
     @staticmethod
     def _state_error(
@@ -267,8 +280,10 @@ class RunWorkflowService:
                 replayed = self._run_understand(context)
             elif context.step.stage is RunStage.EXAMINE:
                 replayed = self._run_examine(context)
-            else:
+            elif context.step.stage is RunStage.REVIEW:
                 self._complete_review(context)
+            else:
+                return self._run_commit(context)
         except _RetryScheduled as scheduled:
             return scheduled.result
         except RunWorkflowError:
@@ -277,6 +292,15 @@ class RunWorkflowService:
             raise
         except self._correctable_scope_errors():
             raise
+        except CommitFinalReportInProgressError as error:
+            raise self._state_error(
+                RunWorkflowOperationInProgress,
+                context.run,
+                context.step,
+                "OPERATION_IN_PROGRESS",
+                str(error),
+                self._commit_operation(context.run),
+            ) from error
         except self._graph_errors():
             self._recheck_not_eligible(context)
             raise
@@ -345,7 +369,10 @@ class RunWorkflowService:
             if not steps:
                 self._require_fresh_graph(connection, run, command)
                 repository = RunStepRepository(connection)
-                created = {stage: repository.create(run.run_id, stage, 1) for stage in _STAGES}
+                created = {
+                    stage: repository.create(run.run_id, stage, 1)
+                    for stage in self._graph_stages()
+                }
                 step = self._transition_running(repository, created[RunStage.INGEST])
                 if run.run_type is RunType.UPDATE and run.blocked_on_run_id is not None:
                     step = self._await_upstream(repository, step, "RUN_BLOCKED", "waiting on blocked run")
@@ -357,6 +384,8 @@ class RunWorkflowService:
                 connection.commit()
                 return _StageContext(run, step)
 
+            self._reconcile_commit_cutover_if_needed(connection, run, steps)
+            steps = RunStepRepository(connection).list_for_run(run.run_id)
             self._validate_graph(steps)
             step = self._next_step(steps)
             if step is None:
@@ -499,6 +528,26 @@ class RunWorkflowService:
             return False
         raise RunWorkflowGraphIntegrityError("EXAMINE retry has unknown operation provenance")
 
+    def _run_commit(self, context: _StageContext) -> RunWorkflowResult:
+        if self._commit_final_report is None:
+            raise RunWorkflowGraphIntegrityError("COMMIT service is not configured")
+        if context.step.attempt > 1:
+            self._commit_final_report._retry_after_failed_from_workflow(
+                CommitFinalReportCommand(context.run.run_id),
+                expected_failed_generation=context.step.retry_from_claim_generation,
+            )
+        else:
+            self._commit_final_report.commit(CommitFinalReportCommand(context.run.run_id))
+        with self._connection_pool.connection() as connection:
+            run = RunRepository(connection).get_by_id(context.run.run_id)
+            step = RunStepRepository(connection).get_for_run_stage_attempt(
+                context.run.run_id, RunStage.COMMIT, context.step.attempt,
+            )
+            if run is None or step is None or run.status is not RunStatus.COMPLETED or step.status is not RunStepStatus.COMPLETED:
+                raise RunWorkflowGraphIntegrityError("COMMIT service returned without durable completion proof")
+            connection.commit()
+        return RunWorkflowResult(run.run_id, RunStage.COMMIT, step, run.status, RunWorkflowOutcome.COMPLETED, True)
+
     def _run_operation(self, context: _StageContext, operation: _Operation) -> bool:
         with self._connection_pool.connection() as connection:
             record = IdempotencyRepository(connection).get(operation.scope, operation.key)
@@ -545,6 +594,10 @@ class RunWorkflowService:
             self._evaluate_rules._retry_after_failed_from_workflow(
                 EvaluateRunRulesCommand(context.run.run_id), expected_failed_generation=generation,
             )
+        elif operation.scope == _COMMIT_SCOPE and self._commit_final_report is not None:
+            self._commit_final_report._retry_after_failed_from_workflow(
+                CommitFinalReportCommand(context.run.run_id), expected_failed_generation=generation,
+            )
         else:
             raise RunWorkflowGraphIntegrityError("retry operation is not provider-backed")
 
@@ -561,6 +614,8 @@ class RunWorkflowService:
                 if record is not None and record.status is IdempotencyStatus.FAILED:
                     return contradiction
             return self._rule_evaluation_operation(context.run)
+        if context.step.stage is RunStage.COMMIT:
+            return self._commit_operation(context.run)
         raise RunWorkflowGraphIntegrityError("stage has no retryable provider operation")
 
     def _retry_operation_for_context(self, context: _StageContext) -> _Operation | None:
@@ -568,6 +623,8 @@ class RunWorkflowService:
             return self._preparation_operation(context.run)
         if context.step.stage in {RunStage.UNDERSTAND, RunStage.EXAMINE}:
             return self._operation_for_failure(context)
+        if context.step.stage is RunStage.COMMIT:
+            return self._commit_operation(context.run)
         return None
 
     def _schedule_retry(
@@ -620,7 +677,9 @@ class RunWorkflowService:
                     error_message=f"retry budget exhausted for {operation.scope}/{operation.key}",
                 )
                 assert updated is not None
-                RunMetricRepository(connection).create_for_closed_step(run.run_id, updated.stage, updated.attempt)
+                self._create_metric_with_usage(
+                    connection, run.run_id, updated.stage, updated.attempt,
+                )
                 connection.commit()
                 raise self._state_error(
                     RunWorkflowStepEscalatedError, run, updated,
@@ -636,7 +695,9 @@ class RunWorkflowService:
                 ),
             )
             assert updated is not None
-            RunMetricRepository(connection).create_for_closed_step(run.run_id, updated.stage, updated.attempt)
+            self._create_metric_with_usage(
+                connection, run.run_id, updated.stage, updated.attempt,
+            )
             successor = steps.create(
                 run.run_id, step.stage, step.attempt + 1,
                 retry_operation_scope=operation.scope,
@@ -682,12 +743,37 @@ class RunWorkflowService:
                 clear_error=True,
             )
             assert step is not None
-            RunMetricRepository(connection).create_for_closed_step(run.run_id, step.stage, step.attempt)
+            self._create_metric_with_usage(
+                connection, run.run_id, step.stage, step.attempt,
+            )
             connection.commit()
             return RunWorkflowResult(
                 run.run_id, step.stage, step, run.status,
                 outcome, advanced=True,
             )
+
+    def _create_metric_with_usage(
+        self,
+        connection: Connection,
+        run_id: str,
+        stage: RunStage,
+        attempt: int,
+    ) -> None:
+        metrics = RunMetricRepository(connection)
+        metrics.create_for_closed_step(run_id, stage, attempt)
+        input_tokens, output_tokens, estimated_cost = ProviderUsageRepository(
+            connection,
+        ).aggregate_for_step(run_id, stage, attempt)
+        updated = metrics.set_usage(
+            run_id,
+            stage,
+            attempt,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost=estimated_cost,
+        )
+        if updated is None:
+            raise RunWorkflowGraphIntegrityError("closed RunStep metric disappeared")
 
     def _complete_review(self, context: _StageContext) -> None:
         # Every upstream service owns exact replay and result-reference
@@ -726,7 +812,7 @@ class RunWorkflowService:
         elif stage is RunStage.EXAMINE:
             self._require_completed(idempotency, _CONTRADICTION_SCOPE, f"examine-contradictions:{run.run_id}")
             self._require_completed(idempotency, _RULE_SCOPE, f"examine-rules:{run.run_id}")
-        else:
+        elif stage is RunStage.REVIEW:
             steps = {
                 step.stage: step
                 for step in RunStepRepository(connection).list_for_run(run.run_id)
@@ -753,6 +839,8 @@ class RunWorkflowService:
                 f"examine-contradictions:{run.run_id}",
             )
             self._require_completed(idempotency, _RULE_SCOPE, f"examine-rules:{run.run_id}")
+        else:
+            self._require_completed(idempotency, _COMMIT_SCOPE, f"commit-final-report:{run.run_id}")
 
     def _require_completed(self, repository: IdempotencyRepository, scope: str, key: str) -> None:
         record = repository.get(scope, key)
@@ -794,8 +882,8 @@ class RunWorkflowService:
                 error_message=message,
             )
             assert updated is not None
-            RunMetricRepository(connection).create_for_closed_step(
-                run.run_id, updated.stage, updated.attempt,
+            self._create_metric_with_usage(
+                connection, run.run_id, updated.stage, updated.attempt,
             )
             if fail_run:
                 updated_run = runs.update_status(run.run_id, RunStatus.FAILED)
@@ -955,6 +1043,15 @@ class RunWorkflowService:
             lambda: self._evaluate_rules.evaluate(EvaluateRunRulesCommand(run.run_id)),
         )
 
+    def _commit_operation(self, run: RunRecord) -> _Operation:
+        if self._commit_final_report is None:
+            raise RunWorkflowGraphIntegrityError("COMMIT service is not configured")
+        return _Operation(
+            _COMMIT_SCOPE,
+            f"commit-final-report:{run.run_id}",
+            lambda: self._commit_final_report.commit(CommitFinalReportCommand(run.run_id)),
+        )
+
     def _recheck_not_eligible(self, context: _StageContext) -> None:
         with self._connection_pool.connection() as connection:
             run = RunRepository(connection).get_for_update(context.run.run_id)
@@ -1007,7 +1104,9 @@ class RunWorkflowService:
 
     def _next_step(self, steps: list[RunStepRecord]) -> RunStepRecord | None:
         by_stage = self._latest_steps(steps)
-        for stage in _STAGES:
+        for stage in self._graph_stages():
+            if stage not in by_stage:
+                continue
             step = by_stage[stage]
             if step.status is not RunStepStatus.COMPLETED:
                 return step
@@ -1017,14 +1116,23 @@ class RunWorkflowService:
         if not steps:
             raise RunWorkflowGraphIntegrityError("workflow graph is absent")
         by_stage = self._latest_steps(steps)
-        if set(by_stage) != set(_STAGES):
+        configured_stages = self._graph_stages()
+        expected_stages = set(configured_stages)
+        legacy_stages = set(_STAGES[:-1])
+        # A COMMIT-aware runtime may reconcile a pre-006 four-stage graph.
+        # The Phase 5A compatibility construction (no COMMIT service injected)
+        # intentionally remains a four-stage graph for existing callers.
+        if self._commit_final_report is not None and set(by_stage) == legacy_stages:
+            expected_stages = legacy_stages
+        if set(by_stage) != expected_stages:
             raise RunWorkflowGraphIntegrityError("workflow graph has unexpected stages")
-        for stage in _STAGES:
+        stages = tuple(stage for stage in configured_stages if stage in expected_stages)
+        for stage in stages:
             attempts = sorted(item.attempt for item in steps if item.stage is stage)
             if not attempts or attempts != list(range(1, max(attempts) + 1)) or max(attempts) > 3:
                 raise RunWorkflowGraphIntegrityError("workflow graph has non-contiguous attempts")
         seen_incomplete = False
-        for stage in _STAGES:
+        for stage in stages:
             step = by_stage[stage]
             if seen_incomplete and step.status is not RunStepStatus.PENDING:
                 raise RunWorkflowGraphIntegrityError("downstream stage cannot be active")
@@ -1038,6 +1146,39 @@ class RunWorkflowService:
             if step.stage not in latest or step.attempt > latest[step.stage].attempt:
                 latest[step.stage] = step
         return latest
+
+    def _reconcile_commit_cutover_if_needed(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        steps: list[RunStepRecord],
+    ) -> None:
+        """Add only a pending COMMIT to pre-006 active workflow graphs.
+
+        Already-COMPLETED historical Runs remain read-only and never receive a
+        fabricated COMMIT history.
+        """
+        if self._commit_final_report is None:
+            return
+        stages = {step.stage for step in steps}
+        legacy = set(_STAGES[:-1])
+        if stages == legacy:
+            if run.commit_required and run.status is not RunStatus.COMPLETED:
+                RunStepRepository(connection).create(run.run_id, RunStage.COMMIT, 1)
+            return
+        if RunStage.COMMIT not in stages and stages != legacy:
+            raise RunWorkflowGraphIntegrityError("workflow graph is partial around COMMIT cutover")
+
+    def _graph_stages(self) -> tuple[RunStage, ...]:
+        """Expose COMMIT only when its single finalization authority is wired.
+
+        This preserves the public Phase 5A construction used by existing
+        applications/tests while a Phase 6A runtime injects the COMMIT service
+        and owns the five-stage graph from creation onward.
+        """
+        if self._commit_final_report is None:
+            return _STAGES[:-1]
+        return _STAGES
 
     @staticmethod
     def _correctable_scope_errors():
@@ -1075,6 +1216,7 @@ class RunWorkflowService:
             FactExtractionClaimLostError,
             ContradictionClaimLostError,
             RuleEvaluationClaimLostError,
+            CommitFinalReportClaimLostError,
         )
 
     @staticmethod
@@ -1092,6 +1234,9 @@ class RunWorkflowService:
             RuleEvaluationProviderFailure,
             InvalidRuleEvaluationResponseError,
             UnsupportedRuleEvaluationError,
+            CommitFinalReportPreviouslyFailedError,
+            CommitArtifactPublicationError,
+            CommitFinalReportIntegrityError,
         )
 
     @staticmethod

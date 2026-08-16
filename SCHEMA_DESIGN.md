@@ -106,7 +106,7 @@ PILE
 
 The locked V2.7 baseline contains **21 tables**.
 
-Reviewed migration `002_run_rule_scope.sql` adds **3 Run-owned rule-scope tables** and reviewed migration `003_update_review.sql` adds **2 UPDATE-review tables**, bringing the current executable schema to **26 tables**:
+Reviewed migration `002_run_rule_scope.sql` adds **3 Run-owned rule-scope tables**, reviewed migration `003_update_review.sql` adds **2 UPDATE-review tables**, migrations `004` and `005` strengthen existing tables without adding new ones, and migration `006_document_runtime_commit_and_telemetry.sql` adds **1 provider-usage table**. The current executable schema after ordered migrations `001` through `006` therefore contains **27 tables**:
 
 ```text
 1.  piles
@@ -135,6 +135,7 @@ Reviewed migration `002_run_rule_scope.sql` adds **3 Run-owned rule-scope tables
 24. run_rule_snapshots
 25. update_change_sets
 26. update_review_decisions
+27. provider_usage_events
 ```
 
 ---
@@ -2082,6 +2083,13 @@ Unless the approved Engineer specification explicitly changes them:
 23. Migration `003_update_review.sql` adds one immutable change set per UPDATE Run and one immutable UPDATE-level review decision per change set.
 24. Fresh UPDATE finalization requires an immutable APPROVED update-review decision and exact reconstruction of its full approved change-set fingerprint.
 25. UPDATE change-set and review-decision insertion lock the associated Run and reject stale or non-reviewable state; they do not replace Finding-level review.
+26. Migration `004_idempotency_claim_generation.sql` fences stale idempotency owners with immutable claim generations and PostgreSQL-authoritative claim timestamps.
+27. Migration `005_run_step_retry_history.sql` records semantic retry attempts explicitly and requires exactly one metric for every closed RunStep attempt.
+28. Migration `006_document_runtime_commit_and_telemetry.sql` marks every historical nonterminal and every new Run as `commit_required = TRUE`; only Runs already COMPLETED when 006 is applied receive the immutable compatibility value `FALSE`.
+29. A commit-required Run can create a fresh `FINAL_REPORT` only while its latest COMMIT attempt is RUNNING, and it can transition to COMPLETED only after a `FINAL_REPORT` exists and its latest COMMIT attempt is COMPLETED.
+30. Migration 006 never fabricates historical COMMIT RunSteps or provider-usage receipts; pre-006 active four-stage Runs are reconciled by the application to one pending COMMIT before fresh completion, while historical completed-output replay remains read-only.
+31. `provider_usage_events` records one provider invocation receipt per RunStep/operation/generation; STARTED and UNAVAILABLE carry no token/cost values, while RECORDED preserves whatever usage fields are truthfully known.
+32. READY and FAILED DocumentVersions are terminal immutable history, `piles.latest_run_id` must reference the same Pile, and an established `parent_run_id` cannot be mutated.
 
 ---
 
@@ -2114,7 +2122,8 @@ PILE
         ├──< OUTPUT
         ├──< IDEMPOTENCY_RECORD
         ├──< AUDIT_EVENT
-        └──< RUN_METRIC
+        ├──< RUN_METRIC
+        └──< PROVIDER_USAGE_EVENT
 ```
 
 ---
@@ -2281,6 +2290,9 @@ The executable database contract is the ordered migration set:
 sql/migrations/001_schema_v2_7.sql
 sql/migrations/002_run_rule_scope.sql
 sql/migrations/003_update_review.sql
+sql/migrations/004_idempotency_claim_generation.sql
+sql/migrations/005_run_step_retry_history.sql
+sql/migrations/006_document_runtime_commit_and_telemetry.sql
 ```
 
 Migration `001` remains the locked historical V2.7 baseline.
@@ -2289,7 +2301,13 @@ Migration `002` is the approved additive rule-scope provenance correction.
 
 Migration `003` is the implemented/reviewed additive UPDATE change-set and immutable approval correction, pending independent checkpoint approval.
 
-Future changes must continue additively unless an explicitly reviewed migration policy says otherwise.
+Migration `004` adds fenced idempotency claim ownership without adding tables.
+
+Migration `005` adds explicit retry-attempt provenance and closed-attempt metric integrity without adding tables.
+
+Migration `006` adds the durable document-runtime/COMMIT cutover and provider-usage receipt model, bringing the ordered executable schema to 27 tables.
+
+Migrations `001` through `005` are historical migration artifacts and are not rewritten by the Phase 6A correction. Future changes must continue additively unless an explicitly reviewed migration policy says otherwise.
 
 ---
 
@@ -2334,3 +2352,104 @@ timestamps and exactly one `run_metrics` record. Metric duration is derived as
 and cost fields are never fabricated by migration. A composite metric foreign
 key and deferred closure check prevent orphan/open metrics and unmeasured
 closed attempts.
+
+---
+
+# 46. Migration 006: Document Runtime, COMMIT Authority, and Provider Usage
+
+Migration `006_document_runtime_commit_and_telemetry.sql` is additive. It adds
+`runs.commit_required`, the `provider_usage_state` enum, and the
+`provider_usage_events` table. The executable schema after ordered migrations
+`001` through `006` contains **27 tables**. Migrations `001` through `005`
+remain unchanged historical artifacts.
+
+## 46.1 Durable COMMIT cutover
+
+`commit_required` is the permanent Phase-6 completion-authority marker:
+
+- Runs already `COMPLETED` when migration 006 is applied are assigned
+  `commit_required = FALSE` so their existing output can remain readable and
+  replayable without inventing COMMIT history.
+- Every historical nonterminal Run is assigned `commit_required = TRUE`.
+- Every Run created after migration 006 defaults to `commit_required = TRUE`.
+- The marker is `NOT NULL` and immutable after cutover. Application callers
+  cannot create a new compatibility Run or downgrade a Phase-6 Run to `FALSE`.
+- Migration 006 does **not** fabricate COMMIT RunSteps for any historical Run.
+
+There is no generic fresh direct-finalization compatibility path. For a
+commit-required Run, inserting a fresh `FINAL_REPORT` requires the Run to be
+`REVIEW_REQUIRED` and the latest COMMIT attempt to be `RUNNING`. A subsequent
+transition to `COMPLETED` requires a `FINAL_REPORT` and the latest COMMIT
+attempt to be `COMPLETED`.
+
+Historical Runs that were already `COMPLETED` before migration 006 are a
+read-only compatibility class only. `FinalizeRunService` may validate/replay an
+already committed historical output, but it cannot create a fresh output for
+that class. A pre-006 **active** four-stage Run is not direct-finalization
+compatible: `RunWorkflowService` reconciles it to exactly one pending COMMIT
+attempt before it can complete through the normal five-stage workflow.
+
+`CommitFinalReportService` is therefore the sole public fresh-finalization
+authority. Its generation-fenced transaction verifies current review/render
+state, the deterministic final-report bytes and artifact hash, the active
+COMMIT attempt, and the current idempotency owner before persisting Output,
+audit, metric, claim completion, COMMIT completion, and finally Run completion.
+
+## 46.2 Provider usage receipts and metrics
+
+`provider_usage_events` is a durable receipt for an actual provider invocation,
+keyed by `(run_id, stage, attempt, operation_scope, operation_key,
+claim_generation)`. It is tied to the semantic RunStep attempt, not merely the
+current idempotency row. Exact service replay creates no new receipt; a Phase
+5B generation takeover receives its own receipt.
+
+Receipt state semantics are exact:
+
+- `STARTED`: `recorded_at`, token counts, and estimated cost are null.
+- `UNAVAILABLE`: `recorded_at` is non-null and token/cost fields are null.
+- `RECORDED`: `recorded_at` is non-null; truthfully known token/cost fields are
+  stored and fields the provider did not supply may remain null.
+
+Provider and model identity are durable. Optional configured model pricing may
+produce a `NUMERIC(18,8)` Decimal cost estimate; when pricing or usage is not
+known, cost remains null rather than being invented. RunStep metric aggregation
+uses only receipts belonging to that exact attempt, so retry successors and
+Phase-5B generations do not double-count earlier invocations.
+
+## 46.3 Document-runtime and lineage backstops
+
+Migration 006 makes both `READY` and `FAILED` DocumentVersions immutable
+terminal history. A failed `(document_id, content_hash)` is not silently
+reopened under a new lifecycle. Content-addressed source bytes outside
+PostgreSQL are non-authoritative orphans until a READY DocumentVersion commits.
+
+`piles.latest_run_id` is the authoritative automatic-arrival lineage tail and
+must reference a Run in the same Pile. The application holds the Pile row lock
+while advancing that tail; completion of an older Run cannot move it backward.
+An established `runs.parent_run_id` is immutable. Existing invalid cross-pile
+tails fail migration rather than being silently rewritten.
+
+## 46.4 Focused UPDATE final artifacts
+
+For an UPDATE, the fresh finalization path reads and verifies the exact baseline
+`FINAL_REPORT` artifact and builds the new report through focused byte
+patching. Retained document lines, carried Finding lines, unchanged evidence
+citation lines, and the unchanged portions of carried Fact claim lines are
+copied from baseline bytes; only material that the approved UPDATE state says
+changed is regenerated. The patched bytes must still equal the canonical
+report for the frozen current input.
+
+The `FINAL_OUTPUT_COMMITTED` audit payload carries a deterministic
+`focused_update` proof containing the baseline Run/Output identity, baseline
+content hash, total preserved byte count, and every preserved baseline/updated
+byte range with its SHA-256 hash. Replay recomputes and validates that proof.
+This preservation proof is an application-level finalization invariant; the
+Migration-006 SQL triggers remain responsible for the durable Output/COMMIT/Run
+state gate.
+
+---
+
+Phase 6A also keeps the narrow PostgreSQL-authoritative workflow amendment in
+`.codex-context/ARCHITECTURE_DESIGN.md`: `RunWorkflowService` is the implemented
+hand-rolled orchestration authority for this checkpoint, with no LangGraph,
+Redis, queue, scheduler, or second durable workflow-state store introduced.

@@ -82,6 +82,21 @@ class LocalArtifactStorage:
 
         return self._verify_path(self._path_for_digest(uri_digest), uri_digest)
 
+    def read_bytes(self, storage_uri: str, content_hash: str) -> bytes:
+        """Read one immutable artifact while verifying its canonical digest."""
+
+        uri_digest = self._digest_from_uri(storage_uri)
+        hash_digest = self._digest_from_content_hash(content_hash)
+        if uri_digest != hash_digest:
+            raise ArtifactIntegrityError("artifact URI and supplied content hash disagree")
+
+        path = self._path_for_digest(uri_digest)
+        with path.open("rb") as stream:
+            content = stream.read()
+        if sha256(content).hexdigest() != uri_digest:
+            raise ArtifactIntegrityError("stored artifact bytes do not match the expected content hash")
+        return content
+
     def _artifact_for_digest(self, digest: str, size_bytes: int) -> StoredArtifact:
         return StoredArtifact(
             storage_uri=f"artifact://sha256/{digest}",

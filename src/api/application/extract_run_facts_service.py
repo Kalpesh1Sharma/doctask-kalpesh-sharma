@@ -19,6 +19,7 @@ from api.application.prepare_update_run_service import (
     UpdatePreparationApplicationError,
     build_current_update_preparation_manifest,
 )
+from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
 from domain.evidence import EvidenceSpan
 from domain.fact import Fact, FactStatus
 from domain.fact_extraction import (
@@ -34,7 +35,7 @@ from domain.fact_extraction import (
     sha256_text,
     update_fact_extraction_input_fingerprint,
 )
-from domain.run import RunStatus, RunType
+from domain.run import RunStage, RunStatus, RunType
 from domain.run_membership import RunMembershipRelation
 from domain.update_preparation import update_preparation_fingerprint
 from repositories.document_chunk_repository import DocumentChunkRecord, DocumentChunkRepository
@@ -51,7 +52,11 @@ from repositories.idempotency_repository import (
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_repository import RunRecord, RunRepository
-from services.fact_extraction_provider import FactExtractionProvider, FactExtractionProviderError
+from services.fact_extraction_provider import (
+    FactExtractionInvalidResponseError,
+    FactExtractionProvider,
+    FactExtractionProviderError,
+)
 
 _IDEMPOTENCY_SCOPE = "fact-extraction-v1"
 _UPDATE_IDEMPOTENCY_SCOPE = "fact-extraction-update-v2"
@@ -190,9 +195,23 @@ class ExtractRunFactsService:
         return self._execute_claimed(claimed)
 
     def _execute_claimed(self, claimed: _ClaimedOperation) -> ExtractRunFactsResult:
+        receipt = start_provider_usage(
+            self._connection_pool,
+            run_id=claimed.request.run_id,
+            stage=RunStage.UNDERSTAND,
+            operation_scope=claimed.idempotency_scope,
+            operation_key=claimed.idempotency_key,
+            claim_generation=claimed.claim_token,
+            provider=self._provider,
+        )
         try:
-            response = self._provider.extract(claimed.request)
-            persistence_plan = self._build_persistence_plan(claimed.request, response)
+            try:
+                response = self._provider.extract(claimed.request)
+                persistence_plan = self._build_persistence_plan(claimed.request, response)
+            finally:
+                finish_provider_usage(
+                    self._connection_pool, receipt, getattr(self._provider, "last_usage", None),
+                )
         except SourceEvidenceValidationError:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_EVIDENCE_VALIDATION)
             raise
@@ -202,6 +221,11 @@ class ExtractRunFactsService:
         except FactExtractionApplicationError:
             self._mark_failed(claimed)
             raise
+        except FactExtractionInvalidResponseError as error:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
+            raise InvalidFactExtractionResponseError(
+                "fact extraction provider returned invalid structured output",
+            ) from error
         except FactExtractionProviderError as error:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise FactExtractionProviderFailure("fact extraction provider failed") from error

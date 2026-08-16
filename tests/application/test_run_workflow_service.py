@@ -1,10 +1,14 @@
 from dataclasses import dataclass
+from decimal import Decimal
 from threading import Barrier, Event, Thread
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from psycopg.errors import DeadlockDetected, ForeignKeyViolation, SerializationFailure
 
+from api.application import provider_usage_tracking
+from api.application.commit_final_report_service import CommitFinalReportService
 from api.application.detect_run_contradictions_service import (
     ContradictionDetectionRunNotEligibleError,
     ContradictionIdempotencyIntegrityError,
@@ -26,6 +30,7 @@ from api.application.extract_run_facts_service import (
     FactExtractionIdempotencyIntegrityError,
     FactExtractionRunNotEligibleError,
 )
+from api.application.finalize_run_service import FinalizeRunService
 from api.application.prepare_update_run_service import (
     PrepareUpdateRunCommand,
     PrepareUpdateRunService,
@@ -49,6 +54,7 @@ from api.application.run_workflow_service import (
     RunWorkflowStepEscalatedError,
     RunWorkflowUnmanagedRunError,
 )
+from config.settings import OpenAIModelPricing
 from db.pool import pool
 from domain.contradiction_detection import (
     ContradictionDetectionRequest,
@@ -72,18 +78,28 @@ from domain.rule_evaluation import (
 from domain.run import RunStage, RunStatus, RunStepStatus
 from domain.run_membership import RunMembershipRelation
 from domain.run_rule_scope import RunRuleSetSnapshot
+from repositories.audit_event_repository import AuditEventRepository
 from repositories.fact_evidence_repository import FactEvidenceRepository
 from repositories.fact_repository import FactRepository
 from repositories.finding_repository import FindingRepository
-from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
+from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
+    IdempotencyRepository,
+    IdempotencyStatus,
+)
+from repositories.output_repository import OutputRepository
+from repositories.provider_usage_repository import ProviderUsageRepository
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_finding_repository import RunFindingRepository
+from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
 from repositories.run_step_repository import RunStepRepository
 from services.contradiction_detection_provider import ContradictionDetectionProviderError
 from services.fact_extraction_provider import FactExtractionProviderError
+from services.local_artifact_storage import ArtifactPublicationError, LocalArtifactStorage
+from services.openai_structured_transport import ProviderUsage
 from services.rule_evaluation_provider import RuleEvaluationProviderError
 
 
@@ -1233,6 +1249,27 @@ class _CapturingFactProvider:
         )
 
 
+class _UsageFactProvider(_CapturingFactProvider):
+    provider_name = "openai"
+    model_name = "workflow-usage-model"
+
+    def __init__(self, usages: tuple[tuple[int, int], ...], *, fail: bool = False) -> None:
+        super().__init__(fail=fail)
+        self._usages = usages
+        self.last_usage: ProviderUsage | None = None
+
+    def extract(
+        self,
+        request: FactExtractionRequest | UpdateFactExtractionRequest,
+    ) -> FactExtractionResponse:
+        index = min(len(self.calls), len(self._usages) - 1)
+        input_tokens, output_tokens = self._usages[index]
+        self.last_usage = ProviderUsage(
+            "openai", self.model_name, input_tokens, output_tokens,
+        )
+        return super().extract(request)
+
+
 class _CapturingContradictionProvider:
     def __init__(self, order: list[str] | None = None, *, fail: bool = False) -> None:
         self.order = order
@@ -1249,6 +1286,20 @@ class _CapturingContradictionProvider:
             format="contradiction-detection-v1",
             contradictions=(),
         )
+
+
+class _UsageContradictionProvider(_CapturingContradictionProvider):
+    provider_name = "openai"
+    model_name = "workflow-contradiction-model"
+
+    def __init__(self, usage: tuple[int, int]) -> None:
+        super().__init__()
+        self._usage = usage
+        self.last_usage: ProviderUsage | None = None
+
+    def detect(self, request: ContradictionDetectionRequest) -> ContradictionDetectionResponse:
+        self.last_usage = ProviderUsage("openai", self.model_name, *self._usage)
+        return super().detect(request)
 
 
 class _CapturingRuleProvider:
@@ -1273,6 +1324,20 @@ class _CapturingRuleProvider:
                 for rule in request.rules
             ),
         )
+
+
+class _UsageRuleProvider(_CapturingRuleProvider):
+    provider_name = "openai"
+    model_name = "workflow-rule-model"
+
+    def __init__(self, usage: tuple[int, int]) -> None:
+        super().__init__()
+        self._usage = usage
+        self.last_usage: ProviderUsage | None = None
+
+    def evaluate(self, request: RuleEvaluationRequest) -> RuleEvaluationResponse:
+        self.last_usage = ProviderUsage("openai", self.model_name, *self._usage)
+        return super().evaluate(request)
 
 
 class _ObservingScopeService:
@@ -2862,6 +2927,140 @@ def test_provider_failure_schedules_explicit_retry_without_failing_run() -> None
     assert len(extraction_provider.calls) == 1
 
 
+def test_completed_provider_attempt_aggregates_usage_and_configured_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _UsageFactProvider(((1_000_000, 2_000_000),))
+    monkeypatch.setattr(
+        provider_usage_tracking,
+        "get_settings",
+        lambda: SimpleNamespace(
+            openai_model_pricing={
+                provider.model_name: OpenAIModelPricing(
+                    input_cost_per_million=Decimal("0.50"),
+                    output_cost_per_million=Decimal("1.25"),
+                ),
+            },
+        ),
+    )
+    created, workflow, command, *_ = _real_manual_ready_for_understand(
+        extraction_provider=provider,
+    )
+
+    result = workflow.advance(command)
+
+    assert result.stage is RunStage.UNDERSTAND
+    assert result.step.status is RunStepStatus.COMPLETED
+    with pool.connection() as connection:
+        metric = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.UNDERSTAND, 1,
+        )
+        events = ProviderUsageRepository(connection).list_for_step(
+            created.run_id, RunStage.UNDERSTAND, 1,
+        )
+    assert metric is not None
+    assert (metric.input_tokens, metric.output_tokens) == (1_000_000, 2_000_000)
+    assert metric.estimated_cost == Decimal("3.00000000")
+    assert len(events) == 1
+    assert events[0].model_name == provider.model_name
+    assert events[0].estimated_cost == Decimal("3.00000000")
+
+
+def test_retrying_and_successor_attempts_keep_usage_isolated() -> None:
+    provider = _UsageFactProvider(((5, 7), (11, 13)), fail=True)
+    created, workflow, command, *_ = _real_manual_ready_for_understand(
+        extraction_provider=provider,
+    )
+
+    scheduled = workflow.advance(command)
+    assert scheduled.step.status is RunStepStatus.RETRYING
+    provider.fail = False
+    completed = workflow.advance(command)
+    assert completed.step.status is RunStepStatus.COMPLETED
+
+    with pool.connection() as connection:
+        first = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.UNDERSTAND, 1,
+        )
+        second = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.UNDERSTAND, 2,
+        )
+        first_events = ProviderUsageRepository(connection).list_for_step(
+            created.run_id, RunStage.UNDERSTAND, 1,
+        )
+        second_events = ProviderUsageRepository(connection).list_for_step(
+            created.run_id, RunStage.UNDERSTAND, 2,
+        )
+    assert first is not None and second is not None
+    assert (first.input_tokens, first.output_tokens, first.estimated_cost) == (5, 7, None)
+    assert (second.input_tokens, second.output_tokens, second.estimated_cost) == (11, 13, None)
+    assert len(first_events) == len(second_events) == 1
+    assert first_events[0].claim_generation == 1
+    assert second_events[0].claim_generation == 2
+
+
+def test_escalated_attempt_aggregates_only_its_own_usage() -> None:
+    provider = _UsageFactProvider(((2, 3), (5, 7), (11, 13)), fail=True)
+    created, workflow, command, *_ = _real_manual_ready_for_understand(
+        extraction_provider=provider,
+    )
+
+    assert workflow.advance(command).step.status is RunStepStatus.RETRYING
+    assert workflow.advance(command).step.status is RunStepStatus.RETRYING
+    with pytest.raises(RunWorkflowStepEscalatedError):
+        workflow.advance(command)
+
+    with pool.connection() as connection:
+        metrics = [
+            RunMetricRepository(connection).get_for_run_stage_attempt(
+                created.run_id, RunStage.UNDERSTAND, attempt,
+            )
+            for attempt in (1, 2, 3)
+        ]
+    assert all(metric is not None for metric in metrics)
+    assert [(metric.input_tokens, metric.output_tokens) for metric in metrics if metric] == [
+        (2, 3),
+        (5, 7),
+        (11, 13),
+    ]
+
+
+def test_examine_exact_replay_does_not_double_count_provider_usage() -> None:
+    contradiction = _UsageContradictionProvider((17, 19))
+    rules = _UsageRuleProvider((23, 29))
+    created, workflow, command, *_ = _real_manual_ready_for_examine(
+        contradiction_provider=contradiction,
+        rule_provider=rules,
+    )
+
+    examined = workflow.advance(command)
+    assert examined.stage is RunStage.EXAMINE
+    with pool.connection() as connection:
+        metric_before = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+        events_before = ProviderUsageRepository(connection).list_for_step(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+    assert metric_before is not None
+    assert (metric_before.input_tokens, metric_before.output_tokens) == (40, 48)
+    assert len(events_before) == 2
+
+    reviewed = workflow.advance(command)
+    assert reviewed.stage is RunStage.REVIEW
+    with pool.connection() as connection:
+        metric_after = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+        events_after = ProviderUsageRepository(connection).list_for_step(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+    assert metric_after == metric_before
+    assert events_after == events_before
+    assert len(contradiction.calls) == 1
+    assert len(rules.calls) == 1
+
+
 def test_pending_retry_successor_starts_and_reopens_only_through_workflow() -> None:
     created = _create_real_initial_or_manual_run("MANUAL")
     extraction_provider = _CapturingFactProvider(fail=True)
@@ -3666,3 +3865,491 @@ def test_workflow_ingest_completion_sets_completed_at_once() -> None:
     assert observed is not None
     assert observed.completed_at == completed.completed_at
     _assert_phase5a_graph_invariants(resources.update_run_id)
+
+
+def test_phase6_cutover_reconciles_pre006_review_required_graph_to_one_pending_commit() -> None:
+    with pool.connection() as connection:
+        pile = connection.execute(
+            "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+            (f"Phase6 cutover {uuid4()}",),
+        ).fetchone()
+        assert pile is not None
+        run_row = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status)
+            VALUES (%s::uuid, 'MANUAL'::run_type, 'REVIEW_REQUIRED'::run_status)
+            RETURNING id
+            """,
+            (str(pile[0]),),
+        ).fetchone()
+        assert run_row is not None
+        run_id = str(run_row[0])
+        steps = RunStepRepository(connection)
+        metrics = RunMetricRepository(connection)
+        for stage in (RunStage.INGEST, RunStage.UNDERSTAND, RunStage.EXAMINE, RunStage.REVIEW):
+            step = steps.create(run_id, stage, 1)
+            running = steps.update_execution_state(
+                step.step_id,
+                RunStepStatus.RUNNING,
+                mark_started=True,
+            )
+            assert running is not None
+            completed = steps.update_execution_state(
+                step.step_id,
+                RunStepStatus.COMPLETED,
+                mark_completed=True,
+            )
+            assert completed is not None
+            metrics.create_for_closed_step(run_id, stage, 1)
+        connection.commit()
+
+    service = object.__new__(RunWorkflowService)
+    service._commit_final_report = object()
+    with pool.connection() as connection:
+        run = RunRepository(connection).get_for_update(run_id)
+        assert run is not None
+        assert run.commit_required is True
+        existing = RunStepRepository(connection).list_for_run(run_id)
+        service._reconcile_commit_cutover_if_needed(connection, run, existing)
+        first_reconciliation = RunStepRepository(connection).list_for_run(run_id)
+        service._reconcile_commit_cutover_if_needed(connection, run, first_reconciliation)
+        connection.commit()
+
+    commits = [step for step in first_reconciliation if step.stage is RunStage.COMMIT]
+    assert len(commits) == 1
+    assert commits[0].attempt == 1
+    assert commits[0].status is RunStepStatus.PENDING
+    assert commits[0].started_at is None
+    assert commits[0].completed_at is None
+
+    with pool.connection() as connection:
+        final_steps = RunStepRepository(connection).list_for_run(run_id)
+        run = RunRepository(connection).get_by_id(run_id)
+        metric_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM run_metrics
+            WHERE run_id = %s::uuid AND stage = 'COMMIT'::run_stage
+            """,
+            (run_id,),
+        ).fetchone()
+    assert run is not None and run.status is RunStatus.REVIEW_REQUIRED
+    assert len([step for step in final_steps if step.stage is RunStage.COMMIT]) == 1
+    assert metric_count == (0,)
+
+
+def _phase6_real_workflow(
+    artifact_storage: LocalArtifactStorage,
+    extraction_provider: _ZeroFactProvider,
+    contradiction_provider: _ZeroContradictionProvider,
+    rule_provider: _NoViolationRuleProvider,
+) -> RunWorkflowService:
+    finalizer = FinalizeRunService(pool, artifact_storage)
+    commit = CommitFinalReportService(pool, artifact_storage, finalizer)
+    return RunWorkflowService(
+        pool,
+        PrepareUpdateRunService(pool),
+        RunRuleScopeService(pool),
+        ExtractRunFactsService(pool, extraction_provider, "Extract facts only.", "workflow-v1"),
+        DetectRunContradictionsService(
+            pool,
+            contradiction_provider,
+            "Detect supplied fact disagreements only.",
+            "workflow-v1",
+        ),
+        EvaluateRunRulesService(
+            pool,
+            rule_provider,
+            "Evaluate captured rules only.",
+            "workflow-v1",
+        ),
+        commit,
+    )
+
+
+def test_phase6_new_run_uses_five_stage_graph_and_commit_is_authoritative(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _create_real_initial_or_manual_run("MANUAL")
+    storage = LocalArtifactStorage(tmp_path / f"phase6-five-stage-{uuid4()}")
+    extraction = _ZeroFactProvider()
+    contradiction = _ZeroContradictionProvider()
+    rules = _NoViolationRuleProvider()
+    workflow = _phase6_real_workflow(storage, extraction, contradiction, rules)
+    command = RunWorkflowCommand(
+        created.run_id,
+        (created.rule_set_id,),
+        (created.rule_id,),
+    )
+
+    ingest = workflow.advance(command)
+    assert ingest.stage is RunStage.INGEST
+    with pool.connection() as connection:
+        initial_steps = RunStepRepository(connection).list_for_run(created.run_id)
+    initial_by_stage = {step.stage: step for step in initial_steps}
+    assert set(initial_by_stage) == {
+        RunStage.INGEST,
+        RunStage.UNDERSTAND,
+        RunStage.EXAMINE,
+        RunStage.REVIEW,
+        RunStage.COMMIT,
+    }
+    assert all(step.attempt == 1 for step in initial_steps)
+    assert initial_by_stage[RunStage.INGEST].status is RunStepStatus.COMPLETED
+    assert all(
+        initial_by_stage[stage].status is RunStepStatus.PENDING
+        for stage in (RunStage.UNDERSTAND, RunStage.EXAMINE, RunStage.REVIEW, RunStage.COMMIT)
+    )
+
+    assert workflow.advance(command).stage is RunStage.UNDERSTAND
+    assert workflow.advance(command).stage is RunStage.EXAMINE
+    review = workflow.advance(command)
+    assert review.stage is RunStage.REVIEW
+    assert review.run_status is RunStatus.REVIEW_REQUIRED
+
+    with pool.connection() as connection:
+        run_before_commit = RunRepository(connection).get_by_id(created.run_id)
+        pending_commit = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+        output_before_commit = OutputRepository(connection).get_by_run_and_type(
+            created.run_id,
+            "FINAL_REPORT",
+        )
+        commit_metric_before = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+    assert run_before_commit is not None and run_before_commit.status is RunStatus.REVIEW_REQUIRED
+    assert pending_commit is not None and pending_commit.status is RunStepStatus.PENDING
+    assert pending_commit.started_at is None and pending_commit.completed_at is None
+    assert output_before_commit is None
+    assert commit_metric_before is None
+
+    observed_during_publication: list[tuple[RunStatus, RunStepStatus]] = []
+    publish_bytes = storage.publish_bytes
+
+    def observe_commit_execution(content: bytes):
+        with pool.connection() as connection:
+            running_run = RunRepository(connection).get_by_id(created.run_id)
+            running_commit = RunStepRepository(connection).get_for_run_stage_attempt(
+                created.run_id,
+                RunStage.COMMIT,
+                1,
+            )
+        assert running_run is not None and running_commit is not None
+        observed_during_publication.append((running_run.status, running_commit.status))
+        return publish_bytes(content)
+
+    monkeypatch.setattr(storage, "publish_bytes", observe_commit_execution)
+    committed = workflow.advance(command)
+
+    assert observed_during_publication == [
+        (RunStatus.REVIEW_REQUIRED, RunStepStatus.RUNNING),
+    ]
+    assert committed.stage is RunStage.COMMIT
+    assert committed.step.status is RunStepStatus.COMPLETED
+    assert committed.run_status is RunStatus.COMPLETED
+    assert committed.outcome is RunWorkflowOutcome.COMPLETED
+
+    with pool.connection() as connection:
+        completed_run = RunRepository(connection).get_by_id(created.run_id)
+        completed_commit = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+        metric = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+        output = OutputRepository(connection).get_by_run_and_type(
+            created.run_id,
+            "FINAL_REPORT",
+        )
+        audits = AuditEventRepository(connection).list_for_run(created.run_id)
+    assert completed_run is not None and completed_run.status is RunStatus.COMPLETED
+    assert completed_commit is not None and completed_commit.status is RunStepStatus.COMPLETED
+    assert completed_commit.completed_at is not None
+    assert metric is not None and metric.duration_ms >= 0
+    assert output is not None
+    final_audits = [event for event in audits if event.event_type == "FINAL_OUTPUT_COMMITTED"]
+    assert len(final_audits) == 1
+    assert final_audits[0].entity_id == output.output_id
+
+
+def test_phase6_cutover_running_four_stage_graph_finishes_review_and_gets_one_commit(
+    tmp_path,
+) -> None:
+    created = _create_real_initial_or_manual_run("MANUAL")
+    extraction = _ZeroFactProvider()
+    contradiction = _ZeroContradictionProvider()
+    rules = _NoViolationRuleProvider()
+    legacy_workflow = _real_workflow(extraction, contradiction, rules)
+    command = RunWorkflowCommand(
+        created.run_id,
+        (created.rule_set_id,),
+        (created.rule_id,),
+    )
+
+    assert legacy_workflow.advance(command).stage is RunStage.INGEST
+    assert legacy_workflow.advance(command).stage is RunStage.UNDERSTAND
+    assert legacy_workflow.advance(command).stage is RunStage.EXAMINE
+    with pool.connection() as connection:
+        legacy_run = RunRepository(connection).get_by_id(created.run_id)
+        legacy_steps = RunStepRepository(connection).list_for_run(created.run_id)
+    assert legacy_run is not None and legacy_run.status is RunStatus.RUNNING
+    assert {step.stage for step in legacy_steps} == {
+        RunStage.INGEST,
+        RunStage.UNDERSTAND,
+        RunStage.EXAMINE,
+        RunStage.REVIEW,
+    }
+    assert len([step for step in legacy_steps if step.stage is RunStage.COMMIT]) == 0
+
+    storage = LocalArtifactStorage(tmp_path / f"phase6-running-cutover-{uuid4()}")
+    phase6_workflow = _phase6_real_workflow(storage, extraction, contradiction, rules)
+    review = phase6_workflow.advance(command)
+
+    assert review.stage is RunStage.REVIEW
+    assert review.run_status is RunStatus.REVIEW_REQUIRED
+    with pool.connection() as connection:
+        reconciled_run = RunRepository(connection).get_by_id(created.run_id)
+        reconciled_steps = RunStepRepository(connection).list_for_run(created.run_id)
+        commit_metric = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+    commits = [step for step in reconciled_steps if step.stage is RunStage.COMMIT]
+    assert reconciled_run is not None and reconciled_run.status is RunStatus.REVIEW_REQUIRED
+    assert len(commits) == 1
+    assert commits[0].attempt == 1
+    assert commits[0].status is RunStepStatus.PENDING
+    assert commits[0].started_at is None
+    assert commits[0].completed_at is None
+    assert commit_metric is None
+
+
+def test_phase6_cutover_completed_four_stage_graph_is_read_only(tmp_path) -> None:
+    with pool.connection() as connection:
+        pile = connection.execute(
+            "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+            (f"Phase6 completed cutover {uuid4()}",),
+        ).fetchone()
+        assert pile is not None
+        run_row = connection.execute(
+            """
+            INSERT INTO runs (pile_id, run_type, status, completed_at)
+            VALUES (%s::uuid, 'MANUAL'::run_type, 'COMPLETED'::run_status, clock_timestamp())
+            RETURNING id
+            """,
+            (str(pile[0]),),
+        ).fetchone()
+        assert run_row is not None
+        run_id = str(run_row[0])
+        steps = RunStepRepository(connection)
+        metrics = RunMetricRepository(connection)
+        for stage in (RunStage.INGEST, RunStage.UNDERSTAND, RunStage.EXAMINE, RunStage.REVIEW):
+            step = steps.create(run_id, stage, 1)
+            running = steps.update_execution_state(
+                step.step_id,
+                RunStepStatus.RUNNING,
+                mark_started=True,
+            )
+            assert running is not None
+            completed = steps.update_execution_state(
+                step.step_id,
+                RunStepStatus.COMPLETED,
+                mark_completed=True,
+            )
+            assert completed is not None
+            metrics.create_for_closed_step(run_id, stage, 1)
+        before = RunStepRepository(connection).list_for_run(run_id)
+        connection.commit()
+
+    storage = LocalArtifactStorage(tmp_path / f"phase6-completed-cutover-{uuid4()}")
+    service = _phase6_real_workflow(
+        storage,
+        _ZeroFactProvider(),
+        _ZeroContradictionProvider(),
+        _NoViolationRuleProvider(),
+    )
+    with pool.connection() as connection:
+        run = RunRepository(connection).get_for_update(run_id)
+        assert run is not None and run.status is RunStatus.COMPLETED
+        service._reconcile_commit_cutover_if_needed(
+            connection,
+            run,
+            RunStepRepository(connection).list_for_run(run_id),
+        )
+        after = RunStepRepository(connection).list_for_run(run_id)
+        commit_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM run_steps
+            WHERE run_id = %s::uuid AND stage = 'COMMIT'::run_stage
+            """,
+            (run_id,),
+        ).fetchone()
+        commit_metric_count = connection.execute(
+            """
+            SELECT count(*)
+            FROM run_metrics
+            WHERE run_id = %s::uuid AND stage = 'COMMIT'::run_stage
+            """,
+            (run_id,),
+        ).fetchone()
+        connection.commit()
+
+    assert after == before
+    assert commit_count == (0,)
+    assert commit_metric_count == (0,)
+
+
+
+def _phase6_ready_for_commit(tmp_path):
+    created = _create_real_initial_or_manual_run("MANUAL")
+    storage = LocalArtifactStorage(tmp_path / f"phase6-commit-recovery-{uuid4()}")
+    workflow = _phase6_real_workflow(
+        storage,
+        _ZeroFactProvider(),
+        _ZeroContradictionProvider(),
+        _NoViolationRuleProvider(),
+    )
+    command = RunWorkflowCommand(
+        created.run_id,
+        (created.rule_set_id,),
+        (created.rule_id,),
+    )
+    assert workflow.advance(command).stage is RunStage.INGEST
+    assert workflow.advance(command).stage is RunStage.UNDERSTAND
+    assert workflow.advance(command).stage is RunStage.EXAMINE
+    review = workflow.advance(command)
+    assert review.stage is RunStage.REVIEW
+    assert review.run_status is RunStatus.REVIEW_REQUIRED
+    return created, storage, workflow, command
+
+
+def test_commit_publication_failure_schedules_retry_and_keeps_run_review_required(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created, storage, workflow, command = _phase6_ready_for_commit(tmp_path)
+
+    def fail_publication(_: bytes):
+        raise ArtifactPublicationError("injected publication failure")
+
+    monkeypatch.setattr(storage, "publish_bytes", fail_publication)
+    result = workflow.advance(command)
+
+    assert result.stage is RunStage.COMMIT
+    assert result.outcome is RunWorkflowOutcome.RETRY_SCHEDULED
+    assert result.step.attempt == 1
+    assert result.step.status is RunStepStatus.RETRYING
+    assert result.successor_attempt == 2
+    with pool.connection() as connection:
+        run = RunRepository(connection).get_by_id(created.run_id)
+        first = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+        second = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            2,
+        )
+        metric = RunMetricRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            1,
+        )
+        claim = IdempotencyRepository(connection).get(
+            "final-report-render-v1",
+            f"commit-final-report:{created.run_id}",
+        )
+        output = OutputRepository(connection).get_by_run_and_type(
+            created.run_id,
+            "FINAL_REPORT",
+        )
+    assert run is not None and run.status is RunStatus.REVIEW_REQUIRED
+    assert first is not None and first.status is RunStepStatus.RETRYING
+    assert first.error_code == IdempotencyFailureKind.RETRYABLE_ARTIFACT_PUBLICATION.value
+    assert second is not None and second.status is RunStepStatus.PENDING
+    assert second.retry_from_claim_generation == 1
+    assert metric is not None
+    assert claim is not None and claim.status is IdempotencyStatus.FAILED
+    assert claim.failure_kind is IdempotencyFailureKind.RETRYABLE_ARTIFACT_PUBLICATION
+    assert output is None
+
+
+def test_commit_third_publication_failure_escalates_without_attempt_four_and_restart_surfaces(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created, storage, workflow, command = _phase6_ready_for_commit(tmp_path)
+
+    def fail_publication(_: bytes):
+        raise ArtifactPublicationError("injected publication failure")
+
+    monkeypatch.setattr(storage, "publish_bytes", fail_publication)
+
+    first = workflow.advance(command)
+    second = workflow.advance(command)
+    assert first.outcome is RunWorkflowOutcome.RETRY_SCHEDULED
+    assert second.outcome is RunWorkflowOutcome.RETRY_SCHEDULED
+    assert first.successor_attempt == 2
+    assert second.successor_attempt == 3
+
+    with pytest.raises(RunWorkflowStepEscalatedError) as exhausted:
+        workflow.advance(command)
+    assert exhausted.value.stage is RunStage.COMMIT
+    assert exhausted.value.attempt == 3
+    assert exhausted.value.error_code == IdempotencyFailureKind.RETRYABLE_ARTIFACT_PUBLICATION.value
+
+    with pool.connection() as connection:
+        run = RunRepository(connection).get_by_id(created.run_id)
+        steps = [
+            step
+            for step in RunStepRepository(connection).list_for_run(created.run_id)
+            if step.stage is RunStage.COMMIT
+        ]
+        metrics = [
+            RunMetricRepository(connection).get_for_run_stage_attempt(
+                created.run_id,
+                RunStage.COMMIT,
+                attempt,
+            )
+            for attempt in (1, 2, 3)
+        ]
+        claim = IdempotencyRepository(connection).get(
+            "final-report-render-v1",
+            f"commit-final-report:{created.run_id}",
+        )
+        attempt_four = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id,
+            RunStage.COMMIT,
+            4,
+        )
+    assert run is not None and run.status is RunStatus.REVIEW_REQUIRED
+    assert [(step.attempt, step.status) for step in steps] == [
+        (1, RunStepStatus.RETRYING),
+        (2, RunStepStatus.RETRYING),
+        (3, RunStepStatus.ESCALATED),
+    ]
+    assert all(metric is not None for metric in metrics)
+    assert claim is not None and claim.status is IdempotencyStatus.FAILED
+    assert claim.claim_generation == 3
+    assert claim.failure_kind is IdempotencyFailureKind.RETRYABLE_ARTIFACT_PUBLICATION
+    assert attempt_four is None
+
+    with pytest.raises(RunWorkflowStepEscalatedError) as restarted:
+        workflow.advance(command)
+    assert restarted.value.stage is RunStage.COMMIT
+    assert restarted.value.attempt == 3

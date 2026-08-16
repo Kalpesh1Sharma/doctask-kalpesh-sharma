@@ -7,7 +7,12 @@ from psycopg import connect
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.errors import CheckViolation, ForeignKeyViolation, RaiseException, UniqueViolation
 from psycopg.types.json import Jsonb
+from psycopg_pool import ConnectionPool
 
+from api.application.finalize_run_service import (
+    FinalizeRunOutputCommand,
+    FinalizeRunService,
+)
 from config.settings import get_settings
 from db.pool import pool
 from domain.update_preparation import UpdateDocumentChange, UpdateDocumentChangeKind
@@ -16,6 +21,7 @@ from domain.update_review import (
     UpdateChangeSetManifest,
 )
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from services.local_artifact_storage import LocalArtifactStorage
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -182,8 +188,8 @@ def test_shape_valid_but_wrong_stored_fingerprint_is_application_integrity_error
         connection.rollback()
 
 
-def test_migrations_apply_to_a_clean_database_in_order() -> None:
-    """Exercise 001 -> 002 -> 003 -> 004 -> 005 without the shared test database."""
+def test_migrations_apply_to_a_clean_database_in_order(tmp_path: Path) -> None:
+    """Exercise 001 -> 002 -> 003 -> 004 -> 005 -> 006 without shared state."""
     database_name = f"task1_phase4b_{uuid4().hex}"
     connection_info = conninfo_to_dict(get_settings().database_url)
     connection_info["dbname"] = "postgres"
@@ -194,7 +200,13 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
         Path("sql/migrations/003_update_review.sql"),
         Path("sql/migrations/004_idempotency_claim_generation.sql"),
         Path("sql/migrations/005_run_step_retry_history.sql"),
+        Path("sql/migrations/006_document_runtime_commit_and_telemetry.sql"),
     )
+    historical_fingerprint = fingerprint("f")
+    historical_storage = LocalArtifactStorage(tmp_path / database_name)
+    historical_artifact = historical_storage.publish_bytes(b"historical final report")
+    historical_completed_run_id: str | None = None
+    historical_active_run_id: str | None = None
     with connect(admin_info, autocommit=True) as admin:
         admin.execute(f'CREATE DATABASE "{database_name}"')
     try:
@@ -232,6 +244,85 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                         """INSERT INTO idempotency_records (scope, key, status, claimed_at)
                            VALUES ('migration-005', 'historical-failure', 'FAILED'::idempotency_status, clock_timestamp())""",
                     )
+                if migration_path.name == "006_document_runtime_commit_and_telemetry.sql":
+                    cutover_pile = isolated.execute(
+                        "INSERT INTO piles (name) VALUES ('migration-006-cutover') RETURNING id",
+                    ).fetchone()
+                    assert cutover_pile is not None
+                    historical_completed = isolated.execute(
+                        """
+                        INSERT INTO runs (pile_id, run_type, status, completed_at)
+                        VALUES (%s, 'MANUAL'::run_type, 'COMPLETED'::run_status, clock_timestamp())
+                        RETURNING id
+                        """,
+                        (cutover_pile[0],),
+                    ).fetchone()
+                    historical_active = isolated.execute(
+                        """
+                        INSERT INTO runs (pile_id, run_type, status)
+                        VALUES (%s, 'MANUAL'::run_type, 'REVIEW_REQUIRED'::run_status)
+                        RETURNING id
+                        """,
+                        (cutover_pile[0],),
+                    ).fetchone()
+                    assert historical_completed is not None and historical_active is not None
+                    historical_completed_run_id = str(historical_completed[0])
+                    historical_active_run_id = str(historical_active[0])
+                    historical_output = isolated.execute(
+                        """
+                        INSERT INTO outputs (run_id, output_type, storage_uri, content_hash)
+                        VALUES (%s, 'FINAL_REPORT', %s, %s)
+                        RETURNING id
+                        """,
+                        (
+                            historical_completed[0],
+                            historical_artifact.storage_uri,
+                            historical_artifact.content_hash,
+                        ),
+                    ).fetchone()
+                    assert historical_output is not None
+                    isolated.execute(
+                        """
+                        INSERT INTO audit_events (
+                            run_id, entity_type, entity_id, event_type, actor_type, actor_id, payload
+                        )
+                        VALUES (%s, 'output', %s, 'FINAL_OUTPUT_COMMITTED', 'system', 'pre-006', %s::jsonb)
+                        """,
+                        (
+                            historical_completed[0],
+                            historical_output[0],
+                            Jsonb(
+                                {
+                                    "run_id": historical_completed_run_id,
+                                    "output_type": "FINAL_REPORT",
+                                    "render_input_fingerprint": historical_fingerprint,
+                                    "artifact_content_hash": historical_artifact.content_hash,
+                                    "storage_uri": historical_artifact.storage_uri,
+                                },
+                            ),
+                        ),
+                    )
+                    for stage in ("INGEST", "UNDERSTAND", "EXAMINE", "REVIEW"):
+                        isolated.execute(
+                            """
+                            INSERT INTO run_steps (run_id, stage, status, attempt, started_at, completed_at)
+                            VALUES (%s, %s::run_stage, 'COMPLETED'::run_step_status, 1,
+                                    clock_timestamp() - interval '1 second', clock_timestamp())
+                            """,
+                            (historical_active[0], stage),
+                        )
+                        isolated.execute(
+                            """
+                            INSERT INTO run_metrics (run_id, stage, attempt, duration_ms)
+                            SELECT run_id, stage, attempt,
+                                   FLOOR(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::BIGINT
+                            FROM run_steps
+                            WHERE run_id = %s
+                              AND stage = %s::run_stage
+                              AND attempt = 1
+                            """,
+                            (historical_active[0], stage),
+                        )
                 isolated.execute(migration_path.read_text(encoding="utf-8"))
                 isolated.commit()
             table_count = isolated.execute(
@@ -242,7 +333,7 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                   AND table_type = 'BASE TABLE'
                 """,
             ).fetchone()
-            assert table_count == (26,)
+            assert table_count == (27,)
             objects = isolated.execute(
                 """
                 SELECT to_regclass('public.update_change_sets'),
@@ -277,6 +368,99 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                 "SELECT duration_ms, input_tokens, estimated_cost FROM run_metrics WHERE attempt = 1",
             ).fetchone()
             assert metric is not None and metric[0] >= 0 and metric[1:] == (7, Decimal("1.25"))
+            assert isolated.execute(
+                "SELECT to_regclass('public.provider_usage_events')",
+            ).fetchone() == ("provider_usage_events",)
+            assert historical_completed_run_id is not None
+            assert historical_active_run_id is not None
+            cutover = isolated.execute(
+                """
+                SELECT id::text, commit_required
+                FROM runs
+                WHERE id IN (%s::uuid, %s::uuid)
+                ORDER BY id
+                """,
+                (historical_completed_run_id, historical_active_run_id),
+            ).fetchall()
+            cutover_map = {str(row[0]): row[1] for row in cutover}
+            assert cutover_map[historical_completed_run_id] is False
+            assert cutover_map[historical_active_run_id] is True
+            assert isolated.execute(
+                "SELECT count(*) FROM run_steps WHERE run_id IN (%s::uuid, %s::uuid) AND stage = 'COMMIT'::run_stage",
+                (historical_completed_run_id, historical_active_run_id),
+            ).fetchone() == (0,)
+
+            new_run = isolated.execute(
+                """
+                INSERT INTO runs (pile_id, run_type, status)
+                SELECT pile_id, 'MANUAL'::run_type, 'REVIEW_REQUIRED'::run_status
+                FROM runs WHERE id = %s::uuid
+                RETURNING id, commit_required
+                """,
+                (historical_active_run_id,),
+            ).fetchone()
+            assert new_run is not None and new_run[1] is True
+            isolated.commit()
+
+            with pytest.raises(RaiseException, match="active COMMIT RunStep"):
+                isolated.execute(
+                    """
+                    INSERT INTO outputs (run_id, output_type, storage_uri, content_hash)
+                    VALUES (%s, 'FINAL_REPORT', 'artifact://bypass', %s)
+                    """,
+                    (new_run[0], fingerprint("b")),
+                )
+            isolated.rollback()
+
+            with pytest.raises(RaiseException, match="Run completion requires FINAL_REPORT output"):
+                isolated.execute(
+                    "UPDATE runs SET status = 'COMPLETED'::run_status, completed_at = clock_timestamp() WHERE id = %s",
+                    (new_run[0],),
+                )
+            isolated.rollback()
+
+            with pytest.raises(RaiseException, match="new Run must require COMMIT completion proof"):
+                isolated.execute(
+                    """
+                    INSERT INTO runs (pile_id, run_type, status, commit_required)
+                    SELECT pile_id, 'MANUAL'::run_type, 'PENDING'::run_status, FALSE
+                    FROM runs WHERE id = %s::uuid
+                    """,
+                    (historical_active_run_id,),
+                )
+            isolated.rollback()
+
+            with pytest.raises(RaiseException, match="cutover marker is immutable"):
+                isolated.execute(
+                    "UPDATE runs SET commit_required = FALSE WHERE id = %s",
+                    (new_run[0],),
+                )
+            isolated.rollback()
+
+            isolated.commit()
+            isolated_pool = ConnectionPool(
+                conninfo=make_conninfo(**database_info),
+                min_size=1,
+                max_size=1,
+                open=False,
+            )
+            isolated_pool.open()
+            try:
+                replay_service = FinalizeRunService(isolated_pool, historical_storage)
+                replay = replay_service.finalize(
+                    FinalizeRunOutputCommand(
+                        run_id=historical_completed_run_id,
+                        expected_render_input_fingerprint=historical_fingerprint,
+                        artifact_storage_uri=historical_artifact.storage_uri,
+                        artifact_content_hash=historical_artifact.content_hash,
+                        actor_type="system",
+                        actor_id="pre-006",
+                    ),
+                )
+                assert replay.replayed is True
+                assert replay.run.commit_required is False
+            finally:
+                isolated_pool.close()
     finally:
         with connect(admin_info, autocommit=True) as admin:
             admin.execute(

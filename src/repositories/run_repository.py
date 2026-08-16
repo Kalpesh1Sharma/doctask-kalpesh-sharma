@@ -15,6 +15,7 @@ _RUN_COLUMNS = """
     parent_run_id,
     baseline_run_id,
     blocked_on_run_id,
+    commit_required,
     started_at,
     completed_at,
     created_at,
@@ -36,6 +37,7 @@ class RunRecord:
     parent_run_id: str | None
     baseline_run_id: str | None
     blocked_on_run_id: str | None
+    commit_required: bool
     started_at: datetime | None
     completed_at: datetime | None
     created_at: datetime
@@ -52,10 +54,11 @@ class RunRecord:
             parent_run_id=_optional_string(row[5]),
             baseline_run_id=_optional_string(row[6]),
             blocked_on_run_id=_optional_string(row[7]),
-            started_at=cast(datetime | None, row[8]),
-            completed_at=cast(datetime | None, row[9]),
-            created_at=cast(datetime, row[10]),
-            updated_at=cast(datetime, row[11]),
+            commit_required=cast(bool, row[8]),
+            started_at=cast(datetime | None, row[9]),
+            completed_at=cast(datetime | None, row[10]),
+            created_at=cast(datetime, row[11]),
+            updated_at=cast(datetime, row[12]),
         )
 
     def to_domain(self) -> Run:
@@ -158,3 +161,34 @@ class RunRepository:
         ).fetchone()
 
         return RunRecord.from_row(row) if row is not None else None
+
+    def resolve_blocked_update_baseline(
+        self,
+        run_id: str,
+        baseline_run_id: str,
+    ) -> RunRecord | None:
+        """Resolve a completed parent without changing the durable pile tail."""
+        row = self._connection.execute(
+            f"""
+            UPDATE runs
+            SET baseline_run_id = %s::uuid, blocked_on_run_id = NULL
+            WHERE id = %s::uuid
+              AND run_type = 'UPDATE'::run_type
+              AND blocked_on_run_id = %s::uuid
+            RETURNING {_RUN_COLUMNS}
+            """,
+            (baseline_run_id, run_id, baseline_run_id),
+        ).fetchone()
+        return RunRecord.from_row(row) if row is not None else None
+
+    def list_for_pile(self, pile_id: str) -> list[RunRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM runs
+            WHERE pile_id = %s::uuid
+            ORDER BY id ASC
+            """,
+            (pile_id,),
+        ).fetchall()
+        return [RunRecord.from_row(row) for row in rows]

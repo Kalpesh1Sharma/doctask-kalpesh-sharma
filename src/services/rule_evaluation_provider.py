@@ -12,3 +12,7 @@ class RuleEvaluationProvider(Protocol):
 
 class RuleEvaluationProviderError(RuntimeError):
     """Raised when a provider cannot complete a Rule-evaluation request."""
+
+
+class RuleEvaluationInvalidResponseError(RuleEvaluationProviderError):
+    """Raised when a provider returns unusable structured output."""

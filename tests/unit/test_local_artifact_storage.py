@@ -32,6 +32,10 @@ def test_publish_and_verify_round_trip_across_storage_instances(tmp_path: Path) 
     assert published.size_bytes == len(content)
     assert final_path(tmp_path, content).read_bytes() == content
     assert verified == published
+    assert LocalArtifactStorage(tmp_path).read_bytes(
+        published.storage_uri,
+        published.content_hash,
+    ) == content
 
 
 def test_identical_publish_is_idempotent(tmp_path: Path) -> None:
@@ -92,6 +96,8 @@ def test_verify_rejects_missing_and_altered_artifacts(tmp_path: Path) -> None:
     path.write_bytes(b"altered")
     with pytest.raises(ArtifactIntegrityError):
         storage.verify(published.storage_uri, published.content_hash)
+    with pytest.raises(ArtifactIntegrityError):
+        storage.read_bytes(published.storage_uri, published.content_hash)
 
     path.unlink()
     with pytest.raises(FileNotFoundError):

@@ -16,6 +16,7 @@ from api.application.extract_run_facts_service import (
     FactExtractionInputConflictError,
     FactExtractionProviderFailure,
     FactExtractionRunNotEligibleError,
+    InvalidFactExtractionResponseError,
     LegacyUpdateFactExtractionConflictError,
     SourceEvidenceValidationError,
     SourceInputDriftError,
@@ -40,6 +41,8 @@ from repositories.idempotency_repository import (
 )
 from repositories.run_repository import RunRepository
 from services.fact_extraction_provider import FactExtractionProviderError
+from services.openai_structured_transport import StructuredTransportInvalidResponse
+from services.openai_task_providers import OpenAIFactExtractionProvider
 
 
 @dataclass(frozen=True)
@@ -102,6 +105,11 @@ class FailingProvider:
     def extract(self, _: FactExtractionRequest) -> FactExtractionResponse:
         self.calls += 1
         raise FactExtractionProviderError("provider unavailable")
+
+
+class InvalidStructuredTransport:
+    def parse(self, **_: object):
+        raise StructuredTransportInvalidResponse("invalid structured output")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -1132,6 +1140,23 @@ def test_update_non_trigger_evidence_is_rejected_and_marks_claim_failed(
     assert record is not None
     assert record.status is IdempotencyStatus.FAILED
     assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_EVIDENCE_VALIDATION
+
+
+def test_openai_structured_invalid_fact_output_is_retryable_invalid_response(
+    resources: ExtractionResources,
+) -> None:
+    provider = OpenAIFactExtractionProvider(InvalidStructuredTransport(), "test-model")
+
+    with pytest.raises(InvalidFactExtractionResponseError):
+        service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+
+    with pool.connection() as connection:
+        record = IdempotencyRepository(connection).get(
+            "fact-extraction-v1",
+            f"understand:{resources.run_id}",
+        )
+    assert record is not None and record.status is IdempotencyStatus.FAILED
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE
 
 
 def test_update_provider_failure_marks_v2_claim_failed_without_changing_carried_state(

@@ -121,6 +121,33 @@ class DocumentVersionRepository:
 
         return DocumentVersionRecord.from_row(row) if row is not None else None
 
+    def get_for_update(self, document_version_id: str) -> DocumentVersionRecord | None:
+        row = self._connection.execute(
+            f"""
+            SELECT {_DOCUMENT_VERSION_COLUMNS}
+            FROM document_versions
+            WHERE id = %s::uuid
+            FOR UPDATE
+            """,
+            (document_version_id,),
+        ).fetchone()
+        return DocumentVersionRecord.from_row(row) if row is not None else None
+
+    def get_by_document_and_content_hash(
+        self,
+        document_id: str,
+        content_hash: str,
+    ) -> DocumentVersionRecord | None:
+        row = self._connection.execute(
+            f"""
+            SELECT {_DOCUMENT_VERSION_COLUMNS}
+            FROM document_versions
+            WHERE document_id = %s::uuid AND content_hash = %s
+            """,
+            (document_id, content_hash),
+        ).fetchone()
+        return DocumentVersionRecord.from_row(row) if row is not None else None
+
     def list_for_document(self, document_id: str) -> list[DocumentVersionRecord]:
         rows = self._connection.execute(
             f"""
@@ -162,4 +189,40 @@ class DocumentVersionRepository:
             (status.value, document_version_id),
         ).fetchone()
 
+        return DocumentVersionRecord.from_row(row) if row is not None else None
+
+    def transition_from_pending(
+        self,
+        document_version_id: str,
+        status: DocumentProcessingStatus,
+    ) -> DocumentVersionRecord | None:
+        row = self._connection.execute(
+            f"""
+            UPDATE document_versions
+            SET processing_status = %s::document_version_status
+            WHERE id = %s::uuid
+              AND processing_status = 'PENDING'::document_version_status
+            RETURNING {_DOCUMENT_VERSION_COLUMNS}
+            """,
+            (status.value, document_version_id),
+        ).fetchone()
+        return DocumentVersionRecord.from_row(row) if row is not None else None
+
+    def update_metadata(
+        self,
+        document_version_id: str,
+        *,
+        mime_type: str,
+        size_bytes: int,
+    ) -> DocumentVersionRecord | None:
+        row = self._connection.execute(
+            f"""
+            UPDATE document_versions
+            SET mime_type = %s, size_bytes = %s
+            WHERE id = %s::uuid
+              AND processing_status = 'PENDING'::document_version_status
+            RETURNING {_DOCUMENT_VERSION_COLUMNS}
+            """,
+            (mime_type, size_bytes, document_version_id),
+        ).fetchone()
         return DocumentVersionRecord.from_row(row) if row is not None else None

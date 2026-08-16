@@ -40,6 +40,8 @@ from repositories.idempotency_repository import (
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_repository import RunRepository
 from services.contradiction_detection_provider import ContradictionDetectionProviderError
+from services.openai_structured_transport import StructuredTransportInvalidResponse
+from services.openai_task_providers import OpenAIContradictionDetectionProvider
 
 
 @dataclass(frozen=True)
@@ -74,6 +76,11 @@ class FailingProvider:
     def detect(self, _: ContradictionDetectionRequest) -> ContradictionDetectionResponse:
         self.calls += 1
         raise ContradictionDetectionProviderError("provider unavailable")
+
+
+class InvalidStructuredTransport:
+    def parse(self, **_: object):
+        raise StructuredTransportInvalidResponse("invalid structured output")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -389,6 +396,20 @@ def test_provider_failure_marks_claim_failed_without_findings(resources: Resourc
     record = detection_record(resources)
     assert record is not None and record.status is IdempotencyStatus.FAILED
     assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
+
+
+def test_openai_structured_invalid_contradiction_output_is_retryable_invalid_response(
+    resources: Resources,
+) -> None:
+    provider = OpenAIContradictionDetectionProvider(InvalidStructuredTransport(), "test-model")
+
+    with pytest.raises(InvalidContradictionDetectionResponseError):
+        service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    current = detection_record(resources)
+    assert current is not None and current.status is IdempotencyStatus.FAILED
+    assert current.failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE
+    assert finding_count(resources) == 0
 
 
 def test_normal_failed_retryable_detection_never_reopens_without_workflow(resources: Resources) -> None:

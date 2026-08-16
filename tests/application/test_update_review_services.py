@@ -1,5 +1,8 @@
 import threading
 from dataclasses import dataclass
+from hashlib import sha256
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import pytest
@@ -15,7 +18,12 @@ from api.application.build_update_change_set_service import (
     UpdateChangeSetRunNotEligibleError,
     build_current_update_change_set_manifest,
 )
+from api.application.commit_final_report_service import (
+    CommitFinalReportCommand,
+    CommitFinalReportService,
+)
 from api.application.finalize_run_service import (
+    DirectFreshFinalizationDisabledError,
     FinalizeRunOutputCommand,
     FinalizeRunService,
     PrepareRunOutputCommand,
@@ -37,16 +45,20 @@ from api.application.review_update_change_set_service import (
     UpdateReviewRunNotEligibleError,
 )
 from db.pool import pool
-from domain.run import RunStatus
+from domain.final_report import FinalReportInput
+from domain.run import RunStage, RunStatus, RunStepStatus
 from domain.update_review import (
     UpdateChangeSetIntegrityError,
     UpdateReviewDecisionType,
 )
 from repositories.audit_event_repository import AuditEventRepository
-from repositories.output_repository import OutputRepository
+from repositories.output_repository import OutputRecord, OutputRepository
+from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
+from repositories.run_step_repository import RunStepRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from services.final_report_renderer import render_final_report
 from services.local_artifact_storage import LocalArtifactStorage
 
 
@@ -55,7 +67,12 @@ class UpdateResources:
     pile_id: str
     baseline_run_id: str
     update_run_id: str
+    trigger_document_id: str
     trigger_version_id: str
+    retained_document_id: str
+    retained_version_id: str
+    carried_fact_id: str
+    evidence_id: str
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -71,11 +88,19 @@ def create_prepared_update(*, close_rule_scope: bool = True) -> UpdateResources:
         ).fetchone()
         assert pile is not None
         pile_id = str(pile[0])
-        document = connection.execute(
+
+        trigger_document = connection.execute(
             "INSERT INTO documents (pile_id, logical_key) VALUES (%s::uuid, %s) RETURNING id",
-            (pile_id, f"document-{uuid4()}"),
+            (pile_id, f"trigger-document-{uuid4()}"),
         ).fetchone()
-        assert document is not None
+        retained_document = connection.execute(
+            "INSERT INTO documents (pile_id, logical_key) VALUES (%s::uuid, %s) RETURNING id",
+            (pile_id, f"retained-document-{uuid4()}"),
+        ).fetchone()
+        assert trigger_document is not None and retained_document is not None
+        trigger_document_id = str(trigger_document[0])
+        retained_document_id = str(retained_document[0])
+
         baseline_version = connection.execute(
             """
             INSERT INTO document_versions (
@@ -84,7 +109,7 @@ def create_prepared_update(*, close_rule_scope: bool = True) -> UpdateResources:
             VALUES (%s::uuid, 1, %s, %s, 'READY')
             RETURNING id
             """,
-            (str(document[0]), f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
+            (trigger_document_id, f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
         ).fetchone()
         trigger_version = connection.execute(
             """
@@ -94,23 +119,104 @@ def create_prepared_update(*, close_rule_scope: bool = True) -> UpdateResources:
             VALUES (%s::uuid, 2, %s, %s, 'READY')
             RETURNING id
             """,
-            (str(document[0]), f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
+            (trigger_document_id, f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
         ).fetchone()
+        retained_version = connection.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_number, content_hash, storage_uri, processing_status
+            )
+            VALUES (%s::uuid, 1, %s, %s, 'READY')
+            RETURNING id
+            """,
+            (retained_document_id, f"sha256:{uuid4().hex}", f"storage://{uuid4()}"),
+        ).fetchone()
+        assert baseline_version is not None and trigger_version is not None and retained_version is not None
+        baseline_version_id = str(baseline_version[0])
+        trigger_version_id = str(trigger_version[0])
+        retained_version_id = str(retained_version[0])
+
         baseline = connection.execute(
             """
-            INSERT INTO runs (pile_id, run_type, status, completed_at)
-            VALUES (%s::uuid, 'MANUAL', 'COMPLETED', now())
+            INSERT INTO runs (pile_id, run_type, status)
+            VALUES (%s::uuid, 'MANUAL', 'REVIEW_REQUIRED')
             RETURNING id
             """,
             (pile_id,),
         ).fetchone()
-        assert baseline_version is not None and trigger_version is not None and baseline is not None
+        assert baseline is not None
         baseline_run_id = str(baseline[0])
-        trigger_version_id = str(trigger_version[0])
         connection.execute(
-            "INSERT INTO run_document_versions (run_id, document_version_id) VALUES (%s::uuid, %s::uuid)",
-            (baseline_run_id, str(baseline_version[0])),
+            """
+            INSERT INTO run_document_versions (run_id, document_version_id)
+            VALUES (%s::uuid, %s::uuid), (%s::uuid, %s::uuid)
+            """,
+            (baseline_run_id, baseline_version_id, baseline_run_id, retained_version_id),
         )
+
+        retained_text = "retained clause"
+        retained_hash = f"sha256:{sha256(retained_text.encode()).hexdigest()}"
+        chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (
+                document_version_id, chunk_index, content, content_hash, start_offset, end_offset
+            )
+            VALUES (%s::uuid, 0, %s, %s, 0, %s)
+            RETURNING id
+            """,
+            (retained_version_id, retained_text, retained_hash, len(retained_text)),
+        ).fetchone()
+        assert chunk is not None
+        chunk_id = str(chunk[0])
+        evidence_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                id, document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            )
+            VALUES (%s::uuid, %s::uuid, %s::uuid, 0, 8, 'retained', %s)
+            """,
+            (
+                evidence_id,
+                retained_version_id,
+                chunk_id,
+                f"sha256:{sha256(b'retained').hexdigest()}",
+            ),
+        )
+        carried_fact_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO facts (id, origin_run_id, subject, predicate, object_value, status)
+            VALUES (%s::uuid, %s::uuid, 'contract', 'notice_days', %s::jsonb, 'CONFIRMED')
+            """,
+            (carried_fact_id, baseline_run_id, Jsonb({"days": 30})),
+        )
+        connection.execute(
+            """
+            INSERT INTO run_facts (run_id, fact_id, relation)
+            VALUES (%s::uuid, %s::uuid, 'CREATED')
+            """,
+            (baseline_run_id, carried_fact_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO fact_evidence (fact_id, evidence_span_id)
+            VALUES (%s::uuid, %s::uuid)
+            """,
+            (carried_fact_id, evidence_id),
+        )
+        RunRuleScopeRepository(connection).complete_scope(baseline_run_id)
+        connection.commit()
+
+    activate_commit_step(baseline_run_id)
+    with TemporaryDirectory() as baseline_directory:
+        baseline_storage = LocalArtifactStorage(Path(baseline_directory))
+        baseline_finalizer = FinalizeRunService(pool, baseline_storage)
+        CommitFinalReportService(pool, baseline_storage, baseline_finalizer).commit(
+            CommitFinalReportCommand(baseline_run_id),
+        )
+
+    with pool.connection() as connection:
         update = connection.execute(
             """
             INSERT INTO runs (pile_id, run_type, status, trigger_document_version_id, baseline_run_id)
@@ -129,7 +235,17 @@ def create_prepared_update(*, close_rule_scope: bool = True) -> UpdateResources:
             RunRuleScopeRepository(connection).complete_scope(update_run_id)
         RunRepository(connection).update_status(update_run_id, RunStatus.REVIEW_REQUIRED)
         connection.commit()
-    return UpdateResources(pile_id, baseline_run_id, update_run_id, trigger_version_id)
+    return UpdateResources(
+        pile_id=pile_id,
+        baseline_run_id=baseline_run_id,
+        update_run_id=update_run_id,
+        trigger_document_id=trigger_document_id,
+        trigger_version_id=trigger_version_id,
+        retained_document_id=retained_document_id,
+        retained_version_id=retained_version_id,
+        carried_fact_id=carried_fact_id,
+        evidence_id=evidence_id,
+    )
 
 
 @pytest.fixture
@@ -228,6 +344,7 @@ def test_update_finalization_requires_approval_then_finalizes(
     tmp_path,
 ) -> None:
     storage = LocalArtifactStorage(tmp_path / "artifacts")
+    baseline_bytes, baseline_output = materialize_baseline_artifact(storage, reviewable_update)
     finalizer = FinalizeRunService(pool, storage)
     prepared = finalizer.prepare(PrepareRunOutputCommand(reviewable_update.update_run_id))
     artifact = storage.publish_bytes(b"approved update")
@@ -252,10 +369,52 @@ def test_update_finalization_requires_approval_then_finalizes(
             f"update-review:{reviewable_update.update_run_id}:finalize",
         ),
     )
-    result = finalizer.finalize(command)
+    with pytest.raises(DirectFreshFinalizationDisabledError):
+        finalizer.finalize(command)
+
+    activate_commit_step(reviewable_update.update_run_id)
+    commit_service = CommitFinalReportService(pool, storage, finalizer)
+    result = commit_service.commit(
+        CommitFinalReportCommand(
+            reviewable_update.update_run_id,
+            actor_type="human",
+            actor_id="reviewer",
+        ),
+    )
+    replay = commit_service.commit(CommitFinalReportCommand(reviewable_update.update_run_id))
     assert result.replayed is False
-    replay = finalizer.finalize(command)
     assert replay.replayed is True
+
+    updated_bytes = storage.read_bytes(result.output.storage_uri, result.output.content_hash)
+    with pool.connection() as connection:
+        audit_events = [
+            event
+            for event in AuditEventRepository(connection).list_for_run(reviewable_update.update_run_id)
+            if event.event_type == "FINAL_OUTPUT_COMMITTED"
+        ]
+    assert len(audit_events) == 1
+    focused_update = audit_events[0].payload.get("focused_update")
+    assert isinstance(focused_update, dict)
+    assert focused_update["baseline_run_id"] == reviewable_update.baseline_run_id
+    assert focused_update["baseline_output_id"] == baseline_output.output_id
+    assert focused_update["baseline_content_hash"] == baseline_output.content_hash
+    parts = focused_update["preserved_parts"]
+    assert isinstance(parts, list) and parts
+    part_ids = {part["part_id"] for part in parts}
+    assert f"document:{reviewable_update.retained_document_id}" in part_ids
+    assert f"fact:{reviewable_update.carried_fact_id}:identity" in part_ids
+    assert f"fact:{reviewable_update.carried_fact_id}:claim-body" in part_ids
+    assert f"evidence:{reviewable_update.evidence_id}" in part_ids
+    assert f"document:{reviewable_update.trigger_document_id}" not in part_ids
+
+    preserved_bytes = 0
+    for part in parts:
+        baseline_slice = baseline_bytes[part["baseline_start"]:part["baseline_end"]]
+        updated_slice = updated_bytes[part["updated_start"]:part["updated_end"]]
+        assert baseline_slice == updated_slice
+        assert part["content_hash"] == f"sha256:{sha256(baseline_slice).hexdigest()}"
+        preserved_bytes += len(updated_slice)
+    assert focused_update["preserved_bytes"] == preserved_bytes
 
 
 def test_rejected_update_cannot_freshly_finalize(
@@ -381,8 +540,44 @@ def build_and_approve(resources: UpdateResources, token: str = "approve") -> Non
     )
 
 
+def activate_commit_step(run_id: str) -> None:
+    with pool.connection() as connection:
+        repository = RunStepRepository(connection)
+        existing = repository.get_for_run_stage_attempt(run_id, RunStage.COMMIT, 1)
+        if existing is None:
+            existing = repository.create(run_id, RunStage.COMMIT, 1)
+        if existing.status is RunStepStatus.PENDING:
+            existing = repository.update_execution_state(
+                existing.step_id,
+                RunStepStatus.RUNNING,
+                mark_started=True,
+            )
+        assert existing is not None and existing.status is RunStepStatus.RUNNING
+        connection.commit()
+
+
+def materialize_baseline_artifact(
+    storage: LocalArtifactStorage,
+    resources: UpdateResources,
+) -> tuple[bytes, OutputRecord]:
+    finalizer = FinalizeRunService(pool, storage)
+    with pool.connection() as connection:
+        baseline_output = OutputRepository(connection).get_by_run_and_type(
+            resources.baseline_run_id,
+            "FINAL_REPORT",
+        )
+        assert baseline_output is not None
+        manifest = finalizer._build_manifest(connection, resources.baseline_run_id)
+    baseline_bytes = render_final_report(FinalReportInput(render_input=manifest))
+    artifact = storage.publish_bytes(baseline_bytes)
+    assert artifact.storage_uri == baseline_output.storage_uri
+    assert artifact.content_hash == baseline_output.content_hash
+    return baseline_bytes, baseline_output
+
+
 def finalize_command(resources: UpdateResources, tmp_path) -> tuple[FinalizeRunService, FinalizeRunOutputCommand]:
     storage = LocalArtifactStorage(tmp_path / f"artifacts-{uuid4()}")
+    materialize_baseline_artifact(storage, resources)
     finalizer = FinalizeRunService(pool, storage)
     prepared = finalizer.prepare(PrepareRunOutputCommand(resources.update_run_id))
     artifact = storage.publish_bytes(b"update final artifact")
@@ -529,7 +724,7 @@ def test_review_rejects_fresh_request_after_run_is_no_longer_review_required(
 ) -> None:
     BuildUpdateChangeSetService(pool).build(BuildUpdateChangeSetCommand(reviewable_update.update_run_id))
     with pool.connection() as connection:
-        RunRepository(connection).update_status(reviewable_update.update_run_id, RunStatus.COMPLETED)
+        RunRepository(connection).update_status(reviewable_update.update_run_id, RunStatus.FAILED)
         connection.commit()
     with pytest.raises(UpdateReviewRunNotEligibleError):
         ReviewUpdateChangeSetService(pool).record(
@@ -902,7 +1097,12 @@ def test_exact_review_replay_after_finalization_is_write_free(
 ) -> None:
     build_and_approve(reviewable_update)
     finalizer, command = finalize_command(reviewable_update, tmp_path)
-    finalizer.finalize(command)
+    with pytest.raises(DirectFreshFinalizationDisabledError):
+        finalizer.finalize(command)
+    activate_commit_step(reviewable_update.update_run_id)
+    CommitFinalReportService(pool, finalizer._artifact_storage, finalizer).commit(
+        CommitFinalReportCommand(reviewable_update.update_run_id),
+    )
     replay = ReviewUpdateChangeSetService(pool).record(
         ReviewUpdateChangeSetCommand(
             reviewable_update.update_run_id,
@@ -965,12 +1165,22 @@ def test_update_finalizer_missing_and_rejected_paths_leave_fresh_state(
     assert_no_fresh_finalization(rejected.update_run_id)
 
 
-def test_completed_pre_migration_update_replays_without_change_set_or_decision(tmp_path) -> None:
+def test_completed_update_replays_without_change_set_or_decision(tmp_path) -> None:
+    # The true pre-006 FALSE-marker replay is exercised in the clean migration
+    # regression.  Here we prove the application replay remains read-only and
+    # does not require rebuilding UPDATE approval state once a canonical output
+    # already exists.
     resources = create_prepared_update(close_rule_scope=False)
     storage = LocalArtifactStorage(tmp_path / f"historical-artifacts-{uuid4()}")
     artifact = storage.publish_bytes(b"historical UPDATE output")
     expected_fingerprint = "sha256:" + "a" * 64
     with pool.connection() as connection:
+        steps = RunStepRepository(connection)
+        commit = steps.create(resources.update_run_id, RunStage.COMMIT, 1)
+        running = steps.update_execution_state(
+            commit.step_id, RunStepStatus.RUNNING, mark_started=True,
+        )
+        assert running is not None
         output = OutputRepository(connection).create(
             resources.update_run_id,
             "FINAL_REPORT",
@@ -992,6 +1202,15 @@ def test_completed_pre_migration_update_replays_without_change_set_or_decision(t
                 "storage_uri": artifact.storage_uri,
             },
         )
+        closed = steps.update_execution_state(
+            commit.step_id, RunStepStatus.COMPLETED, mark_completed=True,
+        )
+        assert closed is not None
+        RunMetricRepository(connection).create_for_closed_step(
+            resources.update_run_id,
+            RunStage.COMMIT,
+            1,
+        )
         RunRepository(connection).update_status(resources.update_run_id, RunStatus.COMPLETED)
         connection.commit()
     replay = FinalizeRunService(pool, storage).finalize(
@@ -1006,7 +1225,6 @@ def test_completed_pre_migration_update_replays_without_change_set_or_decision(t
     )
     assert replay.replayed is True
     assert count_rows(resources.update_run_id) == (0, 0, 1)
-
 
 def test_initial_finalization_is_unchanged_by_update_approval_guard(
     reviewable_update: UpdateResources,
@@ -1026,15 +1244,22 @@ def test_initial_finalization_is_unchanged_by_update_approval_guard(
     service = FinalizeRunService(pool, storage)
     prepared = service.prepare(PrepareRunOutputCommand(run_id))
     artifact = storage.publish_bytes(b"initial output")
-    result = service.finalize(
-        FinalizeRunOutputCommand(
-            run_id,
-            prepared.render_input_fingerprint,
-            artifact.storage_uri,
-            artifact.content_hash,
-            "human",
-            "initial-reviewer",
-        ),
+    direct_command = FinalizeRunOutputCommand(
+        run_id,
+        prepared.render_input_fingerprint,
+        artifact.storage_uri,
+        artifact.content_hash,
+        "human",
+        "initial-reviewer",
+    )
+    with pytest.raises(DirectFreshFinalizationDisabledError):
+        service.finalize(direct_command)
+
+    activate_commit_step(run_id)
+    result = CommitFinalReportService(pool, storage, service).commit(
+        CommitFinalReportCommand(run_id, actor_type="human", actor_id="initial-reviewer"),
     )
     assert result.replayed is False
-    assert result.run.status is RunStatus.COMPLETED
+    with pool.connection() as connection:
+        completed = RunRepository(connection).get_by_id(run_id)
+    assert completed is not None and completed.status is RunStatus.COMPLETED

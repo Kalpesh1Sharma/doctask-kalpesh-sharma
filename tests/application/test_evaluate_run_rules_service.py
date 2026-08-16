@@ -44,6 +44,8 @@ from repositories.idempotency_repository import (
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_repository import RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
+from services.openai_structured_transport import StructuredTransportInvalidResponse
+from services.openai_task_providers import OpenAIRuleEvaluationProvider
 from services.rule_evaluation_provider import RuleEvaluationProviderError
 
 
@@ -79,6 +81,11 @@ class FailingProvider:
     def evaluate(self, _: RuleEvaluationRequest) -> RuleEvaluationResponse:
         self.calls += 1
         raise RuleEvaluationProviderError("provider unavailable")
+
+
+class InvalidStructuredTransport:
+    def parse(self, **_: object):
+        raise StructuredTransportInvalidResponse("invalid structured output")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -378,6 +385,19 @@ def test_provider_and_invalid_response_failures_mark_claim_failed_without_findin
     assert record(invalid).status is IdempotencyStatus.FAILED  # type: ignore[union-attr]
     assert record(invalid).failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE  # type: ignore[union-attr]
     assert finding_count(invalid) == 0
+
+
+def test_openai_structured_invalid_rule_output_is_retryable_invalid_response() -> None:
+    resources = create_resources()
+    provider = OpenAIRuleEvaluationProvider(InvalidStructuredTransport(), "test-model")
+
+    with pytest.raises(InvalidRuleEvaluationResponseError):
+        service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+
+    current = record(resources)
+    assert current is not None and current.status is IdempotencyStatus.FAILED
+    assert current.failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE
+    assert finding_count(resources) == 0
 
 
 def test_normal_failed_retryable_rules_never_reopen_without_workflow() -> None:

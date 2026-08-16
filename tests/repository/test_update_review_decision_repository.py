@@ -172,7 +172,7 @@ def test_decision_database_backstops_pending_and_non_reviewable_runs() -> None:
         ).fetchone()
         assert run_id is not None
         connection.execute(
-            "UPDATE runs SET status = 'COMPLETED', completed_at = now() WHERE id = %s::uuid",
+            "UPDATE runs SET status = 'FAILED'::run_status WHERE id = %s::uuid",
             (str(run_id[0]),),
         )
         with pytest.raises(RaiseException), connection.transaction():

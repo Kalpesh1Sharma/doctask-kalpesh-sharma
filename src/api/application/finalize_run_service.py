@@ -85,6 +85,10 @@ class UpdateApprovalStaleError(FinalizeRunApplicationError):
     pass
 
 
+class DirectFreshFinalizationDisabledError(FinalizeRunApplicationError):
+    """A fresh output must be committed through CommitFinalReportService."""
+
+
 @dataclass(frozen=True)
 class PrepareRunOutputCommand:
     run_id: str
@@ -113,6 +117,7 @@ class FinalizeRunOutputResult:
     run: RunRecord
     render_input_fingerprint: str
     replayed: bool
+
 
 
 class FinalizeRunService:
@@ -179,38 +184,19 @@ class FinalizeRunService:
             raise FinalizationIntegrityError("completed run has no canonical final output")
         self._require_fresh_status(run)
 
+        # Preserve the legacy API's read-only validation surface so callers get
+        # useful drift/approval/integrity errors, but never let this path write
+        # an Output, audit event, or COMPLETED Run.  Fresh persistence is owned
+        # exclusively by CommitFinalReportService.
         manifest = self._build_manifest(connection, command.run_id)
         if run.run_type is RunType.UPDATE:
             self._require_update_approval(connection, run, manifest)
         fingerprint = render_input_fingerprint(manifest)
         if fingerprint != command.expected_render_input_fingerprint:
             raise RenderInputDriftError("authoritative render input no longer matches preparation")
-
         self._verify_artifact(command.artifact_storage_uri, command.artifact_content_hash)
-        output = output_repository.create(
-            command.run_id,
-            _OUTPUT_TYPE,
-            command.artifact_storage_uri,
-            command.artifact_content_hash,
-        )
-        payload = self._audit_payload(command, output)
-        audit_event = audit_repository.create(
-            command.run_id,
-            _AUDIT_ENTITY_TYPE,
-            output.output_id,
-            _AUDIT_EVENT_TYPE,
-            command.actor_type,
-            command.actor_id,
-            payload,
-        )
-        completed_run = RunRepository(connection).update_status(command.run_id, RunStatus.COMPLETED)
-        assert completed_run is not None
-        return FinalizeRunOutputResult(
-            output=output,
-            audit_event=audit_event,
-            run=completed_run,
-            render_input_fingerprint=fingerprint,
-            replayed=False,
+        raise DirectFreshFinalizationDisabledError(
+            "fresh finalization is owned by CommitFinalReportService",
         )
 
     def _require_update_approval(

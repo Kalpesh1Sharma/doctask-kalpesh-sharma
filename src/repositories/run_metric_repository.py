@@ -67,3 +67,24 @@ class RunMetricRepository:
             (run_id, stage.value, attempt),
         ).fetchone()
         return RunMetricRecord.from_row(row) if row is not None else None
+
+    def set_usage(
+        self,
+        run_id: str,
+        stage: RunStage,
+        attempt: int,
+        *,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        estimated_cost: Decimal | None,
+    ) -> RunMetricRecord | None:
+        row = self._connection.execute(
+            f"""
+            UPDATE run_metrics
+            SET input_tokens = %s, output_tokens = %s, estimated_cost = %s
+            WHERE run_id = %s::uuid AND stage = %s::run_stage AND attempt = %s
+            RETURNING {_COLUMNS}
+            """,
+            (input_tokens, output_tokens, estimated_cost, run_id, stage.value, attempt),
+        ).fetchone()
+        return RunMetricRecord.from_row(row) if row is not None else None
