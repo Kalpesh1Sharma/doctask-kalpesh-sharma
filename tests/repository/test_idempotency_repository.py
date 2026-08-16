@@ -8,6 +8,7 @@ from psycopg.errors import LockNotAvailable, UniqueViolation
 
 from db.pool import pool
 from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
     IdempotencyRepository,
     IdempotencyStatus,
     InProgressClaimState,
@@ -132,6 +133,66 @@ def test_mark_failed_preserves_result_and_completion_fields(scope: str) -> None:
     assert failed.status is IdempotencyStatus.FAILED
     assert failed.result_reference == "preserved-result"
     assert failed.completed_at is None
+
+
+def test_workflow_fenced_reopen_requires_exact_retryable_failed_generation(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as connection:
+        repository = IdempotencyRepository(connection)
+        failed = repository.mark_failed(
+            scope, original.key, original.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        assert failed is not None
+        reopened = repository.reopen_failed(
+            scope, original.key, original.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        assert reopened is not None
+        assert reopened.claim_generation == original.claim_generation + 1
+        assert reopened.failure_kind is None
+        assert repository.reopen_failed(
+            scope, original.key, original.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        ) is None
+        connection.commit()
+
+
+def test_two_retry_workers_have_exactly_one_failed_generation_reopen_winner(scope: str) -> None:
+    original = claim(scope)
+    with pool.connection() as connection:
+        failed = IdempotencyRepository(connection).mark_failed(
+            scope,
+            original.key,
+            original.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        assert failed is not None
+        connection.commit()
+    barrier = threading.Barrier(2)
+
+    def reopen() -> int | None:
+        with pool.connection() as connection:
+            barrier.wait(timeout=5)
+            reopened = IdempotencyRepository(connection).reopen_failed(
+                scope,
+                original.key,
+                original.claim_generation,
+                IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+            )
+            connection.commit()
+            return reopened.claim_generation if reopened is not None else None
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        generations = list(workers.map(lambda _: reopen(), range(2)))
+    assert generations.count(original.claim_generation + 1) == 1
+    assert generations.count(None) == 1
+    with pool.connection() as connection:
+        current = IdempotencyRepository(connection).get(scope, original.key)
+    assert current is not None
+    assert current.status is IdempotencyStatus.IN_PROGRESS
+    assert current.claim_generation == original.claim_generation + 1
+    assert current.failure_kind is None
 
 
 def test_get_returns_none_for_unknown_operation(scope: str) -> None:

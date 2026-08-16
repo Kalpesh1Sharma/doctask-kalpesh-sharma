@@ -33,7 +33,11 @@ from domain.fact_extraction import (
     FactExtractionResponse,
     fact_extraction_input_fingerprint,
 )
-from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
+from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
+    IdempotencyRepository,
+    IdempotencyStatus,
+)
 from repositories.run_repository import RunRepository
 from services.fact_extraction_provider import FactExtractionProviderError
 
@@ -1127,6 +1131,7 @@ def test_update_non_trigger_evidence_is_rejected_and_marks_claim_failed(
     ) == (0, 0, 0, 0)
     assert record is not None
     assert record.status is IdempotencyStatus.FAILED
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_EVIDENCE_VALIDATION
 
 
 def test_update_provider_failure_marks_v2_claim_failed_without_changing_carried_state(
@@ -1144,6 +1149,7 @@ def test_update_provider_failure_marks_v2_claim_failed_without_changing_carried_
     assert update_grounded_counts(resources.update_run_id, resources.trigger_version_id) == (0, 0, 0, 0)
     assert record is not None
     assert record.status is IdempotencyStatus.FAILED
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
 
 
 def update_extraction_record_for_run(run_id: str):
@@ -2067,6 +2073,74 @@ def test_in_progress_claim_prevents_provider_call(resources: ExtractionResources
     with pytest.raises(FactExtractionInProgressError):
         service(provider).extract(ExtractRunFactsCommand(resources.run_id))
     assert provider.calls == []
+
+
+def test_normal_failed_retryable_extraction_never_reopens_without_workflow(
+    resources: ExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim("fact-extraction-v1", f"understand:{resources.run_id}")
+        assert claimed is not None
+        IdempotencyRepository(connection).mark_failed(
+            claimed.scope, claimed.key, claimed.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        connection.commit()
+    provider = FakeProvider(response_for(resources))
+    with pytest.raises(extraction_module.FactExtractionPreviouslyFailedError):
+        service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+    current = extraction_record(resources)
+    assert provider.calls == []
+    assert current is not None and current.status is IdempotencyStatus.FAILED
+    assert current.claim_generation == claimed.claim_generation
+    assert current.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
+
+
+def test_concurrent_workflow_only_extraction_reopen_has_one_provider_winner(
+    resources: ExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim(
+            "fact-extraction-v1", f"understand:{resources.run_id}",
+        )
+        assert claimed is not None
+        failed = IdempotencyRepository(connection).mark_failed(
+            claimed.scope,
+            claimed.key,
+            claimed.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        assert failed is not None
+        connection.commit()
+    entered = threading.Event()
+    release = threading.Event()
+    provider = FakeProvider(response_for(resources))
+
+    def pause(_request: FactExtractionRequest) -> None:
+        entered.set()
+        assert release.wait(10)
+
+    provider.before_return = pause
+    owner = service(provider)
+    loser = service(provider)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        winning = executor.submit(
+            owner._retry_after_failed_from_workflow,
+            ExtractRunFactsCommand(resources.run_id),
+            expected_failed_generation=failed.claim_generation,
+        )
+        assert entered.wait(10)
+        with pytest.raises(extraction_module.FactExtractionInProgressError):
+            loser._retry_after_failed_from_workflow(
+                ExtractRunFactsCommand(resources.run_id),
+                expected_failed_generation=failed.claim_generation,
+            )
+        release.set()
+        winning.result(timeout=10)
+    current = extraction_record(resources)
+    assert len(provider.calls) == 1
+    assert current is not None and current.status is IdempotencyStatus.COMPLETED
+    assert current.claim_generation == failed.claim_generation + 1
 
 
 def test_fresh_extraction_requires_running_status(resources: ExtractionResources) -> None:

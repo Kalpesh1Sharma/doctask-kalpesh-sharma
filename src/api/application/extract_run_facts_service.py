@@ -42,6 +42,7 @@ from repositories.evidence_span_repository import EvidenceSpanRepository
 from repositories.fact_evidence_repository import FactEvidenceRepository
 from repositories.fact_repository import FactRepository
 from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
@@ -186,17 +187,26 @@ class ExtractRunFactsService:
         if isinstance(claimed, ExtractRunFactsResult):
             return claimed
 
+        return self._execute_claimed(claimed)
+
+    def _execute_claimed(self, claimed: _ClaimedOperation) -> ExtractRunFactsResult:
         try:
             response = self._provider.extract(claimed.request)
             persistence_plan = self._build_persistence_plan(claimed.request, response)
+        except SourceEvidenceValidationError:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_EVIDENCE_VALIDATION)
+            raise
+        except InvalidFactExtractionResponseError:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
+            raise
         except FactExtractionApplicationError:
             self._mark_failed(claimed)
             raise
         except FactExtractionProviderError as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise FactExtractionProviderFailure("fact extraction provider failed") from error
         except Exception as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise FactExtractionProviderFailure("fact extraction provider failed") from error
 
         self._persist(claimed, persistence_plan)
@@ -205,6 +215,63 @@ class ExtractRunFactsService:
             input_fingerprint=claimed.input_fingerprint,
             replayed=False,
         )
+
+    def _retry_after_failed_from_workflow(
+        self,
+        command: ExtractRunFactsCommand,
+        *,
+        expected_failed_generation: int,
+    ) -> ExtractRunFactsResult:
+        """Internal Phase 5C path; normal ``extract`` never reopens FAILED."""
+        normalized = ExtractRunFactsCommand(run_id=self._normalize_run_id(command.run_id))
+        with self._connection_pool.connection() as connection:
+            run = RunRepository(connection).get_for_update(normalized.run_id)
+            if run is None:
+                raise FactExtractionRunNotFoundError(f"run {normalized.run_id} does not exist")
+            scope, key = self._fact_extraction_identity_for_retry(run)
+            repository = IdempotencyRepository(connection)
+            failed = repository.get(scope, key)
+            if (
+                failed is None
+                or failed.status is not IdempotencyStatus.FAILED
+                or failed.claim_generation != expected_failed_generation
+                or failed.failure_kind is None
+            ):
+                return self._resolve_authoritative_retry_existing(connection, run, repository, scope, key)
+            if run.status is not RunStatus.RUNNING:
+                raise FactExtractionRunNotEligibleError("run is not running fact extraction")
+            if run.run_type is RunType.UPDATE:
+                request = self._load_update_request(connection, run, for_share=False)
+                fingerprint = update_fact_extraction_input_fingerprint(request)
+                reference = self._update_result_reference(run.run_id, fingerprint)
+                self._require_fresh_update_fact_state(connection, request)
+            else:
+                request = self._load_request(connection, run.run_id, for_share=False)
+                fingerprint = fact_extraction_input_fingerprint(request)
+                reference = self._result_reference(run.run_id, fingerprint)
+            reopened = repository.reopen_failed(scope, key, expected_failed_generation, failed.failure_kind)
+            if reopened is None:
+                return self._resolve_authoritative_retry_existing(connection, run, repository, scope, key)
+            connection.commit()
+        return self._execute_claimed(_ClaimedOperation(request, fingerprint, reopened.claim_generation, scope, key, reference))
+
+    @staticmethod
+    def _fact_extraction_identity_for_retry(run: RunRecord) -> tuple[str, str]:
+        if run.run_type is RunType.UPDATE:
+            return _UPDATE_IDEMPOTENCY_SCOPE, f"understand-update:{run.run_id}"
+        return _IDEMPOTENCY_SCOPE, f"understand:{run.run_id}"
+
+    def _resolve_authoritative_retry_existing(self, connection: Connection, run: RunRecord, repository: IdempotencyRepository, scope: str, key: str) -> ExtractRunFactsResult:
+        current = repository.get(scope, key)
+        if current is None:
+            raise FactExtractionIdempotencyIntegrityError("failed retry operation disappeared")
+        if current.status is IdempotencyStatus.IN_PROGRESS:
+            raise FactExtractionInProgressError("fact extraction is already in progress")
+        if current.status is IdempotencyStatus.FAILED:
+            raise FactExtractionPreviouslyFailedError("fact extraction previously failed")
+        if scope == _UPDATE_IDEMPOTENCY_SCOPE:
+            return self._resolve_completed_update_existing(connection, run, current)
+        return self._resolve_completed_v1_existing(connection, run.run_id, current)
 
     def _claim_or_replay(
         self,
@@ -460,7 +527,11 @@ class ExtractRunFactsService:
         if completed is None:
             raise FactExtractionClaimLostError("fact extraction claim is no longer owned")
 
-    def _mark_failed(self, claimed: _ClaimedOperation) -> None:
+    def _mark_failed(
+        self,
+        claimed: _ClaimedOperation,
+        failure_kind: IdempotencyFailureKind | None = None,
+    ) -> None:
         for attempt in range(_MAX_TRANSACTION_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
@@ -468,6 +539,7 @@ class ExtractRunFactsService:
                         claimed.idempotency_scope,
                         claimed.idempotency_key,
                         claimed.claim_token,
+                        failure_kind,
                     )
                     if failed is None:
                         raise FactExtractionClaimLostError("fact extraction claim is no longer owned")

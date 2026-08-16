@@ -1,3 +1,4 @@
+from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
@@ -182,7 +183,7 @@ def test_shape_valid_but_wrong_stored_fingerprint_is_application_integrity_error
 
 
 def test_migrations_apply_to_a_clean_database_in_order() -> None:
-    """Exercise 001 -> 002 -> 003 -> 004 without the shared test database."""
+    """Exercise 001 -> 002 -> 003 -> 004 -> 005 without the shared test database."""
     database_name = f"task1_phase4b_{uuid4().hex}"
     connection_info = conninfo_to_dict(get_settings().database_url)
     connection_info["dbname"] = "postgres"
@@ -192,6 +193,7 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
         Path("sql/migrations/002_run_rule_scope.sql"),
         Path("sql/migrations/003_update_review.sql"),
         Path("sql/migrations/004_idempotency_claim_generation.sql"),
+        Path("sql/migrations/005_run_step_retry_history.sql"),
     )
     with connect(admin_info, autocommit=True) as admin:
         admin.execute(f'CREATE DATABASE "{database_name}"')
@@ -203,6 +205,32 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                 if migration_path.name == "004_idempotency_claim_generation.sql":
                     isolated.execute(
                         "INSERT INTO idempotency_records (scope, key, status, claimed_at) VALUES ('migration-004', 'legacy', 'COMPLETED'::idempotency_status, clock_timestamp())",
+                    )
+                if migration_path.name == "005_run_step_retry_history.sql":
+                    pile = isolated.execute(
+                        "INSERT INTO piles (name) VALUES ('migration-005-history') RETURNING id",
+                    ).fetchone()
+                    assert pile is not None
+                    run = isolated.execute(
+                        """INSERT INTO runs (pile_id, run_type, status)
+                           VALUES (%s, 'MANUAL'::run_type, 'PENDING'::run_status) RETURNING id""",
+                        (pile[0],),
+                    ).fetchone()
+                    assert run is not None
+                    isolated.execute(
+                        """INSERT INTO run_steps (run_id, stage, status, attempt, started_at, completed_at)
+                           VALUES (%s, 'INGEST'::run_stage, 'COMPLETED'::run_step_status, 1,
+                                   clock_timestamp() - interval '2 seconds', clock_timestamp())""",
+                        (run[0],),
+                    )
+                    isolated.execute(
+                        """INSERT INTO run_metrics (run_id, stage, attempt, duration_ms, input_tokens, estimated_cost)
+                           VALUES (%s, 'INGEST'::run_stage, 1, NULL, 7, 1.25)""",
+                        (run[0],),
+                    )
+                    isolated.execute(
+                        """INSERT INTO idempotency_records (scope, key, status, claimed_at)
+                           VALUES ('migration-005', 'historical-failure', 'FAILED'::idempotency_status, clock_timestamp())""",
                     )
                 isolated.execute(migration_path.read_text(encoding="utf-8"))
                 isolated.commit()
@@ -241,6 +269,14 @@ def test_migrations_apply_to_a_clean_database_in_order() -> None:
                 "INSERT INTO idempotency_records (scope, key, status, claimed_at) VALUES ('migration-004', 'future', 'IN_PROGRESS'::idempotency_status, clock_timestamp()) RETURNING claim_generation",
             ).fetchone()
             assert future == (1,)
+            historical_failure = isolated.execute(
+                "SELECT failure_kind FROM idempotency_records WHERE scope = 'migration-005'",
+            ).fetchone()
+            assert historical_failure == (None,)
+            metric = isolated.execute(
+                "SELECT duration_ms, input_tokens, estimated_cost FROM run_metrics WHERE attempt = 1",
+            ).fetchone()
+            assert metric is not None and metric[0] >= 0 and metric[1:] == (7, Decimal("1.25"))
     finally:
         with connect(admin_info, autocommit=True) as admin:
             admin.execute(
@@ -289,6 +325,103 @@ def test_migration_004_rejects_malformed_legacy_in_progress_claim() -> None:
         with connect(admin_info, autocommit=True) as admin:
             admin.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()",
+                (database_name,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    [
+        ("conflicting_duration", "historical duration differs"),
+        ("orphan_metric", "metric has no closed RunStep"),
+        ("open_metric", "metric has no closed RunStep"),
+        (
+            "missing_closed_timestamps",
+            "closed RunStep has invalid timestamps|chk_closed_run_step_timestamps",
+        ),
+    ],
+)
+def test_migration_005_rejects_invalid_historical_retry_data(case: str, message: str) -> None:
+    """Migration 005 fails closed rather than guessing historical retry truth."""
+    database_name = f"task1_phase5c_bad_{case}_{uuid4().hex}"
+    connection_info = conninfo_to_dict(get_settings().database_url)
+    connection_info["dbname"] = "postgres"
+    admin_info = make_conninfo(**connection_info)
+    migrations = (
+        Path("sql/migrations/001_schema_v2_7.sql"),
+        Path("sql/migrations/002_run_rule_scope.sql"),
+        Path("sql/migrations/003_update_review.sql"),
+        Path("sql/migrations/004_idempotency_claim_generation.sql"),
+    )
+    with connect(admin_info, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{database_name}"')
+    try:
+        database_info = dict(connection_info)
+        database_info["dbname"] = database_name
+        with connect(make_conninfo(**database_info)) as isolated:
+            for migration in migrations:
+                isolated.execute(migration.read_text(encoding="utf-8"))
+                isolated.commit()
+            pile = isolated.execute(
+                "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+                (f"bad-005-{case}",),
+            ).fetchone()
+            assert pile is not None
+            run = isolated.execute(
+                """INSERT INTO runs (pile_id, run_type, status)
+                   VALUES (%s, 'MANUAL', 'PENDING') RETURNING id""",
+                (pile[0],),
+            ).fetchone()
+            assert run is not None
+            if case == "orphan_metric":
+                isolated.execute(
+                    """INSERT INTO run_metrics (run_id, stage, attempt, duration_ms)
+                       VALUES (%s, 'INGEST', 1, 1)""",
+                    (run[0],),
+                )
+            elif case == "open_metric":
+                isolated.execute(
+                    """INSERT INTO run_steps (run_id, stage, status, attempt)
+                       VALUES (%s, 'INGEST', 'RUNNING', 1)""",
+                    (run[0],),
+                )
+                isolated.execute(
+                    """INSERT INTO run_metrics (run_id, stage, attempt, duration_ms)
+                       VALUES (%s, 'INGEST', 1, 1)""",
+                    (run[0],),
+                )
+            elif case == "missing_closed_timestamps":
+                isolated.execute(
+                    """INSERT INTO run_steps (run_id, stage, status, attempt)
+                       VALUES (%s, 'INGEST', 'COMPLETED', 1)""",
+                    (run[0],),
+                )
+            else:
+                isolated.execute(
+                    """INSERT INTO run_steps (run_id, stage, status, attempt, started_at, completed_at)
+                       VALUES (%s, 'INGEST', 'COMPLETED', 1,
+                               clock_timestamp() - interval '2 seconds', clock_timestamp())""",
+                    (run[0],),
+                )
+                isolated.execute(
+                    """INSERT INTO run_metrics (run_id, stage, attempt, duration_ms)
+                       VALUES (%s, 'INGEST', 1, 1)""",
+                    (run[0],),
+                )
+            isolated.commit()
+            with pytest.raises((RaiseException, CheckViolation), match=message):
+                isolated.execute(
+                    Path("sql/migrations/005_run_step_retry_history.sql").read_text(
+                        encoding="utf-8",
+                    ),
+                )
+            isolated.rollback()
+    finally:
+        with connect(admin_info, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
                 (database_name,),
             )
             admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')

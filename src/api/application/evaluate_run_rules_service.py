@@ -34,6 +34,7 @@ from domain.run_membership import RunMembershipRelation
 from repositories.finding_evidence_repository import FindingEvidenceRepository
 from repositories.finding_repository import FindingRepository
 from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
@@ -160,25 +161,64 @@ class EvaluateRunRulesService:
         if isinstance(claimed, EvaluateRunRulesResult):
             return claimed
 
+        return self._execute_claimed(claimed)
+
+    def _execute_claimed(self, claimed: _Claim) -> EvaluateRunRulesResult:
         if not claimed.request.rules:
             self._persist(claimed, ())
-            return EvaluateRunRulesResult(run_id, claimed.fingerprint, replayed=False)
+            return EvaluateRunRulesResult(claimed.request.run_id, claimed.fingerprint, replayed=False)
 
         try:
             response = self._provider.evaluate(claimed.request)
             plans = self._build_finding_plans(claimed.request, response)
+        except UnsupportedRuleEvaluationError:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_UNSUPPORTED_EVALUATION)
+            raise
+        except InvalidRuleEvaluationResponseError:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
+            raise
         except RuleEvaluationApplicationError:
             self._mark_failed(claimed)
             raise
         except RuleEvaluationProviderError as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise RuleEvaluationProviderFailure("rule evaluation provider failed") from error
         except Exception as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise RuleEvaluationProviderFailure("rule evaluation provider failed") from error
 
         self._persist(claimed, plans)
-        return EvaluateRunRulesResult(run_id, claimed.fingerprint, replayed=False)
+        return EvaluateRunRulesResult(claimed.request.run_id, claimed.fingerprint, replayed=False)
+
+    def _retry_after_failed_from_workflow(
+        self,
+        command: EvaluateRunRulesCommand,
+        *,
+        expected_failed_generation: int,
+    ) -> EvaluateRunRulesResult:
+        run_id = self._normalize_run_id(command.run_id)
+        with self._connection_pool.connection() as connection:
+            run = RunRepository(connection).get_for_update(run_id)
+            if run is None:
+                raise RuleEvaluationRunNotFoundError(f"run {run_id} does not exist")
+            repository = IdempotencyRepository(connection)
+            failed = repository.get(_SCOPE, self._key(run_id))
+            if (
+                failed is None or failed.status is not IdempotencyStatus.FAILED
+                or failed.claim_generation != expected_failed_generation or failed.failure_kind is None
+            ):
+                return self._resolve_authoritative_existing(connection, run, repository)
+            if run.status is not RunStatus.RUNNING:
+                raise RuleEvaluationRunNotEligibleError("run is not running rule evaluation")
+            request = self._load_request(connection, run_id)
+            fingerprint = rule_evaluation_input_fingerprint(request)
+            reopened = repository.reopen_failed(
+                _SCOPE, self._key(run_id), expected_failed_generation, failed.failure_kind,
+            )
+            if reopened is None:
+                return self._resolve_authoritative_existing(connection, run, repository)
+            connection.commit()
+        return self._execute_claimed(_Claim(request, fingerprint, reopened.claim_generation))
 
     def _claim_or_replay(self, run_id: str) -> _Claim | EvaluateRunRulesResult:
         for attempt in range(_MAX_ATTEMPTS):
@@ -300,12 +340,17 @@ class EvaluateRunRulesService:
         if completed is None:
             raise RuleEvaluationClaimLostError("rule-evaluation claim is no longer owned")
 
-    def _mark_failed(self, claim: _Claim) -> None:
+    def _mark_failed(
+        self,
+        claim: _Claim,
+        failure_kind: IdempotencyFailureKind | None = None,
+    ) -> None:
         for attempt in range(_MAX_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
                     failed = IdempotencyRepository(connection).mark_failed(
                         _SCOPE, self._key(claim.request.run_id), claim.token,
+                        failure_kind,
                     )
                     if failed is None:
                         raise RuleEvaluationClaimLostError("rule-evaluation claim is no longer owned")

@@ -12,6 +12,10 @@ The executable database definition is now the ordered migration set:
 sql/migrations/001_schema_v2_7.sql
 sql/migrations/002_run_rule_scope.sql
 sql/migrations/003_update_review.sql
+sql/migrations/004_idempotency_claim_generation.sql
+sql/migrations/005_run_step_retry_history.sql
+sql/migrations/004_idempotency_claim_generation.sql
+sql/migrations/005_run_step_retry_history.sql
 ```
 
 `001_schema_v2_7.sql` remains the locked historical V2.7 baseline and must not be rewritten.
@@ -2306,3 +2310,27 @@ the inclusive predicate `claimed_at <= clock_timestamp() - stale_after`,
 increments `claim_generation`, and refreshes `claimed_at` atomically.
 Completion and failure require the currently owned generation; a stale owner
 cannot complete or fail a replacement generation.
+
+---
+
+# 45. Migration 005: Explicit Retry Attempt History
+
+Migration `005_run_step_retry_history.sql` is additive and adds no tables; the
+executable schema remains **26 tables**. It records retryable provider/result
+failure classification on `idempotency_records`, while preserving null
+classification for historical failed records whose cause cannot be truthfully
+reconstructed.
+
+Retries are distinct `run_steps` attempts, limited durably to attempts 1–3.
+The predecessor is closed as `RETRYING`, retains immutable operation, failed
+generation, classification, database completion time, and a truthful metric;
+the successor carries immutable retry provenance. `RETRYING` is historical and
+has no outgoing state transition. Attempt three retry exhaustion is
+`ESCALATED`, with the Run remaining `RUNNING` for explicit intervention.
+
+Every closed RunStep has database-authoritative valid start/completion
+timestamps and exactly one `run_metrics` record. Metric duration is derived as
+`FLOOR(EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000)::BIGINT`; token
+and cost fields are never fabricated by migration. A composite metric foreign
+key and deferred closure check prevent orphan/open metrics and unmeasured
+closed attempts.

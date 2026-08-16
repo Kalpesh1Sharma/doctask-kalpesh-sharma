@@ -18,6 +18,13 @@ class InProgressClaimState(StrEnum):
     CHANGED_OR_MISSING = "CHANGED_OR_MISSING"
 
 
+class IdempotencyFailureKind(StrEnum):
+    RETRYABLE_PROVIDER_FAILURE = "RETRYABLE_PROVIDER_FAILURE"
+    RETRYABLE_INVALID_RESPONSE = "RETRYABLE_INVALID_RESPONSE"
+    RETRYABLE_EVIDENCE_VALIDATION = "RETRYABLE_EVIDENCE_VALIDATION"
+    RETRYABLE_UNSUPPORTED_EVALUATION = "RETRYABLE_UNSUPPORTED_EVALUATION"
+
+
 _IDEMPOTENCY_COLUMNS = """
     id,
     scope,
@@ -26,6 +33,7 @@ _IDEMPOTENCY_COLUMNS = """
     result_reference,
     claimed_at,
     claim_generation,
+    failure_kind,
     created_at,
     completed_at
 """
@@ -44,6 +52,7 @@ class IdempotencyRecord:
     result_reference: str | None
     claimed_at: datetime | None
     claim_generation: int
+    failure_kind: IdempotencyFailureKind | None
     created_at: datetime
     completed_at: datetime | None
 
@@ -57,8 +66,9 @@ class IdempotencyRecord:
             result_reference=_optional_string(row[4]),
             claimed_at=cast(datetime | None, row[5]),
             claim_generation=int(row[6]),
-            created_at=cast(datetime, row[7]),
-            completed_at=cast(datetime | None, row[8]),
+            failure_kind=(IdempotencyFailureKind(str(row[7])) if row[7] is not None else None),
+            created_at=cast(datetime, row[8]),
+            completed_at=cast(datetime | None, row[9]),
         )
 
 
@@ -189,18 +199,50 @@ class IdempotencyRepository:
         scope: str,
         key: str,
         owner_generation: int,
+        failure_kind: IdempotencyFailureKind | None = None,
     ) -> IdempotencyRecord | None:
         row = self._connection.execute(
             f"""
             UPDATE idempotency_records
-            SET status = 'FAILED'::idempotency_status
+            SET
+                status = 'FAILED'::idempotency_status,
+                failure_kind = %s::idempotency_failure_kind
             WHERE scope = %s
               AND key = %s
               AND status = 'IN_PROGRESS'::idempotency_status
               AND claim_generation = %s
             RETURNING {_IDEMPOTENCY_COLUMNS}
             """,
-            (scope, key, owner_generation),
+            (failure_kind.value if failure_kind is not None else None, scope, key, owner_generation),
         ).fetchone()
 
+        return IdempotencyRecord.from_row(row) if row is not None else None
+
+    def reopen_failed(
+        self,
+        scope: str,
+        key: str,
+        expected_generation: int,
+        expected_failure_kind: IdempotencyFailureKind,
+    ) -> IdempotencyRecord | None:
+        """Fence a workflow-authorized retry of one failed provider operation."""
+        row = self._connection.execute(
+            f"""
+            UPDATE idempotency_records
+            SET
+                status = 'IN_PROGRESS'::idempotency_status,
+                claim_generation = claim_generation + 1,
+                claimed_at = clock_timestamp(),
+                result_reference = NULL,
+                completed_at = NULL,
+                failure_kind = NULL
+            WHERE scope = %s
+              AND key = %s
+              AND status = 'FAILED'::idempotency_status
+              AND claim_generation = %s
+              AND failure_kind = %s::idempotency_failure_kind
+            RETURNING {_IDEMPOTENCY_COLUMNS}
+            """,
+            (scope, key, expected_generation, expected_failure_kind.value),
+        ).fetchone()
         return IdempotencyRecord.from_row(row) if row is not None else None

@@ -130,7 +130,6 @@ def test_non_terminal_statuses(status: RunStatus) -> None:
         (RunStepStatus.RUNNING, RunStepStatus.FAILED),
         (RunStepStatus.RUNNING, RunStepStatus.AWAITING_UPSTREAM),
         (RunStepStatus.AWAITING_UPSTREAM, RunStepStatus.RUNNING),
-        (RunStepStatus.RETRYING, RunStepStatus.RUNNING),
     ],
 )
 def test_valid_run_step_transitions(

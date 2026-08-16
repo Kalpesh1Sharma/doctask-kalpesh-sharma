@@ -36,7 +36,11 @@ from domain.run_membership import RunMembershipRelation
 from domain.run_rule_scope import RunRuleSetSnapshot, RunRuleSnapshot
 from repositories.fact_evidence_repository import FactEvidenceRepository
 from repositories.fact_repository import FactRepository
-from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
+from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
+    IdempotencyRepository,
+    IdempotencyStatus,
+)
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_repository import RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
@@ -364,6 +368,7 @@ def test_provider_and_invalid_response_failures_mark_claim_failed_without_findin
     with pytest.raises(RuleEvaluationProviderFailure):
         service(FailingProvider()).evaluate(EvaluateRunRulesCommand(resources.run_id))
     assert record(resources).status is IdempotencyStatus.FAILED  # type: ignore[union-attr]
+    assert record(resources).failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE  # type: ignore[union-attr]
     assert finding_count(resources) == 0
 
     invalid = create_resources()
@@ -371,7 +376,29 @@ def test_provider_and_invalid_response_failures_mark_claim_failed_without_findin
     with pytest.raises(InvalidRuleEvaluationResponseError):
         service(missing).evaluate(EvaluateRunRulesCommand(invalid.run_id))
     assert record(invalid).status is IdempotencyStatus.FAILED  # type: ignore[union-attr]
+    assert record(invalid).failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE  # type: ignore[union-attr]
     assert finding_count(invalid) == 0
+
+
+def test_normal_failed_retryable_rules_never_reopen_without_workflow() -> None:
+    resources = create_resources()
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim(
+            "rule-evaluation-v1", f"examine-rules:{resources.run_id}",
+        )
+        assert claimed is not None
+        IdempotencyRepository(connection).mark_failed(
+            claimed.scope, claimed.key, claimed.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        connection.commit()
+    provider = FakeProvider(no_violation(resources))
+    with pytest.raises(RuleEvaluationPreviouslyFailedError):
+        service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+    current = record(resources)
+    assert provider.calls == []
+    assert current is not None and current.claim_generation == claimed.claim_generation
+    assert current.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
 
 
 def test_unsupported_rule_marks_claim_failed_without_findings() -> None:
@@ -383,6 +410,7 @@ def test_unsupported_rule_marks_claim_failed_without_findings() -> None:
         service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
     assert finding_count(resources) == 0
     assert record(resources).status is IdempotencyStatus.FAILED  # type: ignore[union-attr]
+    assert record(resources).failure_kind is IdempotencyFailureKind.RETRYABLE_UNSUPPORTED_EVALUATION  # type: ignore[union-attr]
 
 
 @pytest.mark.parametrize("kind", ["unknown_rule", "unknown_fact"])

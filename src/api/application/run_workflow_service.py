@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from uuid import UUID
 
 from psycopg import Connection
@@ -87,10 +88,14 @@ from repositories.document_repository import DocumentRepository
 from repositories.document_version_repository import DocumentVersionRepository
 from repositories.fact_repository import FactRepository
 from repositories.finding_repository import FindingRepository
-from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
+from repositories.idempotency_repository import (
+    IdempotencyRepository,
+    IdempotencyStatus,
+)
 from repositories.run_document_version_repository import RunDocumentVersionRepository
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_finding_repository import RunFindingRepository
+from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRecord, RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
 from repositories.run_step_repository import RunStepRecord, RunStepRepository
@@ -127,20 +132,56 @@ class RunWorkflowGraphIntegrityError(RunWorkflowError):
     pass
 
 
-class RunWorkflowOperationInProgress(RunWorkflowError):
+class _RunWorkflowStateError(RunWorkflowError):
+    """Typed, machine-readable visible workflow state."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        run_id: str,
+        stage: RunStage,
+        attempt: int,
+        error_code: str,
+        operation_scope: str | None = None,
+        operation_key: str | None = None,
+        claim_generation: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.run_id = run_id
+        self.stage = stage
+        self.attempt = attempt
+        self.error_code = error_code
+        self.operation_scope = operation_scope
+        self.operation_key = operation_key
+        self.claim_generation = claim_generation
+
+
+class RunWorkflowOperationInProgress(_RunWorkflowStateError):
     pass
 
 
-class RunWorkflowStepEscalatedError(RunWorkflowError):
+class RunWorkflowStepEscalatedError(_RunWorkflowStateError):
     pass
 
 
-class RunWorkflowRunFailedError(RunWorkflowError):
+class RunWorkflowRunFailedError(_RunWorkflowStateError):
     pass
 
 
-class RunWorkflowAwaitingUpstream(RunWorkflowError):
+class RunWorkflowAwaitingUpstream(_RunWorkflowStateError):
     pass
+
+
+class RunWorkflowOutcome(StrEnum):
+    COMPLETED = "COMPLETED"
+    REPLAYED = "REPLAYED"
+    RETRY_SCHEDULED = "RETRY_SCHEDULED"
+
+
+class _RetryScheduled(Exception):
+    def __init__(self, result: "RunWorkflowResult") -> None:
+        self.result = result
 
 
 @dataclass(frozen=True)
@@ -156,7 +197,9 @@ class RunWorkflowResult:
     stage: RunStage
     step: RunStepRecord
     run_status: RunStatus
+    outcome: RunWorkflowOutcome
     advanced: bool
+    successor_attempt: int | None = None
 
 
 @dataclass(frozen=True)
@@ -191,19 +234,43 @@ class RunWorkflowService:
         self._detect_contradictions = detect_run_contradictions_service
         self._evaluate_rules = evaluate_run_rules_service
 
+    @staticmethod
+    def _state_error(
+        error_type: type[_RunWorkflowStateError],
+        run: RunRecord,
+        step: RunStepRecord,
+        code: str,
+        message: str,
+        operation: _Operation | None = None,
+        generation: int | None = None,
+    ) -> _RunWorkflowStateError:
+        return error_type(
+            message,
+            run_id=run.run_id,
+            stage=step.stage,
+            attempt=step.attempt,
+            error_code=code,
+            operation_scope=operation.scope if operation is not None else None,
+            operation_key=operation.key if operation is not None else None,
+            claim_generation=generation,
+        )
+
     def advance(self, command: RunWorkflowCommand) -> RunWorkflowResult:
         normalized = self._normalize_command(command)
         self._verify_supplied_closed_scope(normalized)
         context = self._start_or_reconcile_stage(normalized)
+        replayed = False
         try:
             if context.step.stage is RunStage.INGEST:
                 self._run_ingest(context, normalized)
             elif context.step.stage is RunStage.UNDERSTAND:
-                self._run_understand(context)
+                replayed = self._run_understand(context)
             elif context.step.stage is RunStage.EXAMINE:
-                self._run_examine(context)
+                replayed = self._run_examine(context)
             else:
                 self._complete_review(context)
+        except _RetryScheduled as scheduled:
+            return scheduled.result
         except RunWorkflowError:
             raise
         except (DeadlockDetected, SerializationFailure):
@@ -217,13 +284,27 @@ class RunWorkflowService:
             self._handle_trigger_error(context, error)
             raise AssertionError("unreachable")
         except self._escalated_errors() as error:
+            operation = self._retry_operation_for_context(context)
+            scheduled = self._schedule_retry(context, operation, error) if operation is not None else None
+            if scheduled is not None:
+                return scheduled
             self._escalate(context, type(error).__name__, str(error))
-            raise RunWorkflowStepEscalatedError(str(error)) from error
+            raise self._state_error(
+                RunWorkflowStepEscalatedError, context.run, context.step,
+                type(error).__name__, str(error), operation,
+            ) from error
         except self._permanent_errors() as error:
+            operation = self._retry_operation_for_context(context)
             self._fail_run(context, type(error).__name__, str(error))
-            raise RunWorkflowRunFailedError(str(error)) from error
+            raise self._state_error(
+                RunWorkflowRunFailedError, context.run, context.step,
+                type(error).__name__, str(error), operation,
+            ) from error
 
-        return self._complete_stage(context)
+        return self._complete_stage(
+            context,
+            RunWorkflowOutcome.REPLAYED if replayed else RunWorkflowOutcome.COMPLETED,
+        )
 
     def _verify_supplied_closed_scope(self, command: RunWorkflowCommand) -> None:
         """Replay a caller-supplied selection before downstream step mutation.
@@ -269,7 +350,10 @@ class RunWorkflowService:
                 if run.run_type is RunType.UPDATE and run.blocked_on_run_id is not None:
                     step = self._await_upstream(repository, step, "RUN_BLOCKED", "waiting on blocked run")
                     connection.commit()
-                    raise RunWorkflowAwaitingUpstream(f"run {run.run_id} is blocked upstream")
+                    raise self._state_error(
+                        RunWorkflowAwaitingUpstream, run, step, "RUN_BLOCKED",
+                        f"run {run.run_id} is blocked upstream",
+                    )
                 connection.commit()
                 return _StageContext(run, step)
 
@@ -281,9 +365,13 @@ class RunWorkflowService:
                 self._require_scope_selection_if_needed(connection, run, command)
             if step.status is RunStepStatus.AWAITING_UPSTREAM:
                 if run.run_type is RunType.UPDATE and run.blocked_on_run_id is not None:
-                    raise RunWorkflowAwaitingUpstream(f"run {run.run_id} is blocked upstream")
+                    raise self._state_error(
+                        RunWorkflowAwaitingUpstream, run, step, "RUN_BLOCKED",
+                        f"run {run.run_id} is blocked upstream",
+                    )
                 if run.run_type is RunType.UPDATE and not self._update_is_ready_to_resume(connection, run):
-                    raise RunWorkflowAwaitingUpstream(
+                    raise self._state_error(
+                        RunWorkflowAwaitingUpstream, run, step, "UPDATE_PREREQUISITES_PENDING",
                         f"run {run.run_id} has unresolved UPDATE prerequisites",
                     )
                 step = self._transition_running(RunStepRepository(connection), step)
@@ -292,7 +380,11 @@ class RunWorkflowService:
             if step.status is RunStepStatus.RUNNING:
                 return _StageContext(run, step)
             if step.status in {RunStepStatus.ESCALATED, RunStepStatus.FAILED}:
-                raise RunWorkflowStepEscalatedError(f"stage {step.stage.value} is terminal")
+                raise self._state_error(
+                    RunWorkflowStepEscalatedError, run, step,
+                    step.error_code or "STEP_ESCALATED", f"stage {step.stage.value} is terminal",
+                    generation=step.retry_from_claim_generation,
+                )
             if step.status is not RunStepStatus.PENDING:
                 raise RunWorkflowGraphIntegrityError(f"unexpected stage status {step.status.value}")
             step = self._transition_running(RunStepRepository(connection), step)
@@ -383,37 +475,193 @@ class RunWorkflowService:
             ),
         )
 
-    def _run_understand(self, context: _StageContext) -> None:
-        self._run_operation(context, self._fact_extraction_operation(context.run))
+    def _run_understand(self, context: _StageContext) -> bool:
+        operation = self._fact_extraction_operation(context.run)
+        if context.step.attempt > 1:
+            self._run_retry_operation(context, operation)
+            return False
+        return self._run_operation(context, operation)
 
-    def _run_examine(self, context: _StageContext) -> None:
-        self._run_operation(context, self._contradiction_operation(context.run))
-        self._run_operation(context, self._rule_evaluation_operation(context.run))
+    def _run_examine(self, context: _StageContext) -> bool:
+        contradiction = self._contradiction_operation(context.run)
+        rules = self._rule_evaluation_operation(context.run)
+        if context.step.attempt == 1:
+            contradiction_replayed = self._run_operation(context, contradiction)
+            rules_replayed = self._run_operation(context, rules)
+            return contradiction_replayed and rules_replayed
+        if context.step.retry_operation_scope == _RULE_SCOPE:
+            self._run_operation(context, contradiction)
+            self._run_retry_operation(context, rules)
+            return False
+        if context.step.retry_operation_scope == _CONTRADICTION_SCOPE:
+            self._run_retry_operation(context, contradiction)
+            self._run_operation(context, rules)
+            return False
+        raise RunWorkflowGraphIntegrityError("EXAMINE retry has unknown operation provenance")
 
-    def _run_operation(self, context: _StageContext, operation: _Operation) -> None:
+    def _run_operation(self, context: _StageContext, operation: _Operation) -> bool:
         with self._connection_pool.connection() as connection:
             record = IdempotencyRepository(connection).get(operation.scope, operation.key)
         if record is not None:
             if record.status is IdempotencyStatus.IN_PROGRESS:
-                raise RunWorkflowOperationInProgress(f"{operation.scope} is in progress")
+                raise self._state_error(
+                    RunWorkflowOperationInProgress, context.run, context.step,
+                    "OPERATION_IN_PROGRESS", f"{operation.scope} is in progress",
+                    operation, record.claim_generation,
+                )
             if record.status is IdempotencyStatus.FAILED:
+                scheduled = self._schedule_retry(context, operation, None)
+                if scheduled is not None:
+                    raise _RetryScheduled(scheduled)
                 self._escalate(context, "OPERATION_FAILED", f"{operation.scope} previously failed")
-                raise RunWorkflowStepEscalatedError(f"{operation.scope} previously failed")
+                raise self._state_error(
+                    RunWorkflowStepEscalatedError, context.run, context.step,
+                    "OPERATION_FAILED", f"{operation.scope} previously failed",
+                    operation, record.claim_generation,
+                )
+        replayed = record is not None and record.status is IdempotencyStatus.COMPLETED
         try:
             # A completed record is deliberately replayed through the owning
             # service.  Status alone is not a durable semantic proof.
             operation.invoke()
         except self._claim_state_errors() as error:
-            self._reconcile_claim_state_error(context, operation, error)
+            return self._reconcile_claim_state_error(context, operation, error)
+        return replayed
 
-    def _complete_stage(self, context: _StageContext) -> RunWorkflowResult:
+    def _run_retry_operation(self, context: _StageContext, operation: _Operation) -> None:
+        """Run the owning service's restricted failed-operation reopen path."""
+        generation = context.step.retry_from_claim_generation
+        if generation is None or context.step.retry_operation_scope != operation.scope:
+            raise RunWorkflowGraphIntegrityError("retry RunStep provenance does not match operation")
+        if operation.scope in {_FACT_SCOPE, _UPDATE_FACT_SCOPE}:
+            self._extract_facts._retry_after_failed_from_workflow(
+                ExtractRunFactsCommand(context.run.run_id), expected_failed_generation=generation,
+            )
+        elif operation.scope == _CONTRADICTION_SCOPE:
+            self._detect_contradictions._retry_after_failed_from_workflow(
+                DetectRunContradictionsCommand(context.run.run_id), expected_failed_generation=generation,
+            )
+        elif operation.scope == _RULE_SCOPE:
+            self._evaluate_rules._retry_after_failed_from_workflow(
+                EvaluateRunRulesCommand(context.run.run_id), expected_failed_generation=generation,
+            )
+        else:
+            raise RunWorkflowGraphIntegrityError("retry operation is not provider-backed")
+
+    def _operation_for_failure(self, context: _StageContext) -> _Operation:
+        if context.step.stage is RunStage.UNDERSTAND:
+            return self._fact_extraction_operation(context.run)
+        if context.step.stage is RunStage.EXAMINE:
+            # Provider exceptions are raised by the operation most recently
+            # invoked.  Its durable failed identity is authoritative.
+            with self._connection_pool.connection() as connection:
+                repository = IdempotencyRepository(connection)
+                contradiction = self._contradiction_operation(context.run)
+                record = repository.get(contradiction.scope, contradiction.key)
+                if record is not None and record.status is IdempotencyStatus.FAILED:
+                    return contradiction
+            return self._rule_evaluation_operation(context.run)
+        raise RunWorkflowGraphIntegrityError("stage has no retryable provider operation")
+
+    def _retry_operation_for_context(self, context: _StageContext) -> _Operation | None:
+        if context.step.stage is RunStage.INGEST and context.run.run_type is RunType.UPDATE:
+            return self._preparation_operation(context.run)
+        if context.step.stage in {RunStage.UNDERSTAND, RunStage.EXAMINE}:
+            return self._operation_for_failure(context)
+        return None
+
+    def _schedule_retry(
+        self,
+        context: _StageContext,
+        operation: _Operation,
+        error: Exception | None,
+    ) -> RunWorkflowResult | None:
+        """Close one failed semantic attempt and materialize its successor."""
+        with self._connection_pool.connection() as connection:
+            run = RunRepository(connection).get_for_update(context.run.run_id)
+            if run is None:
+                raise RunWorkflowRunNotFoundError(f"run {context.run.run_id} does not exist")
+            steps = RunStepRepository(connection)
+            step = steps.get_for_run_stage_attempt(run.run_id, context.step.stage, context.step.attempt)
+            if step is None:
+                raise RunWorkflowGraphIntegrityError("active step changed before retry scheduling")
+            if step.status is RunStepStatus.RETRYING:
+                successor = steps.get_for_run_stage_attempt(
+                    run.run_id,
+                    step.stage,
+                    step.attempt + 1,
+                )
+                if successor is None:
+                    raise RunWorkflowGraphIntegrityError("RETRYING attempt has no successor")
+                return RunWorkflowResult(
+                    run.run_id,
+                    step.stage,
+                    step,
+                    run.status,
+                    RunWorkflowOutcome.RETRY_SCHEDULED,
+                    advanced=False,
+                    successor_attempt=successor.attempt,
+                )
+            if step.status is not RunStepStatus.RUNNING:
+                raise RunWorkflowGraphIntegrityError("active step changed before retry scheduling")
+            record = IdempotencyRepository(connection).get(operation.scope, operation.key)
+            retryable = (
+                record is not None
+                and record.status is IdempotencyStatus.FAILED
+                and record.failure_kind is not None
+            )
+            if not retryable:
+                return None
+            assert record is not None and record.failure_kind is not None
+            if step.attempt >= 3:
+                updated = steps.update_execution_state(
+                    step.step_id, RunStepStatus.ESCALATED, mark_completed=True,
+                    error_code=record.failure_kind.value,
+                    error_message=f"retry budget exhausted for {operation.scope}/{operation.key}",
+                )
+                assert updated is not None
+                RunMetricRepository(connection).create_for_closed_step(run.run_id, updated.stage, updated.attempt)
+                connection.commit()
+                raise self._state_error(
+                    RunWorkflowStepEscalatedError, run, updated,
+                    record.failure_kind.value, "retry budget exhausted", operation,
+                    record.claim_generation,
+                )
+            updated = steps.update_execution_state(
+                step.step_id, RunStepStatus.RETRYING, mark_completed=True,
+                error_code=record.failure_kind.value,
+                error_message=(
+                    f"retry scheduled after {record.failure_kind.value} for "
+                    f"{operation.scope}/{operation.key} generation {record.claim_generation}"
+                ),
+            )
+            assert updated is not None
+            RunMetricRepository(connection).create_for_closed_step(run.run_id, updated.stage, updated.attempt)
+            successor = steps.create(
+                run.run_id, step.stage, step.attempt + 1,
+                retry_operation_scope=operation.scope,
+                retry_operation_key=operation.key,
+                retry_from_claim_generation=record.claim_generation,
+            )
+            connection.commit()
+            return RunWorkflowResult(
+                run.run_id, updated.stage, updated, run.status,
+                RunWorkflowOutcome.RETRY_SCHEDULED, advanced=False,
+                successor_attempt=successor.attempt,
+            )
+
+    def _complete_stage(
+        self,
+        context: _StageContext,
+        outcome: RunWorkflowOutcome = RunWorkflowOutcome.COMPLETED,
+    ) -> RunWorkflowResult:
         with self._connection_pool.connection() as connection:
             runs = RunRepository(connection)
             run = runs.get_for_update(context.run.run_id)
             if run is None:
                 raise RunWorkflowRunNotFoundError(f"run {context.run.run_id} does not exist")
             steps = RunStepRepository(connection)
-            step = steps.get_for_run_stage_attempt(run.run_id, context.step.stage, 1)
+            step = steps.get_for_run_stage_attempt(run.run_id, context.step.stage, context.step.attempt)
             if step is None or step.status is not RunStepStatus.RUNNING:
                 raise RunWorkflowGraphIntegrityError("active step changed before completion")
             self._verify_stage_proof(connection, run, step.stage)
@@ -434,8 +682,12 @@ class RunWorkflowService:
                 clear_error=True,
             )
             assert step is not None
+            RunMetricRepository(connection).create_for_closed_step(run.run_id, step.stage, step.attempt)
             connection.commit()
-            return RunWorkflowResult(run.run_id, step.stage, step, run.status, advanced=True)
+            return RunWorkflowResult(
+                run.run_id, step.stage, step, run.status,
+                outcome, advanced=True,
+            )
 
     def _complete_review(self, context: _StageContext) -> None:
         # Every upstream service owns exact replay and result-reference
@@ -530,7 +782,7 @@ class RunWorkflowService:
             step = RunStepRepository(connection).get_for_run_stage_attempt(
                 run.run_id,
                 context.step.stage,
-                1,
+                context.step.attempt,
             )
             if step is None or step.status is not RunStepStatus.RUNNING:
                 raise RunWorkflowGraphIntegrityError("active step changed before failure handling")
@@ -542,6 +794,9 @@ class RunWorkflowService:
                 error_message=message,
             )
             assert updated is not None
+            RunMetricRepository(connection).create_for_closed_step(
+                run.run_id, updated.stage, updated.attempt,
+            )
             if fail_run:
                 updated_run = runs.update_status(run.run_id, RunStatus.FAILED)
                 assert updated_run is not None
@@ -571,9 +826,14 @@ class RunWorkflowService:
                     str(error),
                 )
                 connection.commit()
-                raise RunWorkflowAwaitingUpstream(str(error))
+                raise self._state_error(
+                    RunWorkflowAwaitingUpstream, run, step, "TRIGGER_PENDING", str(error),
+                )
         self._fail_run(context, type(error).__name__, str(error))
-        raise RunWorkflowRunFailedError(str(error))
+        raise self._state_error(
+            RunWorkflowRunFailedError, context.run, context.step,
+            type(error).__name__, str(error),
+        )
 
     def _update_is_ready_to_resume(self, connection: Connection, run: RunRecord) -> bool:
         """Return true only when fixed UPDATE prerequisites are now complete.
@@ -635,7 +895,7 @@ class RunWorkflowService:
         context: _StageContext,
         operation: _Operation,
         error: Exception,
-    ) -> None:
+    ) -> bool:
         with self._connection_pool.connection() as connection:
             record = IdempotencyRepository(connection).get(operation.scope, operation.key)
         if record is not None and record.status is IdempotencyStatus.COMPLETED:
@@ -643,12 +903,21 @@ class RunWorkflowService:
             # worker observed claim loss or drift.  Validate the exact replay
             # before treating that race as success.
             operation.invoke()
-            return
+            return True
         if record is not None and record.status is IdempotencyStatus.IN_PROGRESS:
-            raise RunWorkflowOperationInProgress(str(error))
+            raise self._state_error(
+                RunWorkflowOperationInProgress, context.run, context.step,
+                "OPERATION_IN_PROGRESS", str(error), operation, record.claim_generation,
+            )
         if record is not None and record.status is IdempotencyStatus.FAILED:
+            scheduled = self._schedule_retry(context, operation, error)
+            if scheduled is not None:
+                raise _RetryScheduled(scheduled)
             self._escalate(context, "OPERATION_FAILED", str(error))
-            raise RunWorkflowStepEscalatedError(str(error))
+            raise self._state_error(
+                RunWorkflowStepEscalatedError, context.run, context.step,
+                "OPERATION_FAILED", str(error), operation, record.claim_generation,
+            )
         raise RunWorkflowGraphIntegrityError(str(error))
 
     def _preparation_operation(self, run: RunRecord) -> _Operation:
@@ -696,7 +965,7 @@ class RunWorkflowService:
             step = RunStepRepository(connection).get_for_run_stage_attempt(
                 run.run_id,
                 context.step.stage,
-                1,
+                context.step.attempt,
             )
             expected_status = (
                 RunStatus.PENDING if context.step.stage is RunStage.INGEST else RunStatus.RUNNING
@@ -737,7 +1006,7 @@ class RunWorkflowService:
         return updated
 
     def _next_step(self, steps: list[RunStepRecord]) -> RunStepRecord | None:
-        by_stage = {step.stage: step for step in steps}
+        by_stage = self._latest_steps(steps)
         for stage in _STAGES:
             step = by_stage[stage]
             if step.status is not RunStepStatus.COMPLETED:
@@ -745,11 +1014,15 @@ class RunWorkflowService:
         return None
 
     def _validate_graph(self, steps: list[RunStepRecord]) -> None:
-        if len(steps) != len(_STAGES):
-            raise RunWorkflowGraphIntegrityError("workflow graph must contain exactly four steps")
-        by_stage = {step.stage: step for step in steps}
-        if set(by_stage) != set(_STAGES) or any(step.attempt != 1 for step in steps):
-            raise RunWorkflowGraphIntegrityError("workflow graph has unexpected stages or attempts")
+        if not steps:
+            raise RunWorkflowGraphIntegrityError("workflow graph is absent")
+        by_stage = self._latest_steps(steps)
+        if set(by_stage) != set(_STAGES):
+            raise RunWorkflowGraphIntegrityError("workflow graph has unexpected stages")
+        for stage in _STAGES:
+            attempts = sorted(item.attempt for item in steps if item.stage is stage)
+            if not attempts or attempts != list(range(1, max(attempts) + 1)) or max(attempts) > 3:
+                raise RunWorkflowGraphIntegrityError("workflow graph has non-contiguous attempts")
         seen_incomplete = False
         for stage in _STAGES:
             step = by_stage[stage]
@@ -757,6 +1030,14 @@ class RunWorkflowService:
                 raise RunWorkflowGraphIntegrityError("downstream stage cannot be active")
             if step.status is not RunStepStatus.COMPLETED:
                 seen_incomplete = True
+
+    @staticmethod
+    def _latest_steps(steps: list[RunStepRecord]) -> dict[RunStage, RunStepRecord]:
+        latest: dict[RunStage, RunStepRecord] = {}
+        for step in steps:
+            if step.stage not in latest or step.attempt > latest[step.stage].attempt:
+                latest[step.stage] = step
+        return latest
 
     @staticmethod
     def _correctable_scope_errors():

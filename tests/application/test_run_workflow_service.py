@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from threading import Event, Thread
+from threading import Barrier, Event, Thread
 from uuid import uuid4
 
 import pytest
@@ -42,6 +42,7 @@ from api.application.run_workflow_service import (
     RunWorkflowCommand,
     RunWorkflowGraphIntegrityError,
     RunWorkflowOperationInProgress,
+    RunWorkflowOutcome,
     RunWorkflowRuleScopeSelectionRequired,
     RunWorkflowRunFailedError,
     RunWorkflowService,
@@ -834,6 +835,8 @@ def test_completed_understand_replays_real_service_without_second_provider_call(
 
     assert result.stage is RunStage.UNDERSTAND
     assert result.step.status is RunStepStatus.COMPLETED
+    assert result.outcome is RunWorkflowOutcome.REPLAYED
+    assert result.advanced is True
     assert provider.calls == 1
 
 
@@ -1117,8 +1120,16 @@ def test_in_progress_operation_leaves_running_step_unchanged() -> None:
         IdempotencyRepository(connection).claim("fact-extraction-v1", f"understand:{run_id}")
         connection.commit()
 
-    with pytest.raises(RunWorkflowOperationInProgress):
+    with pytest.raises(RunWorkflowOperationInProgress) as raised:
         service.advance(command)
+
+    error = raised.value
+    assert (error.run_id, error.stage, error.attempt, error.error_code) == (
+        run_id, RunStage.UNDERSTAND, 1, "OPERATION_IN_PROGRESS",
+    )
+    assert error.operation_scope == "fact-extraction-v1"
+    assert error.operation_key == f"understand:{run_id}"
+    assert error.claim_generation == 1
 
     with pool.connection() as connection:
         step = RunStepRepository(connection).get_for_run_stage_attempt(run_id, RunStage.UNDERSTAND, 1)
@@ -1790,8 +1801,16 @@ def _real_manual_ready_for_understand(
     return created, workflow, command, extraction_provider, contradiction_provider, rule_provider
 
 
-def _real_manual_ready_for_examine():
-    created, workflow, command, extraction, contradiction, rules = _real_manual_ready_for_understand()
+def _real_manual_ready_for_examine(
+    extraction_provider=None,
+    contradiction_provider=None,
+    rule_provider=None,
+):
+    created, workflow, command, extraction, contradiction, rules = _real_manual_ready_for_understand(
+        extraction_provider,
+        contradiction_provider,
+        rule_provider,
+    )
     workflow.advance(command)
     return created, workflow, command, extraction, contradiction, rules
 
@@ -2017,8 +2036,16 @@ def test_blocked_update_first_and_repeated_advance_are_stable() -> None:
         (resources.rule_id,),
     )
 
-    with pytest.raises(RunWorkflowAwaitingUpstream):
+    with pytest.raises(RunWorkflowAwaitingUpstream) as raised:
         workflow.advance(command)
+
+    error = raised.value
+    assert (error.run_id, error.stage, error.attempt, error.error_code) == (
+        resources.update_run_id, RunStage.INGEST, 1, "RUN_BLOCKED",
+    )
+    assert error.operation_scope is None
+    assert error.operation_key is None
+    assert error.claim_generation is None
 
     with pool.connection() as connection:
         first_run = RunRepository(connection).get_by_id(resources.update_run_id)
@@ -2804,7 +2831,7 @@ def test_workflow_rejects_malformed_completed_rule_reference() -> None:
     assert len(rule_provider.calls) == 1
 
 
-def test_provider_failure_escalates_active_step_without_failing_run() -> None:
+def test_provider_failure_schedules_explicit_retry_without_failing_run() -> None:
     created = _create_real_initial_or_manual_run("MANUAL")
     extraction_provider = _CapturingFactProvider(fail=True)
     workflow = _real_services_for_run(
@@ -2815,8 +2842,7 @@ def test_provider_failure_escalates_active_step_without_failing_run() -> None:
     command = RunWorkflowCommand(created.run_id, (created.rule_set_id,), (created.rule_id,))
     workflow.advance(command)
 
-    with pytest.raises(RunWorkflowStepEscalatedError):
-        workflow.advance(command)
+    result = workflow.advance(command)
 
     with pool.connection() as connection:
         run = RunRepository(connection).get_by_id(created.run_id)
@@ -2830,9 +2856,264 @@ def test_provider_failure_escalates_active_step_without_failing_run() -> None:
             f"understand:{created.run_id}",
         )
     assert run is not None and run.status is RunStatus.RUNNING
-    assert step is not None and step.status is RunStepStatus.ESCALATED
+    assert result.outcome.value == "RETRY_SCHEDULED"
+    assert step is not None and step.status is RunStepStatus.RETRYING
     assert record is not None and record.status is IdempotencyStatus.FAILED
     assert len(extraction_provider.calls) == 1
+
+
+def test_pending_retry_successor_starts_and_reopens_only_through_workflow() -> None:
+    created = _create_real_initial_or_manual_run("MANUAL")
+    extraction_provider = _CapturingFactProvider(fail=True)
+    workflow = _real_services_for_run(
+        extraction_provider, _CapturingContradictionProvider(), _CapturingRuleProvider(),
+    )
+    command = RunWorkflowCommand(created.run_id, (created.rule_set_id,), (created.rule_id,))
+    workflow.advance(command)
+    scheduled = workflow.advance(command)
+    assert scheduled.outcome.value == "RETRY_SCHEDULED"
+
+    extraction_provider.fail = False
+    # Crash/restart recovery consults the durable FAILED row and successor
+    # provenance; it does not depend on the original workflow instance.
+    restarted_workflow = _real_services_for_run(
+        extraction_provider,
+        _CapturingContradictionProvider(),
+        _CapturingRuleProvider(),
+    )
+    completed = restarted_workflow.advance(command)
+
+    with pool.connection() as connection:
+        first = RunStepRepository(connection).get_for_run_stage_attempt(created.run_id, RunStage.UNDERSTAND, 1)
+        second = RunStepRepository(connection).get_for_run_stage_attempt(created.run_id, RunStage.UNDERSTAND, 2)
+        record = IdempotencyRepository(connection).get("fact-extraction-v1", f"understand:{created.run_id}")
+    assert completed.advanced is True
+    assert first is not None and first.status is RunStepStatus.RETRYING
+    assert first.error_code == "RETRYABLE_PROVIDER_FAILURE"
+    assert second is not None and second.status is RunStepStatus.COMPLETED
+    assert second.retry_from_claim_generation == 1
+    assert record is not None and record.status is IdempotencyStatus.COMPLETED
+    assert record.claim_generation == 2
+    assert len(extraction_provider.calls) == 2
+
+
+def test_update_retry_keeps_carried_state_and_persists_only_authoritative_created_fact() -> None:
+    resources = _create_real_update_workflow_fixture()
+    extraction = _CapturingFactProvider(create_trigger_fact=True, fail=True)
+    workflow = _real_services_for_run(
+        extraction,
+        _CapturingContradictionProvider(),
+        _CapturingRuleProvider(),
+    )
+    command = RunWorkflowCommand(
+        resources.update_run_id,
+        (resources.rule_set_id,),
+        (resources.rule_id,),
+    )
+    workflow.advance(command)
+    scheduled = workflow.advance(command)
+    assert scheduled.outcome is RunWorkflowOutcome.RETRY_SCHEDULED
+
+    with pool.connection() as connection:
+        carried_before = FactRepository(connection).get_by_id(resources.carried_fact_id)
+        carried_evidence_before = FactEvidenceRepository(connection).list_for_fact(
+            resources.carried_fact_id,
+        )
+    assert carried_before is not None
+
+    extraction.fail = False
+    completed = workflow.advance(command)
+    assert completed.outcome is RunWorkflowOutcome.COMPLETED
+    with pool.connection() as connection:
+        carried_after = FactRepository(connection).get_by_id(resources.carried_fact_id)
+        carried_evidence_after = FactEvidenceRepository(connection).list_for_fact(
+            resources.carried_fact_id,
+        )
+        memberships = RunFactRepository(connection).list_for_run(resources.update_run_id)
+    assert carried_after == carried_before
+    assert carried_evidence_after == carried_evidence_before
+    assert {(item.fact_id, item.relation) for item in memberships} == {
+        (resources.carried_fact_id, RunMembershipRelation.CARRIED_FORWARD),
+        next(
+            (item.fact_id, RunMembershipRelation.CREATED)
+            for item in memberships
+            if item.relation is RunMembershipRelation.CREATED
+        ),
+    }
+    assert len(extraction.calls) == 2
+
+
+def test_concurrent_retry_scheduling_creates_one_successor_and_one_predecessor_metric() -> None:
+    created, workflow, command, extraction, contradiction, rules = _real_manual_ready_for_understand(
+        extraction_provider=_CapturingFactProvider(fail=True),
+    )
+    # The durable provider failure occurs outside the workflow so both workers
+    # begin from the same RUNNING attempt plus the same FAILED operation.
+    with pytest.raises(FactExtractionApplicationError):
+        workflow._extract_facts.extract(ExtractRunFactsCommand(created.run_id))
+    extraction.fail = False
+    first = _real_services_for_run(extraction, contradiction, rules)
+    second = _real_services_for_run(extraction, contradiction, rules)
+    barrier = Barrier(2)
+    results: list[object] = []
+    errors: list[Exception] = []
+
+    def advance(worker: RunWorkflowService) -> None:
+        try:
+            barrier.wait(timeout=5)
+            results.append(worker.advance(command))
+        except Exception as error:  # noqa: BLE001 - surface any worker failure in this test
+            errors.append(error)
+
+    workers = (Thread(target=advance, args=(first,)), Thread(target=advance, args=(second,)))
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    assert len(results) == 2
+
+    with pool.connection() as connection:
+        attempts = [
+            step
+            for step in RunStepRepository(connection).list_for_run(created.run_id)
+            if step.stage is RunStage.UNDERSTAND
+        ]
+        metrics = connection.execute(
+            """SELECT count(*) FROM run_metrics
+               WHERE run_id = %s::uuid AND stage = 'UNDERSTAND'::run_stage AND attempt = 1""",
+            (created.run_id,),
+        ).fetchone()
+    assert [step.attempt for step in attempts] == [1, 2]
+    assert attempts[0].status is RunStepStatus.RETRYING
+    assert attempts[1].status is RunStepStatus.PENDING
+    assert metrics == (1,)
+    assert len(extraction.calls) == 1  # both workers only observed the durable schedule
+
+
+def test_retry_budget_closes_three_attempts_with_truthful_metrics_and_metadata() -> None:
+    """A retryable service failure consumes semantic attempts, never generations."""
+    created = _create_real_initial_or_manual_run("MANUAL")
+    extraction = _CapturingFactProvider(fail=True)
+    workflow = _real_services_for_run(
+        extraction, _CapturingContradictionProvider(), _CapturingRuleProvider(),
+    )
+    command = RunWorkflowCommand(created.run_id, (created.rule_set_id,), (created.rule_id,))
+    workflow.advance(command)
+
+    first = workflow.advance(command)
+    second = workflow.advance(command)
+    assert first.outcome.value == "RETRY_SCHEDULED"
+    assert second.outcome.value == "RETRY_SCHEDULED"
+    assert first.advanced is False and first.successor_attempt == 2
+    assert second.advanced is False and second.successor_attempt == 3
+
+    with pytest.raises(RunWorkflowStepEscalatedError) as exhausted:
+        workflow.advance(command)
+    error = exhausted.value
+    assert (error.run_id, error.stage, error.attempt, error.error_code) == (
+        created.run_id,
+        RunStage.UNDERSTAND,
+        3,
+        "RETRYABLE_PROVIDER_FAILURE",
+    )
+    assert error.operation_scope == "fact-extraction-v1"
+    assert error.operation_key == f"understand:{created.run_id}"
+    assert error.claim_generation == 3
+
+    with pytest.raises(RunWorkflowStepEscalatedError) as restarted:
+        workflow.advance(command)
+    assert restarted.value.attempt == 3
+    assert restarted.value.error_code == "RETRYABLE_PROVIDER_FAILURE"
+
+    with pool.connection() as connection:
+        steps = RunStepRepository(connection).list_for_run(created.run_id)
+        metrics = connection.execute(
+            """SELECT attempt, duration_ms FROM run_metrics
+               WHERE run_id = %s::uuid AND stage = 'UNDERSTAND'::run_stage
+               ORDER BY attempt""",
+            (created.run_id,),
+        ).fetchall()
+        run = RunRepository(connection).get_by_id(created.run_id)
+    understand = [step for step in steps if step.stage is RunStage.UNDERSTAND]
+    assert [step.status for step in understand] == [
+        RunStepStatus.RETRYING,
+        RunStepStatus.RETRYING,
+        RunStepStatus.ESCALATED,
+    ]
+    assert [step.error_code for step in understand] == ["RETRYABLE_PROVIDER_FAILURE"] * 3
+    assert len(metrics) == 3 and all(int(metric[1]) >= 0 for metric in metrics)
+    assert run is not None and run.status is RunStatus.RUNNING
+    assert len(extraction.calls) == 3
+    assert not any(step.attempt > 3 for step in steps)
+
+
+def test_examine_retry_replays_completed_contradiction_and_reopens_only_rules() -> None:
+    created, workflow, command, _extraction, contradiction, rules = _real_manual_ready_for_examine()
+    workflow._detect_contradictions.detect(DetectRunContradictionsCommand(created.run_id))
+    rules.fail = True
+
+    scheduled = workflow.advance(command)
+    assert scheduled.outcome.value == "RETRY_SCHEDULED"
+    assert len(contradiction.calls) == 1
+    assert len(rules.calls) == 1
+
+    rules.fail = False
+    completed = workflow.advance(command)
+    assert completed.advanced is True
+
+    with pool.connection() as connection:
+        first = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+        second = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 2,
+        )
+    assert first is not None and first.status is RunStepStatus.RETRYING
+    assert first.retry_operation_scope is None
+    assert second is not None and second.status is RunStepStatus.COMPLETED
+    assert second.retry_operation_scope == "rule-evaluation-v1"
+    assert len(contradiction.calls) == 1  # exact durable replay is provider-free
+    assert len(rules.calls) == 2
+
+
+def test_examine_retry_reopens_contradiction_then_schedules_rules_successor() -> None:
+    contradiction = _CapturingContradictionProvider(fail=True)
+    rules = _CapturingRuleProvider()
+    created, workflow, command, _extraction, contradiction, rules = _real_manual_ready_for_examine(
+        extraction_provider=_CapturingFactProvider(),
+        contradiction_provider=contradiction,
+        rule_provider=rules,
+    )
+
+    first = workflow.advance(command)
+    assert first.outcome.value == "RETRY_SCHEDULED"
+    assert len(contradiction.calls) == 1
+    assert rules.calls == []
+
+    contradiction.fail = False
+    rules.fail = True
+    second = workflow.advance(command)
+    assert second.outcome.value == "RETRY_SCHEDULED"
+
+    with pool.connection() as connection:
+        attempt_one = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 1,
+        )
+        attempt_two = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 2,
+        )
+        attempt_three = RunStepRepository(connection).get_for_run_stage_attempt(
+            created.run_id, RunStage.EXAMINE, 3,
+        )
+    assert attempt_one is not None and attempt_one.status is RunStepStatus.RETRYING
+    assert attempt_two is not None and attempt_two.status is RunStepStatus.RETRYING
+    assert attempt_two.retry_operation_scope == "contradiction-detection-v1"
+    assert attempt_three is not None and attempt_three.status is RunStepStatus.PENDING
+    assert attempt_three.retry_operation_scope == "rule-evaluation-v1"
+    assert len(contradiction.calls) == 2
+    assert len(rules.calls) == 1
 
 
 def test_preexisting_failed_operation_escalates_active_step_without_failing_run() -> None:
@@ -2841,8 +3122,15 @@ def test_preexisting_failed_operation_escalates_active_step_without_failing_run(
     )
     _mark_operation_failed("fact-extraction-v1", f"understand:{created.run_id}")
 
-    with pytest.raises(RunWorkflowStepEscalatedError):
+    with pytest.raises(RunWorkflowStepEscalatedError) as raised:
         workflow.advance(command)
+
+    error = raised.value
+    assert (error.run_id, error.stage, error.attempt, error.error_code) == (
+        created.run_id, RunStage.UNDERSTAND, 1, "OPERATION_FAILED",
+    )
+    assert error.operation_scope == "fact-extraction-v1"
+    assert error.operation_key == f"understand:{created.run_id}"
 
     with pool.connection() as connection:
         run = RunRepository(connection).get_by_id(created.run_id)
@@ -2875,8 +3163,19 @@ def test_invalid_update_baseline_fails_ingest_and_run() -> None:
         UpdatePreparationBaselineError("invalid baseline"),
     )
 
-    with pytest.raises(RunWorkflowRunFailedError):
+    with pytest.raises(RunWorkflowRunFailedError) as raised:
         workflow.advance(command)
+
+    error = raised.value
+    assert (error.run_id, error.stage, error.attempt, error.error_code) == (
+        run_id,
+        RunStage.INGEST,
+        1,
+        "UpdatePreparationBaselineError",
+    )
+    assert error.operation_scope == "update-preparation-v1"
+    assert error.operation_key == f"prepare-update:{run_id}"
+    assert error.claim_generation is None
 
     with pool.connection() as connection:
         run = RunRepository(connection).get_by_id(run_id)

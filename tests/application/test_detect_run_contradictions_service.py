@@ -32,7 +32,11 @@ from domain.fact import Fact, FactStatus
 from domain.run_membership import RunMembershipRelation
 from repositories.fact_evidence_repository import FactEvidenceRepository
 from repositories.fact_repository import FactRepository
-from repositories.idempotency_repository import IdempotencyRepository, IdempotencyStatus
+from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
+    IdempotencyRepository,
+    IdempotencyStatus,
+)
 from repositories.run_fact_repository import RunFactRepository
 from repositories.run_repository import RunRepository
 from services.contradiction_detection_provider import ContradictionDetectionProviderError
@@ -384,6 +388,27 @@ def test_provider_failure_marks_claim_failed_without_findings(resources: Resourc
     assert finding_count(resources) == 0
     record = detection_record(resources)
     assert record is not None and record.status is IdempotencyStatus.FAILED
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
+
+
+def test_normal_failed_retryable_detection_never_reopens_without_workflow(resources: Resources) -> None:
+    with pool.connection() as connection:
+        claimed = IdempotencyRepository(connection).claim(
+            "contradiction-detection-v1", f"examine-contradictions:{resources.run_id}",
+        )
+        assert claimed is not None
+        IdempotencyRepository(connection).mark_failed(
+            claimed.scope, claimed.key, claimed.claim_generation,
+            IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE,
+        )
+        connection.commit()
+    provider = FakeProvider(response_for(resources))
+    with pytest.raises(ContradictionDetectionPreviouslyFailedError):
+        service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+    record = detection_record(resources)
+    assert provider.calls == []
+    assert record is not None and record.claim_generation == claimed.claim_generation
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE
 
 
 def test_fresh_detection_requires_running_but_completed_replays(resources: Resources) -> None:
@@ -635,6 +660,7 @@ def test_invalid_provider_pair_marks_claim_failed_without_findings(resources: Re
     assert finding_count(resources) == 0
     record = detection_record(resources)
     assert record is not None and record.status is IdempotencyStatus.FAILED
+    assert record.failure_kind is IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE
 
 
 def test_stale_claim_token_rolls_back_staged_findings(resources: Resources) -> None:

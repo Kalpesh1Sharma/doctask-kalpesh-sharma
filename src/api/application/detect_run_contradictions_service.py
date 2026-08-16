@@ -33,6 +33,7 @@ from domain.run_membership import RunMembershipRelation
 from repositories.finding_evidence_repository import FindingEvidenceRepository
 from repositories.finding_repository import FindingRepository
 from repositories.idempotency_repository import (
+    IdempotencyFailureKind,
     IdempotencyRecord,
     IdempotencyRepository,
     IdempotencyStatus,
@@ -158,19 +159,25 @@ class DetectRunContradictionsService:
         if isinstance(claimed, DetectRunContradictionsResult):
             return claimed
 
+        return self._execute_claimed(claimed)
+
+    def _execute_claimed(self, claimed: _ClaimedOperation) -> DetectRunContradictionsResult:
         try:
             response = self._provider.detect(claimed.request)
             finding_plans = self._build_finding_plans(claimed.request, response)
+        except InvalidContradictionDetectionResponseError:
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
+            raise
         except ContradictionDetectionApplicationError:
             self._mark_failed(claimed)
             raise
         except ContradictionDetectionProviderError as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise ContradictionDetectionProviderFailure(
                 "contradiction detection provider failed",
             ) from error
         except Exception as error:
-            self._mark_failed(claimed)
+            self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise ContradictionDetectionProviderFailure(
                 "contradiction detection provider failed",
             ) from error
@@ -181,6 +188,36 @@ class DetectRunContradictionsService:
             input_fingerprint=claimed.input_fingerprint,
             replayed=False,
         )
+
+    def _retry_after_failed_from_workflow(
+        self,
+        command: DetectRunContradictionsCommand,
+        *,
+        expected_failed_generation: int,
+    ) -> DetectRunContradictionsResult:
+        run_id = self._normalize_run_id(command.run_id)
+        with self._connection_pool.connection() as connection:
+            run = RunRepository(connection).get_for_update(run_id)
+            if run is None:
+                raise ContradictionDetectionRunNotFoundError(f"run {run_id} does not exist")
+            repository = IdempotencyRepository(connection)
+            failed = repository.get(_IDEMPOTENCY_SCOPE, self._idempotency_key(run_id))
+            if (
+                failed is None or failed.status is not IdempotencyStatus.FAILED
+                or failed.claim_generation != expected_failed_generation or failed.failure_kind is None
+            ):
+                return self._resolve_authoritative_existing(connection, run, repository)
+            if run.status is not RunStatus.RUNNING:
+                raise ContradictionDetectionRunNotEligibleError("run is not running contradiction detection")
+            request = self._load_request(connection, run_id)
+            fingerprint = contradiction_detection_input_fingerprint(request)
+            reopened = repository.reopen_failed(
+                _IDEMPOTENCY_SCOPE, self._idempotency_key(run_id), expected_failed_generation, failed.failure_kind,
+            )
+            if reopened is None:
+                return self._resolve_authoritative_existing(connection, run, repository)
+            connection.commit()
+        return self._execute_claimed(_ClaimedOperation(request, fingerprint, reopened.claim_generation))
 
     def _claim_or_replay(
         self,
@@ -338,7 +375,11 @@ class DetectRunContradictionsService:
         if completed is None:
             raise ContradictionClaimLostError("contradiction detection claim is no longer owned")
 
-    def _mark_failed(self, claimed: _ClaimedOperation) -> None:
+    def _mark_failed(
+        self,
+        claimed: _ClaimedOperation,
+        failure_kind: IdempotencyFailureKind | None = None,
+    ) -> None:
         for attempt in range(_MAX_TRANSACTION_ATTEMPTS):
             try:
                 with self._connection_pool.connection() as connection:
@@ -346,6 +387,7 @@ class DetectRunContradictionsService:
                         _IDEMPOTENCY_SCOPE,
                         self._idempotency_key(claimed.request.run_id),
                         claimed.claim_token,
+                        failure_kind,
                     )
                     if failed is None:
                         raise ContradictionClaimLostError("contradiction detection claim is no longer owned")

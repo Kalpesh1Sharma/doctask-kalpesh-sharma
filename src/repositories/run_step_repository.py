@@ -16,6 +16,9 @@ _RUN_STEP_COLUMNS = """
     completed_at,
     error_code,
     error_message,
+    retry_operation_scope,
+    retry_operation_key,
+    retry_from_claim_generation,
     created_at
 """
 
@@ -35,6 +38,9 @@ class RunStepRecord:
     completed_at: datetime | None
     error_code: str | None
     error_message: str | None
+    retry_operation_scope: str | None
+    retry_operation_key: str | None
+    retry_from_claim_generation: int | None
     created_at: datetime
 
     @classmethod
@@ -49,7 +55,10 @@ class RunStepRecord:
             completed_at=cast(datetime | None, row[6]),
             error_code=_optional_string(row[7]),
             error_message=_optional_string(row[8]),
-            created_at=cast(datetime, row[9]),
+            retry_operation_scope=_optional_string(row[9]),
+            retry_operation_key=_optional_string(row[10]),
+            retry_from_claim_generation=cast(int | None, row[11]),
+            created_at=cast(datetime, row[12]),
         )
 
 
@@ -62,18 +71,25 @@ class RunStepRepository:
         run_id: str,
         stage: RunStage,
         attempt: int,
+        *,
+        retry_operation_scope: str | None = None,
+        retry_operation_key: str | None = None,
+        retry_from_claim_generation: int | None = None,
     ) -> RunStepRecord:
         row = self._connection.execute(
             f"""
             INSERT INTO run_steps (
                 run_id,
                 stage,
-                attempt
+                attempt,
+                retry_operation_scope,
+                retry_operation_key,
+                retry_from_claim_generation
             )
-            VALUES (%s::uuid, %s::run_stage, %s)
+            VALUES (%s::uuid, %s::run_stage, %s, %s, %s, %s)
             RETURNING {_RUN_STEP_COLUMNS}
             """,
-            (run_id, stage.value, attempt),
+            (run_id, stage.value, attempt, retry_operation_scope, retry_operation_key, retry_from_claim_generation),
         ).fetchone()
 
         assert row is not None
@@ -167,7 +183,10 @@ class RunStepRepository:
                     ELSE started_at
                 END,
                 completed_at = CASE
-                    WHEN %s THEN COALESCE(completed_at, clock_timestamp())
+                    WHEN %s THEN COALESCE(
+                        completed_at,
+                        GREATEST(clock_timestamp(), started_at)
+                    )
                     ELSE completed_at
                 END,
                 error_code = CASE

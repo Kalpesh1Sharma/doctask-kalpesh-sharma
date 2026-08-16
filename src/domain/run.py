@@ -93,9 +93,9 @@ VALID_RUN_STEP_TRANSITIONS: dict[RunStepStatus, set[RunStepStatus]] = {
     RunStepStatus.AWAITING_UPSTREAM: {
         RunStepStatus.RUNNING,
     },
-    RunStepStatus.RETRYING: {
-        RunStepStatus.RUNNING,
-    },
+    # Phase 5C makes RETRYING a closed historical attempt.  Its successor is
+    # a distinct RunStep attempt rather than a transition back to RUNNING.
+    RunStepStatus.RETRYING: set(),
     RunStepStatus.COMPLETED: set(),
     RunStepStatus.SKIPPED: set(),
     RunStepStatus.ESCALATED: set(),
