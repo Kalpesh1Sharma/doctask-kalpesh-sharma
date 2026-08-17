@@ -1,0 +1,22 @@
+# Final Report
+
+## Metadata
+- run_id: "a00e640a-03f0-4a89-8de6-d89393236536"
+- renderer_version: "markdown-v1"
+- render_input_format: "render-input-v1"
+
+## Source Versions
+- document_id: "467f9014-b13a-4457-b901-a5eba1a32b8f"; version: 1; document_version_id: "f62d224e-afe7-4ca3-a21e-005c29459d23"; content_hash: "sha256:7ad0a5509c324b12972dfec780b11f04"
+- document_id: "cf634d4e-4be3-4f36-a029-1545cbf587ad"; version: 1; document_version_id: "8eba93bd-fe89-465c-8aec-e8af0bee084d"; content_hash: "sha256:b95d290525934c138ff1bf2ae1be95db"
+
+## Confirmed Facts
+- fact_id: "597d555e-b556-46b4-a2d9-632216da3f2f"; provenance: "CREATED"; subject: "contract"; predicate: "notice_days"; object: {"days":30}; origin_run_id: "a00e640a-03f0-4a89-8de6-d89393236536"; evidence_span_ids: ["f01b5714-3a20-43b6-8851-b8c98dda38d6"]
+
+## Disputed Facts
+
+## Approved Findings
+
+## Rejected Review Records
+
+## Citations
+- evidence_span_id: "f01b5714-3a20-43b6-8851-b8c98dda38d6"; document_version_id: "f62d224e-afe7-4ca3-a21e-005c29459d23"; chunk_id: "b3ccd452-f020-41ad-80ea-6870ca84cc39"; page_number: null; start_offset: 0; end_offset: 8; quoted_text: "retained"; content_hash: "sha256:ca67bd59cc4116ac80db5f64cbf4747f26ba929c85e8cc689a6123368d08719b"

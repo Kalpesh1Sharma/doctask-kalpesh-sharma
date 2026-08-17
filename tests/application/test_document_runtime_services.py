@@ -489,6 +489,136 @@ def test_concurrent_different_content_allocates_contiguous_unique_version_number
     assert identities == (2,)
 
 
+def test_out_of_order_full_ingestions_keep_newest_current_and_complete_both_claims(
+    tmp_path: Path, pile_id: str,
+) -> None:
+    root = tmp_path / "sources"
+    older_entered = Event()
+    release_older = Event()
+    older_service = IngestDocumentService(
+        pool,
+        LocalSourceStorage(root),
+        _BlockingParser(older_entered, release_older),
+        DeterministicEmbeddingProvider(),
+    )
+    newer_service = _ingester(root)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        older_future = executor.submit(
+            older_service.ingest,
+            IngestDocumentCommand(pile_id, "out-of-order", b"version one"),
+        )
+        assert older_entered.wait(timeout=5), "older ingestion did not claim before blocking"
+
+        newer = newer_service.ingest(
+            IngestDocumentCommand(pile_id, "out-of-order", b"version two"),
+        )
+        release_older.set()
+        older = older_future.result(timeout=5)
+
+    with pool.connection() as connection:
+        document = DocumentRepository(connection).get_by_id(older.document_id)
+        versions = DocumentVersionRepository(connection).list_for_document(older.document_id)
+        records = [
+            IdempotencyRepository(connection).get(
+                "document-ingestion-v1",
+                older_service._key(pile_id, "out-of-order", result.content_hash),
+            )
+            for result in (older, newer)
+        ]
+
+    assert [version.version_number for version in versions] == [1, 2]
+    assert [version.processing_status for version in versions] == [
+        DocumentProcessingStatus.READY,
+        DocumentProcessingStatus.READY,
+    ]
+    assert older.document_version_id == versions[0].document_version_id
+    assert newer.document_version_id == versions[1].document_version_id
+    assert document is not None and document.current_version_id == newer.document_version_id
+    assert all(record is not None for record in records)
+    assert all(record.status is IdempotencyStatus.COMPLETED for record in records if record is not None)
+
+
+def test_stale_reclaimed_older_version_finishes_after_newer_version_is_current(
+    tmp_path: Path, pile_id: str,
+) -> None:
+    root = tmp_path / "sources"
+    storage = LocalSourceStorage(root)
+    service = IngestDocumentService(
+        pool,
+        storage,
+        DocumentParser(),
+        DeterministicEmbeddingProvider(),
+        stale_claim_after=timedelta(seconds=1),
+    )
+    older_source = storage.publish(b"stale version one")
+    original = service._claim_or_replay(pile_id, "stale-out-of-order", older_source)
+    assert not isinstance(original, IngestDocumentResult)
+
+    newer = service.ingest(
+        IngestDocumentCommand(pile_id, "stale-out-of-order", b"version two"),
+    )
+    _backdate_ingestion_claim(original.key)
+    replacement = service._claim_or_replay(
+        pile_id,
+        "stale-out-of-order",
+        older_source,
+    )
+    assert not isinstance(replacement, IngestDocumentResult)
+    assert replacement.generation == 2
+
+    parsed = DocumentParser().parse_path(older_source.path)
+    chunks = chunk_document(parsed)
+    vectors = DeterministicEmbeddingProvider().embed(tuple(chunk.content for chunk in chunks))
+    older = service._persist_ready(replacement, parsed.mime_type, chunks, vectors)
+
+    with pool.connection() as connection:
+        document = DocumentRepository(connection).get_by_id(older.document_id)
+        versions = DocumentVersionRepository(connection).list_for_document(older.document_id)
+        record = IdempotencyRepository(connection).get("document-ingestion-v1", original.key)
+
+    assert [version.version_number for version in versions] == [1, 2]
+    assert all(
+        version.processing_status is DocumentProcessingStatus.READY
+        for version in versions
+    )
+    assert document is not None and document.current_version_id == newer.document_version_id
+    assert record is not None and record.status is IdempotencyStatus.COMPLETED
+    assert record.claim_generation == replacement.generation
+
+
+def test_historical_ready_version_exact_replay_survives_newer_current_version(
+    tmp_path: Path, pile_id: str,
+) -> None:
+    root = tmp_path / "sources"
+    service = _ingester(root)
+    historical = service.ingest(
+        IngestDocumentCommand(pile_id, "historical-replay", b"version one"),
+    )
+    current = service.ingest(
+        IngestDocumentCommand(pile_id, "historical-replay", b"version two"),
+    )
+    replay_service = IngestDocumentService(
+        pool,
+        LocalSourceStorage(root),
+        _UnexpectedParser(),
+        _UnexpectedEmbeddingProvider(),
+    )
+
+    replay = replay_service.ingest(
+        IngestDocumentCommand(pile_id, "historical-replay", b"version one"),
+    )
+
+    with pool.connection() as connection:
+        document = DocumentRepository(connection).get_by_id(historical.document_id)
+        versions = DocumentVersionRepository(connection).list_for_document(historical.document_id)
+
+    assert replay.replayed is True
+    assert replay.document_version_id == historical.document_version_id
+    assert len(versions) == 2
+    assert document is not None and document.current_version_id == current.document_version_id
+
+
 def test_ready_exact_replay_does_not_call_parser_or_embedding_provider(
     tmp_path: Path, pile_id: str,
 ) -> None:

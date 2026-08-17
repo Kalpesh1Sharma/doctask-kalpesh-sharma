@@ -34,7 +34,13 @@ from repositories.idempotency_repository import (
     InProgressClaimState,
 )
 from services.document_chunker import ParsedChunk, chunk_document
-from services.document_parser import DocumentParser
+from services.document_parser import (
+    DocumentParseError,
+    DocumentParser,
+    ScannedPdfError,
+    UnsupportedDocumentTypeError,
+    UnsupportedDocxContentError,
+)
 from services.embedding_provider import (
     EmbeddingProvider,
     EmbeddingProviderError,
@@ -87,6 +93,14 @@ class DocumentIngestionClaimLostError(DocumentIngestionError):
 
 
 class DocumentIngestionProcessingError(DocumentIngestionError):
+    pass
+
+
+class DocumentIngestionUnsupportedSourceError(DocumentIngestionProcessingError):
+    pass
+
+
+class DocumentIngestionProviderFailureError(DocumentIngestionProcessingError):
     pass
 
 
@@ -149,11 +163,20 @@ class IngestDocumentService:
             parsed = self._parser.parse_path(source.path)
             chunks = chunk_document(parsed)
             vectors = self._embed(tuple(chunk.content for chunk in chunks))
+        except (UnsupportedDocumentTypeError, UnsupportedDocxContentError, ScannedPdfError) as error:
+            self._mark_failed(claimed)
+            raise DocumentIngestionUnsupportedSourceError(str(error)) from error
+        except EmbeddingProviderError as error:
+            self._mark_failed(claimed)
+            raise DocumentIngestionProviderFailureError("embedding provider failed") from error
+        except DocumentParseError as error:
+            self._mark_failed(claimed)
+            raise DocumentIngestionProcessingError("source parsing failed") from error
         except Exception as error:
             self._mark_failed(claimed)
             if isinstance(error, DocumentIngestionError):
                 raise
-            raise DocumentIngestionProcessingError("source parsing or embedding failed") from error
+            raise DocumentIngestionProcessingError("source processing failed") from error
         result = self._persist_ready(claimed, parsed.mime_type, chunks, vectors)
         if self._arrival_service is not None:
             # Arrival is deliberately after READY commit.  A caller crash here is
@@ -255,8 +278,9 @@ class IngestDocumentService:
             raise DocumentIngestionIntegrityError("completed ingestion has malformed result reference")
         if record.result_reference != expected:
             raise DocumentIngestionInputConflictError("completed ingestion has a different result identity")
-        if document.current_version_id != version.document_version_id:
-            raise DocumentIngestionIntegrityError("READY ingestion version is not the current Document version")
+        # READY is immutable historical success.  Whether this version is still
+        # the Document's current version is a separate latest-version concern;
+        # an exact replay must remain valid after a newer version becomes current.
         return IngestDocumentResult(
             document.document_id,
             version.document_version_id,
@@ -342,8 +366,34 @@ class IngestDocumentService:
                         DocumentProcessingStatus.READY,
                     ) is None:
                         raise DocumentIngestionClaimLostError("DocumentVersion status ownership was lost")
-                    if documents.set_current_version(document.document_id, version.document_version_id) is None:
-                        raise DocumentIngestionIntegrityError("Document disappeared before current version update")
+
+                    # Processing completion and latest-version selection are not
+                    # the same invariant.  Another, newer version can finish while
+                    # this worker is parsing/embedding.  In that case this older
+                    # version must still commit as immutable READY history without
+                    # attempting to move current_version_id backwards.  The
+                    # Document row is locked above, so this comparison remains
+                    # stable until commit.
+                    should_advance_current = document.current_version_id is None
+                    if document.current_version_id is not None:
+                        current = versions.get_by_id(document.current_version_id)
+                        if current is None or current.document_id != document.document_id:
+                            raise DocumentIngestionIntegrityError(
+                                "Document current version disappeared or belongs to another Document",
+                            )
+                        if current.processing_status is not DocumentProcessingStatus.READY:
+                            raise DocumentIngestionIntegrityError(
+                                "Document current version is not READY",
+                            )
+                        should_advance_current = current.version_number < version.version_number
+
+                    if should_advance_current and documents.set_current_version(
+                        document.document_id,
+                        version.document_version_id,
+                    ) is None:
+                        raise DocumentIngestionIntegrityError(
+                            "Document disappeared before current version update",
+                        )
                     completed = IdempotencyRepository(connection).mark_completed(
                         _SCOPE,
                         claim.key,

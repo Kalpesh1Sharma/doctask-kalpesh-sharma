@@ -68,6 +68,18 @@ class RunMetricRepository:
         ).fetchone()
         return RunMetricRecord.from_row(row) if row is not None else None
 
+    def list_for_run(self, run_id: str) -> list[RunMetricRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_COLUMNS}
+            FROM run_metrics
+            WHERE run_id = %s::uuid
+            ORDER BY stage ASC, attempt ASC
+            """,
+            (run_id,),
+        ).fetchall()
+        return [RunMetricRecord.from_row(row) for row in rows]
+
     def set_usage(
         self,
         run_id: str,

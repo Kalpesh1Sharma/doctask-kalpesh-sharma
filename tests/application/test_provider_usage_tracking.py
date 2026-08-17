@@ -6,7 +6,7 @@ import pytest
 
 from api.application import provider_usage_tracking
 from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
-from config.settings import OpenAIModelPricing
+from config.settings import GroqModelPricing, OpenAIModelPricing
 from db.pool import pool
 from domain.run import RunStage, RunStepStatus
 from repositories.provider_usage_repository import ProviderUsageRepository, ProviderUsageState
@@ -155,3 +155,48 @@ def test_missing_model_price_leaves_estimated_cost_null(
         )[0]
     assert event.model_name == "gpt-unpriced"
     assert event.estimated_cost is None
+
+
+def test_groq_provider_identity_and_configured_decimal_price_are_persisted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = _running_understand_step()
+    receipt = start_provider_usage(
+        pool,
+        run_id=run_id,
+        stage=RunStage.UNDERSTAND,
+        operation_scope="fact-extraction-v1",
+        operation_key=f"understand:{run_id}",
+        claim_generation=1,
+        provider=SimpleNamespace(provider_name="groq", model_name="openai/gpt-oss-20b"),
+    )
+    assert receipt is not None
+    monkeypatch.setattr(
+        provider_usage_tracking,
+        "get_settings",
+        lambda: SimpleNamespace(
+            groq_model_pricing={
+                "openai/gpt-oss-20b": GroqModelPricing(
+                    input_cost_per_million=Decimal("0.075"),
+                    output_cost_per_million=Decimal("0.30"),
+                ),
+            },
+            openai_model_pricing={},
+        ),
+    )
+
+    finish_provider_usage(
+        pool,
+        receipt,
+        ProviderUsage("groq", "openai/gpt-oss-20b", 1_000_000, 2_000_000),
+    )
+
+    with pool.connection() as connection:
+        event = ProviderUsageRepository(connection).list_for_step(
+            run_id,
+            RunStage.UNDERSTAND,
+            1,
+        )[0]
+    assert event.provider_name == "groq"
+    assert event.model_name == "openai/gpt-oss-20b"
+    assert event.estimated_cost == Decimal("0.67500000")

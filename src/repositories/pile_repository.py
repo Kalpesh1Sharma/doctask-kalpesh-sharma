@@ -44,6 +44,25 @@ class PileRepository:
     def __init__(self, connection: Connection) -> None:
         self._connection = connection
 
+    def create(
+        self,
+        name: str,
+        description: str | None,
+        *,
+        watch_enabled: bool,
+        watch_location: str | None,
+    ) -> PileRecord:
+        row = self._connection.execute(
+            f"""
+            INSERT INTO piles (name, description, watch_enabled, watch_location)
+            VALUES (%s, %s, %s, %s)
+            RETURNING {_PILE_COLUMNS}
+            """,
+            (name, description, watch_enabled, watch_location),
+        ).fetchone()
+        assert row is not None
+        return PileRecord.from_row(row)
+
     def get_by_id(self, pile_id: str) -> PileRecord | None:
         row = self._connection.execute(
             f"SELECT {_PILE_COLUMNS} FROM piles WHERE id = %s::uuid",

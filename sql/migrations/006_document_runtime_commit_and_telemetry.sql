@@ -130,7 +130,24 @@ $$;
 
 -- `latest_run_id` is the automatic-arrival lineage tail.  PostgreSQL can
 -- enforce the same-pile identity; the application owns forward-child intent
--- while holding the pile row lock.
+-- while holding the pile row lock.  Validate historical rows before installing
+-- the future-write trigger so pre-existing cross-pile corruption fails the
+-- migration rather than being silently accepted.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1
+        FROM piles AS p
+        JOIN runs AS r ON r.id = p.latest_run_id
+        WHERE p.latest_run_id IS NOT NULL
+          AND r.pile_id IS DISTINCT FROM p.id
+    ) THEN
+        RAISE EXCEPTION
+            'existing piles.latest_run_id contains a cross-pile lineage tail';
+    END IF;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION validate_pile_latest_run_same_pile()
 RETURNS TRIGGER
 LANGUAGE plpgsql

@@ -189,6 +189,64 @@ def migration_006_database() -> Migration006Database:
             admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
 
 
+def test_migration_006_rejects_preexisting_cross_pile_latest_run_tail() -> None:
+    database_name = f"task1_phase6a_migration006_cross_pile_{uuid4().hex}"
+    connection_info = conninfo_to_dict(get_settings().database_url)
+    connection_info["dbname"] = "postgres"
+    admin_info = make_conninfo(**connection_info)
+
+    with connect(admin_info, autocommit=True) as admin:
+        admin.execute(f'CREATE DATABASE "{database_name}"')
+
+    database_info = dict(connection_info)
+    database_info["dbname"] = database_name
+    database_conninfo = make_conninfo(**database_info)
+    try:
+        with connect(database_conninfo) as isolated:
+            for migration in _MIGRATIONS_001_TO_005:
+                isolated.execute(migration.read_text(encoding="utf-8"))
+                isolated.commit()
+
+            pile_a = isolated.execute(
+                "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+                (f"migration-006-corrupt-a-{uuid4()}",),
+            ).fetchone()
+            pile_b = isolated.execute(
+                "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+                (f"migration-006-corrupt-b-{uuid4()}",),
+            ).fetchone()
+            assert pile_a is not None and pile_b is not None
+            other_pile_run = isolated.execute(
+                """
+                INSERT INTO runs (pile_id, run_type, status)
+                VALUES (%s, 'MANUAL'::run_type, 'PENDING'::run_status)
+                RETURNING id
+                """,
+                (pile_b[0],),
+            ).fetchone()
+            assert other_pile_run is not None
+            isolated.execute(
+                "UPDATE piles SET latest_run_id = %s WHERE id = %s",
+                (other_pile_run[0], pile_a[0]),
+            )
+            isolated.commit()
+
+            with pytest.raises(
+                RaiseException,
+                match="existing piles.latest_run_id contains a cross-pile lineage tail",
+            ):
+                isolated.execute(_MIGRATION_006.read_text(encoding="utf-8"))
+            isolated.rollback()
+    finally:
+        with connect(admin_info, autocommit=True) as admin:
+            admin.execute(
+                "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                "WHERE datname = %s AND pid <> pg_backend_pid()",
+                (database_name,),
+            )
+            admin.execute(f'DROP DATABASE IF EXISTS "{database_name}"')
+
+
 def _create_review_required_run(connection, pile_id: str) -> str:
     row = connection.execute(
         """

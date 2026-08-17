@@ -1,0 +1,27 @@
+# Final Report
+
+## Metadata
+- run_id: "b3aad62d-3b3b-434f-9191-014482a01c2e"
+- renderer_version: "markdown-v1"
+- render_input_format: "render-input-v1"
+
+## Source Versions
+- document_id: "4c7e7dca-904c-49fa-a726-c3903c413e17"; version: 1; document_version_id: "a5cd4dd7-3878-48d8-ae60-40df87905857"; content_hash: "sha256:e63461d21f404c98b81ebd22174a1e54"
+- document_id: "f622a260-72a2-45c8-bc42-bd5d0457cbe8"; version: 2; document_version_id: "b729c045-e707-462c-bf62-a7bd2e9bb663"; content_hash: "sha256:87b720185ec5409f9259eb789e6122ae"
+
+## Update Delta
+- document_change: {"baseline_document_version_id":"a5cd4dd7-3878-48d8-ae60-40df87905857","document_id":"4c7e7dca-904c-49fa-a726-c3903c413e17","kind":"RETAINED","target_content_hash":"sha256:e63461d21f404c98b81ebd22174a1e54","target_document_version_id":"a5cd4dd7-3878-48d8-ae60-40df87905857","target_version_number":1}
+- document_change: {"baseline_document_version_id":"91aff35a-b6a3-4325-bcad-7e9ae70d6ad8","document_id":"f622a260-72a2-45c8-bc42-bd5d0457cbe8","kind":"REPLACED","target_content_hash":"sha256:87b720185ec5409f9259eb789e6122ae","target_document_version_id":"b729c045-e707-462c-bf62-a7bd2e9bb663","target_version_number":2}
+- fact_change: {"fact_id":"a3ad3758-6e0e-466e-beec-06a4f1f08d10","kind":"CARRIED_FORWARD"}
+
+## Confirmed Facts
+- fact_id: "a3ad3758-6e0e-466e-beec-06a4f1f08d10"; provenance: "CARRIED_FORWARD"; subject: "contract"; predicate: "notice_days"; object: {"days":30}; origin_run_id: "aea9fe7c-3da0-4a43-8dc4-c6cc81397e7a"; evidence_span_ids: ["e01371e8-be6c-4058-bc2f-a50b0bdf6519"]
+
+## Disputed Facts
+
+## Approved Findings
+
+## Rejected Review Records
+
+## Citations
+- evidence_span_id: "e01371e8-be6c-4058-bc2f-a50b0bdf6519"; document_version_id: "a5cd4dd7-3878-48d8-ae60-40df87905857"; chunk_id: "d3d9cf34-2488-45c1-ba42-143f9b7ef2ca"; page_number: null; start_offset: 0; end_offset: 8; quoted_text: "retained"; content_hash: "sha256:ca67bd59cc4116ac80db5f64cbf4747f26ba929c85e8cc689a6123368d08719b"

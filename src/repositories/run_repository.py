@@ -181,6 +181,19 @@ class RunRepository:
         ).fetchone()
         return RunRecord.from_row(row) if row is not None else None
 
+    def list_for_pile_limited(self, pile_id: str, *, limit: int) -> list[RunRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM runs
+            WHERE pile_id = %s::uuid
+            ORDER BY created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (pile_id, limit),
+        ).fetchall()
+        return [RunRecord.from_row(row) for row in rows]
+
     def list_for_pile(self, pile_id: str) -> list[RunRecord]:
         rows = self._connection.execute(
             f"""

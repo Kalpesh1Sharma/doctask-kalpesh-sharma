@@ -1,4 +1,4 @@
-# Schema Design — V2.7 + Reviewed Additive Migrations 002 and 003
+# Schema Design — V2.7 + Additive Migrations 002–006
 
 ## 1. Purpose
 
@@ -14,15 +14,14 @@ sql/migrations/002_run_rule_scope.sql
 sql/migrations/003_update_review.sql
 sql/migrations/004_idempotency_claim_generation.sql
 sql/migrations/005_run_step_retry_history.sql
-sql/migrations/004_idempotency_claim_generation.sql
-sql/migrations/005_run_step_retry_history.sql
+sql/migrations/006_document_runtime_commit_and_telemetry.sql
 ```
 
 `001_schema_v2_7.sql` remains the locked historical V2.7 baseline and must not be rewritten.
 
 `002_run_rule_scope.sql` is a reviewed additive correction for a verified provenance gap: V2.7 could not durably reconstruct the exact RuleSet/Rule scope evaluated by a historical Run, especially when that Run produced zero Rule-Violation Findings.
 
-`003_update_review.sql` is an implemented/reviewed additive correction for UPDATE-level human approval, pending independent checkpoint approval: V2.7 could not durably bind a completed baseline, trigger source, prepared delta, and exact reviewed UPDATE state to one approval or rejection.
+`003_update_review.sql` is the approved additive correction for UPDATE-level human approval: V2.7 could not durably bind a completed baseline, trigger source, prepared delta, and exact reviewed UPDATE state to one approval or rejection.
 
 The schema design was evolved through multiple review rounds. The final model preserves:
 
@@ -47,9 +46,12 @@ For schema questions, use this order:
 1. Engineer/specification PDF — requirements.
 2. Approved architecture/design documents — architectural decisions.
 3. Executable migrations in order — exact database implementation:
-   - approved locked baseline `001_schema_v2_7.sql`
-   - approved additive `002_run_rule_scope.sql`
-   - implemented/reviewed `003_update_review.sql`, pending independent checkpoint approval
+   - locked historical baseline `001_schema_v2_7.sql`
+   - additive `002_run_rule_scope.sql`
+   - additive `003_update_review.sql`
+   - additive `004_idempotency_claim_generation.sql`
+   - additive `005_run_step_retry_history.sql`
+   - additive `006_document_runtime_commit_and_telemetry.sql`
 4. This schema design — conceptual/data-model reference.
 5. Application code — current implementation.
 
@@ -376,6 +378,12 @@ Document version creation/current-version advancement is serialized by locking t
 ```sql
 SELECT ... FOR UPDATE
 ```
+
+Parsing and embedding occur outside that lock, so different versions may finish
+out of order. A successfully processed older version still commits as immutable
+`READY` history, but it does not move `current_version_id` backward when a newer
+READY version is already current. Its completed ingestion identity remains valid
+for exact replay even after a newer version becomes current.
 
 The executable V2.7 DDL enforces the READY/current-version relationship with a trigger.
 
@@ -1786,8 +1794,10 @@ of the parent document.
 This protects:
 
 - version numbering
-- current-version advancement
+- monotonic current-version advancement
 - concurrent version creation
+- out-of-order completion, where an older version may become READY history without
+  displacing a newer current version
 
 ---
 
@@ -2232,13 +2242,7 @@ V2.7 could not prove the exact rules examined by a historical Run,
 especially when no Rule-Violation Finding was produced.
 ```
 
-Current implemented repository/application baseline after migrations 001 + 002:
-
-```text
-340 tests passing
-```
-
-A database used by repository/application tests must apply migrations in order before running tests that depend on Run rule scope.
+The 001 + 002 state is historical. The current executable baseline applies migrations 001 through 006 in order. A database used by repository/application tests must apply the required ordered migrations before running tests that depend on later schema features.
 
 ---
 
@@ -2251,7 +2255,7 @@ A database used by repository/application tests must apply migrations in order b
 Status:
 
 ```text
-IMPLEMENTED REVIEWED ADDITIVE UPDATE-APPROVAL CORRECTION — pending independent checkpoint approval
+APPROVED ADDITIVE UPDATE-APPROVAL CORRECTION
 ```
 
 It adds:
@@ -2299,7 +2303,7 @@ Migration `001` remains the locked historical V2.7 baseline.
 
 Migration `002` is the approved additive rule-scope provenance correction.
 
-Migration `003` is the implemented/reviewed additive UPDATE change-set and immutable approval correction, pending independent checkpoint approval.
+Migration `003` is the approved additive UPDATE change-set and immutable approval correction.
 
 Migration `004` adds fenced idempotency claim ownership without adding tables.
 
@@ -2307,7 +2311,7 @@ Migration `005` adds explicit retry-attempt provenance and closed-attempt metric
 
 Migration `006` adds the durable document-runtime/COMMIT cutover and provider-usage receipt model, bringing the ordered executable schema to 27 tables.
 
-Migrations `001` through `005` are historical migration artifacts and are not rewritten by the Phase 6A correction. Future changes must continue additively unless an explicitly reviewed migration policy says otherwise.
+Migrations `001` through `006` are the approved historical migration chain after Phase 6A closure and should not be rewritten by later phases. Future schema changes must continue additively (for example with migration `007`) unless an explicitly reviewed migration policy says otherwise.
 
 ---
 
@@ -2426,8 +2430,9 @@ PostgreSQL are non-authoritative orphans until a READY DocumentVersion commits.
 `piles.latest_run_id` is the authoritative automatic-arrival lineage tail and
 must reference a Run in the same Pile. The application holds the Pile row lock
 while advancing that tail; completion of an older Run cannot move it backward.
-An established `runs.parent_run_id` is immutable. Existing invalid cross-pile
-tails fail migration rather than being silently rewritten.
+An established `runs.parent_run_id` is immutable. Migration 006 preflights
+historical `latest_run_id` rows, so existing invalid cross-pile tails fail the
+migration rather than being silently accepted or rewritten.
 
 ## 46.4 Focused UPDATE final artifacts
 

@@ -8,3 +8,9 @@ __pycache__/
 !.env.example
 *.egg-info/
 .codex-context/
+
+# Frontend dependencies and generated output
+node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/

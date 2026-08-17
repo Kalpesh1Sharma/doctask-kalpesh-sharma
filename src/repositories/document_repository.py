@@ -92,6 +92,19 @@ class DocumentRepository:
 
         return DocumentRecord.from_row(row) if row is not None else None
 
+    def list_for_pile(self, pile_id: str, *, limit: int) -> list[DocumentRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_DOCUMENT_COLUMNS}
+            FROM documents
+            WHERE pile_id = %s::uuid
+            ORDER BY created_at ASC, id ASC
+            LIMIT %s
+            """,
+            (pile_id, limit),
+        ).fetchall()
+        return [DocumentRecord.from_row(row) for row in rows]
+
     def get_by_logical_key(
         self,
         pile_id: str,

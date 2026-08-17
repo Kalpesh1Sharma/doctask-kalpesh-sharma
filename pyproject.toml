@@ -15,7 +15,13 @@ dependencies = [
     "pypdf>=5.0,<7.0",
     "python-docx>=1.1,<2.0",
     "openai>=1.65,<3.0",
+    "groq>=1.6,<2.0",
+    "python-multipart>=0.0.20,<1.0",
+    "mcp>=2.0,<3.0",
 ]
+
+[project.scripts]
+task1-mcp = "api.mcp.server:main"
 
 [project.optional-dependencies]
 dev = [

@@ -7,7 +7,7 @@ from decimal import Decimal
 
 from psycopg_pool import ConnectionPool
 
-from config.settings import OpenAIModelPricing, get_settings
+from config.settings import ModelPricing, get_settings
 from domain.run import RunStage, RunStepStatus
 from repositories.provider_usage_repository import ProviderUsageRepository
 from repositories.run_step_repository import RunStepRepository
@@ -30,16 +30,16 @@ def _provider_identity(provider: object) -> tuple[str, str | None]:
     )
 
 
-def _estimate_openai_cost(
+def _estimate_provider_cost(
     *,
     provider_name: str | None,
     model_name: str | None,
     input_tokens: int | None,
     output_tokens: int | None,
-    pricing: dict[str, OpenAIModelPricing],
+    pricing: dict[str, ModelPricing],
 ) -> Decimal | None:
     if (
-        provider_name != "openai"
+        provider_name not in {"groq", "openai"}
         or model_name is None
         or input_tokens is None
         or output_tokens is None
@@ -108,12 +108,20 @@ def finish_provider_usage(
         if input_tokens is None and output_tokens is None:
             updated = ProviderUsageRepository(connection).mark_unavailable(receipt.event_id)
         else:
-            estimated_cost = _estimate_openai_cost(
-                provider_name=str(provider_name) if provider_name else None,
+            normalized_provider = str(provider_name) if provider_name else None
+            settings = get_settings()
+            if normalized_provider == "groq":
+                pricing = settings.groq_model_pricing
+            elif normalized_provider == "openai":
+                pricing = settings.openai_model_pricing
+            else:
+                pricing = {}
+            estimated_cost = _estimate_provider_cost(
+                provider_name=normalized_provider,
                 model_name=str(model_name) if model_name else None,
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
-                pricing=get_settings().openai_model_pricing,
+                pricing=pricing,
             )
             updated = ProviderUsageRepository(connection).record(
                 receipt.event_id,
