@@ -29,6 +29,11 @@ class UpdateReviewDecisionType(StrEnum):
     REJECTED = "REJECTED"
 
 
+class UpdateChangeItemKind(StrEnum):
+    FACT_CREATED = "FACT_CREATED"
+    FACT_REMOVED = "FACT_REMOVED"
+
+
 class UpdateFactDeltaKind(StrEnum):
     CARRIED_FORWARD = "CARRIED_FORWARD"
     CREATED = "CREATED"

@@ -31,6 +31,7 @@ from api.rest.schemas.core import (
     AdvanceRunResponse,
     CreatePileRequest,
     CreateRuleSetRequest,
+    DocumentClassificationResponse,
     DocumentResponse,
     DocumentVersionResponse,
     EvidenceResponse,
@@ -78,6 +79,12 @@ def _document_response(item: object) -> DocumentResponse:
 
 def _document_version_response(item: object) -> DocumentVersionResponse:
     return DocumentVersionResponse.model_validate(item.__dict__)
+
+
+def _classification_response(item: object) -> DocumentClassificationResponse:
+    payload = dict(item.__dict__)
+    payload["evidence_chunk_ids"] = list(payload["evidence_chunk_ids"])
+    return DocumentClassificationResponse.model_validate(payload)
 
 
 def _evidence_response(item: object) -> EvidenceResponse:
@@ -207,6 +214,11 @@ def ingest_document(
         replayed=result.replayed,
         created_run_ids=list(result.created_run_ids),
         reconciled_blocked_run_id=result.reconciled_blocked_run_id,
+        classification=(
+            _classification_response(result.classification)
+            if result.classification is not None
+            else None
+        ),
     )
 
 

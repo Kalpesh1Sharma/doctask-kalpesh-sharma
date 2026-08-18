@@ -11,7 +11,7 @@ from domain.finding import FindingStatus, FindingType
 from domain.review_decision import ReviewDecisionType
 from domain.run import RunStatus, RunType
 from domain.run_membership import RunMembershipRelation
-from domain.update_review import UpdateReviewDecisionType
+from domain.update_review import UpdateChangeItemKind, UpdateReviewDecisionType
 
 
 class FindingDecisionRequest(ApiModel):
@@ -69,11 +69,30 @@ class UpdateReviewDecisionResponse(ApiModel):
     decided_at: datetime
 
 
+class UpdateItemReviewDecisionResponse(ApiModel):
+    update_item_review_decision_id: str
+    item_id: str
+    decision: UpdateReviewDecisionType
+    actor_type: str
+    actor_id: str
+    idempotency_key: str
+    decided_at: datetime
+
+
+class UpdateChangeItemResponse(ApiModel):
+    item_id: str | None
+    fact_id: str
+    kind: UpdateChangeItemKind
+    payload: JsonValue
+    decision: UpdateItemReviewDecisionResponse | None
+
+
 class UpdateChangeSetResponse(ApiModel):
     change_set_id: str | None
     durable: bool
     change_set_fingerprint: str
     manifest: JsonValue
+    items: list[UpdateChangeItemResponse] = Field(default_factory=list)
     decision: UpdateReviewDecisionResponse | None
 
 
@@ -92,18 +111,22 @@ class UpdateDecisionRequest(ApiModel):
     decision: UpdateReviewDecisionType
     actor_type: str = Field(min_length=1, max_length=100)
     actor_id: str = Field(min_length=1, max_length=255)
-    idempotency_key: str = Field(min_length=1, max_length=256)
+    idempotency_key: str = Field(min_length=1, max_length=512)
     expected_change_set_fingerprint: str = Field(min_length=71, max_length=71)
+    fact_id: str | None = None
 
 
 class UpdateDecisionResponse(ApiModel):
     change_set_id: str
     change_set_fingerprint: str
+    fact_id: str | None
+    item_kind: UpdateChangeItemKind | None
     decision: UpdateReviewDecisionType
     actor_type: str
     actor_id: str
     idempotency_key: str
     decided_at: datetime
+    review_complete: bool
     replayed: bool
 
 

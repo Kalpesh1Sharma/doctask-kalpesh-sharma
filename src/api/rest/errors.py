@@ -17,6 +17,22 @@ from api.application.build_update_change_set_service import (
     UpdateChangeSetRunNotEligibleError,
     UpdateChangeSetRunNotFoundError,
 )
+from api.application.change_history_service import (
+    ChangeHistoryIntegrityError,
+    ChangeHistoryPileNotFoundError,
+    ChangeHistoryRunNotFoundError,
+    InvalidChangeHistoryQueryError,
+)
+from api.application.classify_document_version_service import (
+    DocumentClassificationClaimLostError,
+    DocumentClassificationInProgressError,
+    DocumentClassificationIntegrityError,
+    DocumentClassificationInvalidResponseError,
+    DocumentClassificationProviderFailureError,
+    DocumentClassificationVersionNotFoundError,
+    DocumentClassificationVersionNotReadyError,
+    InvalidDocumentClassificationCommandError,
+)
 from api.application.commit_final_report_service import (
     CommitArtifactPublicationError,
     CommitFinalReportClaimLostError,
@@ -53,6 +69,7 @@ from api.application.external_review_query_service import (
     InvalidExternalReviewQueryError,
 )
 from api.application.external_update_review_service import (
+    ExternalUpdateReviewItemRequiredError,
     ExternalUpdateReviewStaleError,
     InvalidExternalUpdateReviewCommandError,
 )
@@ -88,6 +105,16 @@ from api.application.review_decision_service import (
 )
 from api.application.review_decision_service import (
     RunNotFoundError as ReviewRunNotFoundError,
+)
+from api.application.review_update_change_item_service import (
+    UpdateItemAlreadyReviewedError,
+    UpdateItemReviewChangeSetMissingError,
+    UpdateItemReviewChangeSetStaleError,
+    UpdateItemReviewIdempotencyConflictError,
+    UpdateItemReviewIdempotencyKeyError,
+    UpdateItemReviewItemNotFoundError,
+    UpdateItemReviewRunNotEligibleError,
+    UpdateItemReviewRunNotFoundError,
 )
 from api.application.review_update_change_set_service import (
     UpdateChangeSetAlreadyReviewedError,
@@ -193,6 +220,45 @@ def install_error_handlers(app: FastAPI) -> None:
         )
 
     mappings: tuple[tuple[type[Exception], ErrorHandler], ...] = (
+        (
+            InvalidChangeHistoryQueryError,
+            _simple_handler(400, "INVALID_CHANGE_HISTORY_QUERY"),
+        ),
+        (ChangeHistoryPileNotFoundError, _simple_handler(404, "PILE_NOT_FOUND")),
+        (ChangeHistoryRunNotFoundError, _simple_handler(404, "RUN_NOT_FOUND")),
+        (ChangeHistoryIntegrityError, _integrity_handler("CHANGE_HISTORY_INTEGRITY")),
+        (
+            InvalidDocumentClassificationCommandError,
+            _simple_handler(400, "INVALID_DOCUMENT_CLASSIFICATION"),
+        ),
+        (
+            DocumentClassificationVersionNotFoundError,
+            _simple_handler(404, "DOCUMENT_VERSION_NOT_FOUND"),
+        ),
+        (
+            DocumentClassificationVersionNotReadyError,
+            _simple_handler(409, "DOCUMENT_VERSION_NOT_READY"),
+        ),
+        (
+            DocumentClassificationInProgressError,
+            _simple_handler(409, "DOCUMENT_CLASSIFICATION_IN_PROGRESS"),
+        ),
+        (
+            DocumentClassificationClaimLostError,
+            _simple_handler(409, "DOCUMENT_CLASSIFICATION_CLAIM_LOST"),
+        ),
+        (
+            DocumentClassificationProviderFailureError,
+            _simple_handler(503, "DOCUMENT_CLASSIFICATION_PROVIDER_FAILURE"),
+        ),
+        (
+            DocumentClassificationInvalidResponseError,
+            _simple_handler(503, "DOCUMENT_CLASSIFICATION_INVALID_RESPONSE"),
+        ),
+        (
+            DocumentClassificationIntegrityError,
+            _integrity_handler("DOCUMENT_CLASSIFICATION_INTEGRITY"),
+        ),
         (RestServiceConfigurationError, _simple_handler(503, "SERVICE_NOT_CONFIGURED")),
         (InvalidCreatePileCommandError, _simple_handler(400, "INVALID_PILE")),
         (InvalidCreateRuleSetCommandError, _simple_handler(400, "INVALID_RULE_SET")),
@@ -217,6 +283,10 @@ def install_error_handlers(app: FastAPI) -> None:
         (ReviewIdempotencyConflictError, _simple_handler(409, "REVIEW_IDEMPOTENCY_CONFLICT")),
         (InvalidExternalUpdateReviewCommandError, _simple_handler(400, "INVALID_UPDATE_REVIEW")),
         (ExternalUpdateReviewStaleError, _simple_handler(409, "UPDATE_REVIEW_STALE")),
+        (
+            ExternalUpdateReviewItemRequiredError,
+            _simple_handler(409, "UPDATE_ITEM_REVIEW_REQUIRED"),
+        ),
         (UpdateChangeSetRunNotFoundError, _simple_handler(404, "RUN_NOT_FOUND")),
         (UpdateChangeSetRunNotEligibleError, _simple_handler(409, "UPDATE_REVIEW_NOT_ELIGIBLE")),
         (UpdateChangeSetReviewIncompleteError, _simple_handler(409, "FINDING_REVIEW_INCOMPLETE")),
@@ -238,6 +308,23 @@ def install_error_handlers(app: FastAPI) -> None:
         (UpdateChangeSetAlreadyReviewedError, _simple_handler(409, "UPDATE_ALREADY_REVIEWED")),
         (UpdateReviewRunNotEligibleError, _simple_handler(409, "RUN_NOT_REVIEWABLE")),
         (UpdateChangeSetStaleError, _simple_handler(409, "UPDATE_CHANGE_SET_STALE")),
+        (UpdateItemReviewRunNotFoundError, _simple_handler(404, "RUN_NOT_FOUND")),
+        (
+            UpdateItemReviewChangeSetMissingError,
+            _simple_handler(409, "UPDATE_CHANGE_SET_MISSING"),
+        ),
+        (UpdateItemReviewItemNotFoundError, _simple_handler(404, "UPDATE_ITEM_NOT_FOUND")),
+        (
+            UpdateItemReviewIdempotencyKeyError,
+            _simple_handler(400, "INVALID_UPDATE_ITEM_REVIEW_IDEMPOTENCY_KEY"),
+        ),
+        (
+            UpdateItemReviewIdempotencyConflictError,
+            _simple_handler(409, "UPDATE_ITEM_REVIEW_IDEMPOTENCY_CONFLICT"),
+        ),
+        (UpdateItemAlreadyReviewedError, _simple_handler(409, "UPDATE_ITEM_ALREADY_REVIEWED")),
+        (UpdateItemReviewRunNotEligibleError, _simple_handler(409, "RUN_NOT_REVIEWABLE")),
+        (UpdateItemReviewChangeSetStaleError, _simple_handler(409, "UPDATE_CHANGE_SET_STALE")),
         (InvalidDocumentIngestionCommandError, _simple_handler(400, "INVALID_DOCUMENT_INGESTION")),
         (DocumentIngestionPileNotFoundError, _simple_handler(404, "PILE_NOT_FOUND")),
         (DocumentIngestionInProgressError, _simple_handler(409, "DOCUMENT_INGESTION_IN_PROGRESS")),

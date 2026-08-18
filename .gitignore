@@ -9,8 +9,17 @@ __pycache__/
 *.egg-info/
 .codex-context/
 
+.pytest-*/
 # Frontend dependencies and generated output
 node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+# Operational runtime data (keep directory placeholders only)
+var/sources/*
+!var/sources/.gitkeep
+var/artifacts/*
+!var/artifacts/.gitkeep
+var/watch/*
+!var/watch/.gitkeep
+var/

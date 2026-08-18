@@ -21,6 +21,8 @@ class ExternalOperation(StrEnum):
     REVIEW_UPDATE = "review_update"
     GET_RUN_REPORT = "get_run_report"
     GET_RUN_METRICS = "get_run_metrics"
+    LIST_PILE_CHANGE_HISTORY = "list_pile_change_history"
+    GET_RUN_CHANGE_HISTORY = "get_run_change_history"
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,16 @@ REST_OPERATIONS: tuple[RestOperationContract, ...] = (
         ExternalOperation.GET_RUN_METRICS,
         "GET",
         "/api/v1/runs/{run_id}/metrics",
+    ),
+    RestOperationContract(
+        ExternalOperation.LIST_PILE_CHANGE_HISTORY,
+        "GET",
+        "/api/v1/piles/{pile_id}/change-history",
+    ),
+    RestOperationContract(
+        ExternalOperation.GET_RUN_CHANGE_HISTORY,
+        "GET",
+        "/api/v1/runs/{run_id}/change-history",
     ),
 )
 

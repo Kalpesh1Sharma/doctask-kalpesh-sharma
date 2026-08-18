@@ -132,6 +132,23 @@ class RuleSetRepository:
         ).fetchall()
         return [RuleSetRecord.from_row(row) for row in rows]
 
+    def list_latest_rule_sets_for_pile(self, pile_id: str) -> list[RuleSetRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RULE_SET_COLUMNS}
+            FROM (
+                SELECT DISTINCT ON (name)
+                    id, pile_id, name, description, version, created_at
+                FROM rule_sets
+                WHERE pile_id = %s::uuid
+                ORDER BY name ASC, version DESC, created_at DESC, id DESC
+            ) AS latest
+            ORDER BY name ASC, id ASC
+            """,
+            (pile_id,),
+        ).fetchall()
+        return [RuleSetRecord.from_row(row) for row in rows]
+
     def list_rules_for_rule_set(self, rule_set_id: str) -> list[RuleRecord]:
         rows = self._connection.execute(
             f"""

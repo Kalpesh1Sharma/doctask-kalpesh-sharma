@@ -38,6 +38,26 @@ test("sends UPDATE approval with the exact fingerprint and a stable valid idempo
   expect(payload.actor_id).toBe("alice@example.test");
 });
 
+
+test("sends item-level UPDATE review with the Fact identity in the idempotency key", async () => {
+  const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } })
+  );
+  const runId = "22222222-2222-4222-8222-222222222222";
+  const factId = "33333333-3333-4333-8333-333333333333";
+  const fingerprint = `sha256:${"c".repeat(64)}`;
+
+  await api.reviewUpdate(runId, "REJECTED", "alice@example.test", fingerprint, factId);
+
+  const [, init] = fetchMock.mock.calls[0];
+  const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
+  expect(payload.fact_id).toBe(factId);
+  expect(payload.expected_change_set_fingerprint).toBe(fingerprint);
+  expect(payload.idempotency_key).toBe(
+    `update-item-review:${runId}:${factId}:${"c".repeat(64)}`
+  );
+});
+
 test("preserves the stable API error code and details", async () => {
   vi.spyOn(globalThis, "fetch").mockResolvedValue(
     new Response(

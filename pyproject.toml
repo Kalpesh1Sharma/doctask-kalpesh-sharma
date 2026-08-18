@@ -22,6 +22,8 @@ dependencies = [
 
 [project.scripts]
 task1-mcp = "api.mcp.server:main"
+task1-watch = "runtime.watch_folder:main"
+task1-worker = "runtime.run_worker:main"
 
 [project.optional-dependencies]
 dev = [

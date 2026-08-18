@@ -6,6 +6,10 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.effective_run_fact_state import (
+    EffectiveRunFactStateIntegrityError,
+    list_effective_committed_facts,
+)
 from domain.render_input import (
     RenderInputManifest,
     build_render_input_manifest,
@@ -154,7 +158,12 @@ def build_current_update_change_set_manifest(
     )
 
     fact_repository = RunFactRepository(connection)
-    baseline_facts = fact_repository.list_for_run(run.baseline_run_id)
+    try:
+        baseline_facts = list_effective_committed_facts(connection, run.baseline_run_id)
+    except EffectiveRunFactStateIntegrityError as error:
+        raise UpdateChangeSetInputIntegrityError(
+            "baseline committed Fact state cannot be reconstructed",
+        ) from error
     update_facts = fact_repository.list_for_run(run.run_id)
     fact_delta = classify_update_fact_delta(
         (record.fact_id for record in baseline_facts),

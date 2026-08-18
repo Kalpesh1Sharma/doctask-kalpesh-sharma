@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from api.application.change_history_service import ChangeHistoryService
 from api.application.create_pile_service import CreatePileService
 from api.application.create_rule_set_service import CreateRuleSetService
 from api.application.external_advance_run_service import ExternalAdvanceRunService
@@ -14,6 +15,7 @@ from api.application.external_update_review_service import ExternalUpdateReviewS
 from api.application.ingest_and_reconcile_document_service import IngestAndReconcileDocumentService
 from api.application.review_decision_service import ReviewDecisionService
 from api.external_dependencies import (
+    get_change_history_service,
     get_create_pile_service,
     get_create_rule_set_service,
     get_external_advance_run_service,
@@ -37,6 +39,7 @@ class McpServiceProvider:
     review_query: Callable[[], ExternalReviewQueryService]
     review_decision: Callable[[], ReviewDecisionService]
     update_review: Callable[[], ExternalUpdateReviewService]
+    change_history: Callable[[], ChangeHistoryService]
 
 
 def default_mcp_service_provider() -> McpServiceProvider:
@@ -49,4 +52,5 @@ def default_mcp_service_provider() -> McpServiceProvider:
         review_query=get_external_review_query_service,
         review_decision=get_review_decision_service,
         update_review=get_external_update_review_service,
+        change_history=get_change_history_service,
     )

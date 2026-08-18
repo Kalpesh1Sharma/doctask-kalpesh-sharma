@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from api.rest.schemas.core import (
     AdvanceRunResponse,
+    DocumentClassificationResponse,
     DocumentResponse,
     DocumentVersionResponse,
     EvidenceResponse,
@@ -22,8 +23,10 @@ from api.rest.schemas.review import (
     ReviewDecisionResponse,
     ReviewFindingResponse,
     RunReviewResponse,
+    UpdateChangeItemResponse,
     UpdateChangeSetResponse,
     UpdateDecisionResponse,
+    UpdateItemReviewDecisionResponse,
     UpdateReviewDecisionResponse,
 )
 
@@ -48,6 +51,12 @@ def document_response(item: object) -> DocumentResponse:
 
 def document_version_response(item: object) -> DocumentVersionResponse:
     return DocumentVersionResponse.model_validate(item.__dict__)
+
+
+def classification_response(item: object) -> DocumentClassificationResponse:
+    payload = dict(item.__dict__)
+    payload["evidence_chunk_ids"] = list(payload["evidence_chunk_ids"])
+    return DocumentClassificationResponse.model_validate(payload)
 
 
 def evidence_response(item: object) -> EvidenceResponse:
@@ -85,6 +94,11 @@ def ingest_response(item: object) -> IngestDocumentResponse:
         replayed=item.replayed,
         created_run_ids=list(item.created_run_ids),
         reconciled_blocked_run_id=item.reconciled_blocked_run_id,
+        classification=(
+            classification_response(item.classification)
+            if getattr(item, "classification", None) is not None
+            else None
+        ),
     )
 
 
@@ -137,11 +151,30 @@ def review_response(item: object) -> RunReviewResponse:
             if item.update_change_set.decision is not None
             else None
         )
+        update_items = []
+        for update_item in getattr(item.update_change_set, "items", ()):
+            item_decision = (
+                UpdateItemReviewDecisionResponse.model_validate(
+                    update_item.decision.__dict__,
+                )
+                if update_item.decision is not None
+                else None
+            )
+            update_items.append(
+                UpdateChangeItemResponse(
+                    item_id=update_item.item_id,
+                    fact_id=update_item.fact_id,
+                    kind=update_item.kind,
+                    payload=update_item.payload,
+                    decision=item_decision,
+                ),
+            )
         update_change_set = UpdateChangeSetResponse(
             change_set_id=item.update_change_set.change_set_id,
             durable=item.update_change_set.durable,
             change_set_fingerprint=item.update_change_set.change_set_fingerprint,
             manifest=item.update_change_set.manifest,
+            items=update_items,
             decision=update_decision,
         )
 
@@ -174,14 +207,34 @@ def finding_decision_response(item: object) -> FindingDecisionResponse:
 
 
 def update_decision_response(item: object) -> UpdateDecisionResponse:
+    item_review = getattr(item, "item_review", None)
+    if item_review is not None:
+        decision = item_review.decision
+        return UpdateDecisionResponse(
+            change_set_id=item_review.change_set.change_set_id,
+            change_set_fingerprint=item_review.change_set.change_set_fingerprint,
+            fact_id=item_review.item.fact_id,
+            item_kind=item_review.item.kind,
+            decision=decision.decision,
+            actor_type=decision.actor_type,
+            actor_id=decision.actor_id,
+            idempotency_key=decision.idempotency_key,
+            decided_at=decision.decided_at,
+            review_complete=item_review.review_complete,
+            replayed=item_review.replayed,
+        )
+    assert item.review is not None
     decision = item.review.decision
     return UpdateDecisionResponse(
         change_set_id=item.review.change_set.change_set_id,
         change_set_fingerprint=item.review.change_set.change_set_fingerprint,
+        fact_id=None,
+        item_kind=None,
         decision=decision.decision,
         actor_type=decision.actor_type,
         actor_id=decision.actor_id,
         idempotency_key=decision.idempotency_key,
         decided_at=decision.decided_at,
+        review_complete=True,
         replayed=item.review.replayed,
     )

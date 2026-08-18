@@ -181,6 +181,47 @@ class RunRepository:
         ).fetchone()
         return RunRecord.from_row(row) if row is not None else None
 
+    def list_worker_candidates(self, *, limit: int) -> list[RunRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM runs
+            WHERE run_type IN ('INITIAL'::run_type, 'UPDATE'::run_type)
+              AND status IN (
+                'PENDING'::run_status,
+                'RUNNING'::run_status,
+                'REVIEW_REQUIRED'::run_status
+            )
+            ORDER BY
+                CASE WHEN status = 'REVIEW_REQUIRED'::run_status THEN 1 ELSE 0 END ASC,
+                created_at ASC,
+                id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+        return [RunRecord.from_row(row) for row in rows]
+
+    def list_completed_updates_for_pile(
+        self,
+        pile_id: str,
+        *,
+        limit: int,
+    ) -> list[RunRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_RUN_COLUMNS}
+            FROM runs
+            WHERE pile_id = %s::uuid
+              AND run_type = 'UPDATE'::run_type
+              AND status = 'COMPLETED'::run_status
+            ORDER BY completed_at DESC, id DESC
+            LIMIT %s
+            """,
+            (pile_id, limit),
+        ).fetchall()
+        return [RunRecord.from_row(row) for row in rows]
+
     def list_for_pile_limited(self, pile_id: str, *, limit: int) -> list[RunRecord]:
         rows = self._connection.execute(
             f"""

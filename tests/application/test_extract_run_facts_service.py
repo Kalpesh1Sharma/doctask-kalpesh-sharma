@@ -2469,3 +2469,41 @@ def test_chunk_for_share_blocks_update_until_persistence_releases_lock(
             ("updated after release", resources.chunk_id),
         )
         connection.commit()
+
+
+def test_pgvector_retrieval_limits_provider_visible_initial_source_scope(resources: ExtractionResources) -> None:
+    from api.application.semantic_chunk_retrieval_service import SemanticChunkRetrievalService
+    from services.embedding_provider import DeterministicEmbeddingProvider
+
+    # The fixture predates active retrieval, so populate its durable source vector
+    # with the same local provider used for the query.
+    embedding = DeterministicEmbeddingProvider()
+    with pool.connection() as connection:
+        content = connection.execute(
+            "SELECT content FROM document_chunks WHERE id = %s::uuid",
+            (resources.chunk_id,),
+        ).fetchone()
+        assert content is not None
+        vector = embedding.embed((str(content[0]),))[0]
+        literal = f"[{','.join(str(value) for value in vector)}]"
+        connection.execute(
+            "UPDATE document_chunks SET embedding = %s::vector WHERE id = %s::uuid",
+            (literal, resources.chunk_id),
+        )
+        connection.commit()
+
+    provider = FakeProvider(response_for(resources))
+    extractor = ExtractRunFactsService(
+        pool,
+        provider,
+        "Extract grounded factual statements only.",
+        "grounded-facts-v1",
+        retrieval_service=SemanticChunkRetrievalService(embedding, default_limit=1),
+        retrieval_query="The amount is 100 USD.",
+    )
+
+    result = extractor.extract(ExtractRunFactsCommand(resources.run_id))
+
+    assert result.replayed is False
+    assert len(provider.calls) == 1
+    assert tuple(chunk.chunk_id for chunk in provider.calls[0].source_chunks) == (resources.chunk_id,)

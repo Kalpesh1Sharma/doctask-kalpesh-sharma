@@ -21,7 +21,7 @@ from domain.finding import FindingStatus, FindingType
 from domain.review_decision import ReviewDecisionType
 from domain.run import RunStatus, RunType
 from domain.run_membership import RunMembershipRelation
-from domain.update_review import UpdateReviewDecisionType
+from domain.update_review import UpdateChangeItemKind, UpdateReviewDecisionType
 
 _NOW = datetime(2026, 8, 16, tzinfo=UTC)
 _RUN_ID = "11111111-1111-1111-1111-111111111111"
@@ -181,6 +181,38 @@ class _UpdateReview:
         )
 
 
+class _ItemUpdateReview:
+    command = None
+
+    def record(self, command):
+        self.command = command
+        change_set = SimpleNamespace(
+            change_set_id=_CHANGE_SET_ID,
+            change_set_fingerprint=_FINGERPRINT,
+        )
+        item = SimpleNamespace(
+            fact_id=_FINDING_ID,
+            kind=UpdateChangeItemKind.FACT_CREATED,
+        )
+        decision = SimpleNamespace(
+            decision=command.decision,
+            actor_type=command.actor_type,
+            actor_id=command.actor_id,
+            idempotency_key=command.idempotency_key,
+            decided_at=_NOW,
+        )
+        return SimpleNamespace(
+            review=None,
+            item_review=SimpleNamespace(
+                change_set=change_set,
+                item=item,
+                decision=decision,
+                review_complete=False,
+                replayed=False,
+            ),
+        )
+
+
 class _NotReviewable:
     def record(self, _command):
         raise RunNotReviewableError("run is not awaiting human review")
@@ -320,3 +352,28 @@ def test_advance_cannot_bypass_pending_human_review() -> None:
 
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "HUMAN_REVIEW_REQUIRED"
+
+
+def test_update_decision_can_target_one_material_fact_item() -> None:
+    service = _ItemUpdateReview()
+    app = _app({get_external_update_review_service: service})
+    key = f"update-item-review:{_RUN_ID}:{_FINDING_ID}:approve"
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/runs/{_RUN_ID}/update/decision",
+            json={
+                "decision": "APPROVED",
+                "actor_type": "HUMAN",
+                "actor_id": "reviewer@example.test",
+                "idempotency_key": key,
+                "expected_change_set_fingerprint": _FINGERPRINT,
+                "fact_id": _FINDING_ID,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["fact_id"] == _FINDING_ID
+    assert response.json()["item_kind"] == "FACT_CREATED"
+    assert response.json()["review_complete"] is False
+    assert service.command.fact_id == _FINDING_ID

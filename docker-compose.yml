@@ -1,3 +1,53 @@
+x-task1-environment: &task1-environment
+  APP_NAME: task1
+  ENVIRONMENT: ${ENVIRONMENT:-production}
+  DATABASE_URL: postgresql://task1:task1_dev_password@postgres:5432/task1
+  DATABASE_POOL_MIN_SIZE: ${DATABASE_POOL_MIN_SIZE:-2}
+  DATABASE_POOL_MAX_SIZE: ${DATABASE_POOL_MAX_SIZE:-10}
+  SOURCE_ROOT: /data/sources
+  ARTIFACT_ROOT: /data/artifacts
+  GROQ_API_KEY: ${GROQ_API_KEY:-}
+  GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com}
+  GROQ_TIMEOUT_SECONDS: ${GROQ_TIMEOUT_SECONDS:-60}
+  GROQ_FACT_EXTRACTION_MODEL: ${GROQ_FACT_EXTRACTION_MODEL:-openai/gpt-oss-20b}
+  GROQ_CONTRADICTION_MODEL: ${GROQ_CONTRADICTION_MODEL:-openai/gpt-oss-20b}
+  GROQ_RULE_EVALUATION_MODEL: ${GROQ_RULE_EVALUATION_MODEL:-openai/gpt-oss-20b}
+  GROQ_DOCUMENT_CLASSIFICATION_MODEL: ${GROQ_DOCUMENT_CLASSIFICATION_MODEL:-openai/gpt-oss-20b}
+  GROQ_MAX_REQUESTS_PER_MINUTE: ${GROQ_MAX_REQUESTS_PER_MINUTE:-20}
+  GROQ_MIN_REQUEST_INTERVAL_SECONDS: ${GROQ_MIN_REQUEST_INTERVAL_SECONDS:-3.1}
+  GROQ_RATE_LIMIT_RESERVE_TOKENS: ${GROQ_RATE_LIMIT_RESERVE_TOKENS:-512}
+  GROQ_MAX_COMPLETION_TOKENS: ${GROQ_MAX_COMPLETION_TOKENS:-1024}
+  GROQ_MAX_RETRIES: ${GROQ_MAX_RETRIES:-4}
+  GROQ_BACKOFF_BASE_SECONDS: ${GROQ_BACKOFF_BASE_SECONDS:-1}
+  GROQ_BACKOFF_MAX_SECONDS: ${GROQ_BACKOFF_MAX_SECONDS:-30}
+  GROQ_ESTIMATED_CHARS_PER_TOKEN: ${GROQ_ESTIMATED_CHARS_PER_TOKEN:-3.5}
+  DOCUMENT_CLASSIFICATION_MAX_CHUNKS: ${DOCUMENT_CLASSIFICATION_MAX_CHUNKS:-8}
+  DOCUMENT_CLASSIFICATION_MAX_CHARS_PER_CHUNK: ${DOCUMENT_CLASSIFICATION_MAX_CHARS_PER_CHUNK:-1500}
+  ANALYSIS_RETRIEVAL_TOP_K: ${ANALYSIS_RETRIEVAL_TOP_K:-12}
+  ANALYSIS_RETRIEVAL_QUERY: "${ANALYSIS_RETRIEVAL_QUERY:-Material mortgage-document facts: parties, obligations, amounts, dates, terms, approvals, disclosures, settlement details, and compliance-relevant statements.}"
+  WATCH_POLL_INTERVAL_SECONDS: ${WATCH_POLL_INTERVAL_SECONDS:-1}
+  WATCH_STABLE_AFTER_SECONDS: ${WATCH_STABLE_AFTER_SECONDS:-1}
+  WATCH_RETRY_DELAY_SECONDS: ${WATCH_RETRY_DELAY_SECONDS:-5}
+  WATCH_PILE_LIMIT: ${WATCH_PILE_LIMIT:-200}
+  WORKER_POLL_INTERVAL_SECONDS: ${WORKER_POLL_INTERVAL_SECONDS:-1}
+  WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-100}
+  WORKER_MAX_ADVANCES_PER_RUN: ${WORKER_MAX_ADVANCES_PER_RUN:-8}
+
+x-task1-app: &task1-app
+  image: task1-app:local
+  build:
+    context: .
+    dockerfile: Dockerfile
+  restart: unless-stopped
+  environment: *task1-environment
+  volumes:
+    - source_data:/data/sources
+    - artifact_data:/data/artifacts
+    - ./var/watch:/data/watch
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -8,9 +58,76 @@ services:
       POSTGRES_USER: task1
       POSTGRES_PASSWORD: task1_dev_password
     ports:
-      - "5432:5432"
+      - "${TASK1_POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U task1 -d task1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    image: pgvector/pgvector:pg17
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: task1
+      POSTGRES_USER: task1
+      POSTGRES_PASSWORD: task1_dev_password
+    volumes:
+      - ./sql/migrations:/migrations:ro
+      - ./docker/migrate.sh:/docker/migrate.sh:ro
+    command: ["sh", "/docker/migrate.sh"]
+
+  api:
+    <<: *task1-app
+    command: ["uvicorn", "api.rest.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "${TASK1_API_PORT:-8000}:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2))['status'] == 'ok'",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 5s
+
+  worker:
+    <<: *task1-app
+    command: ["task1-worker"]
+
+  watcher:
+    <<: *task1-app
+    command: ["task1-watch"]
+
+  frontend:
+    image: task1-frontend:local
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${TASK1_UI_PORT:-5173}:80"
+
+  mcp:
+    <<: *task1-app
+    profiles: ["mcp"]
+    command: ["task1-mcp"]
+    stdin_open: true
 
 volumes:
   postgres_data:
+  source_data:
+  artifact_data:

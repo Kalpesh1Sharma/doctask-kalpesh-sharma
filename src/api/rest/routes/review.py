@@ -28,9 +28,11 @@ from api.rest.schemas.review import (
     ReviewDecisionResponse,
     ReviewFindingResponse,
     RunReviewResponse,
+    UpdateChangeItemResponse,
     UpdateChangeSetResponse,
     UpdateDecisionRequest,
     UpdateDecisionResponse,
+    UpdateItemReviewDecisionResponse,
     UpdateReviewDecisionResponse,
 )
 
@@ -87,11 +89,30 @@ def _review_response(item: object) -> RunReviewResponse:
             if item.update_change_set.decision is not None
             else None
         )
+        update_items = []
+        for update_item in getattr(item.update_change_set, "items", ()):
+            item_decision = (
+                UpdateItemReviewDecisionResponse.model_validate(
+                    update_item.decision.__dict__,
+                )
+                if update_item.decision is not None
+                else None
+            )
+            update_items.append(
+                UpdateChangeItemResponse(
+                    item_id=update_item.item_id,
+                    fact_id=update_item.fact_id,
+                    kind=update_item.kind,
+                    payload=update_item.payload,
+                    decision=item_decision,
+                ),
+            )
         update_change_set = UpdateChangeSetResponse(
             change_set_id=item.update_change_set.change_set_id,
             durable=item.update_change_set.durable,
             change_set_fingerprint=item.update_change_set.change_set_fingerprint,
             manifest=item.update_change_set.manifest,
+            items=update_items,
             decision=update_decision,
         )
 
@@ -164,17 +185,38 @@ def review_update(
             actor_id=payload.actor_id,
             idempotency_key=payload.idempotency_key,
             expected_change_set_fingerprint=payload.expected_change_set_fingerprint,
+            fact_id=payload.fact_id,
         ),
     )
+    item_review = getattr(result, "item_review", None)
+    if item_review is not None:
+        decision = item_review.decision
+        return UpdateDecisionResponse(
+            change_set_id=item_review.change_set.change_set_id,
+            change_set_fingerprint=item_review.change_set.change_set_fingerprint,
+            fact_id=item_review.item.fact_id,
+            item_kind=item_review.item.kind,
+            decision=decision.decision,
+            actor_type=decision.actor_type,
+            actor_id=decision.actor_id,
+            idempotency_key=decision.idempotency_key,
+            decided_at=decision.decided_at,
+            review_complete=item_review.review_complete,
+            replayed=item_review.replayed,
+        )
+    assert result.review is not None
     decision = result.review.decision
     return UpdateDecisionResponse(
         change_set_id=result.review.change_set.change_set_id,
         change_set_fingerprint=result.review.change_set.change_set_fingerprint,
+        fact_id=None,
+        item_kind=None,
         decision=decision.decision,
         actor_type=decision.actor_type,
         actor_id=decision.actor_id,
         idempotency_key=decision.idempotency_key,
         decided_at=decision.decided_at,
+        review_complete=True,
         replayed=result.review.replayed,
     )
 

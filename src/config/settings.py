@@ -37,11 +37,12 @@ class Settings(BaseSettings):
     # Production semantic workflow provider. Groq's GPT-OSS 20B supports
     # JSON-schema structured outputs and is available on Groq's free plan.
     groq_api_key: str | None = None
-    groq_base_url: str = "https://api.groq.com/openai/v1"
+    groq_base_url: str = "https://api.groq.com"
     groq_timeout_seconds: float = 60.0
     groq_fact_extraction_model: str = "openai/gpt-oss-20b"
     groq_contradiction_model: str = "openai/gpt-oss-20b"
     groq_rule_evaluation_model: str = "openai/gpt-oss-20b"
+    groq_document_classification_model: str = "openai/gpt-oss-20b"
     groq_model_pricing: dict[str, GroqModelPricing] = Field(default_factory=dict)
 
     # Conservative process-local pacing. The published free-plan ceiling for
@@ -54,6 +55,23 @@ class Settings(BaseSettings):
     groq_backoff_base_seconds: float = 1.0
     groq_backoff_max_seconds: float = 30.0
     groq_estimated_chars_per_token: float = 3.5
+
+    document_classification_max_chunks: int = 8
+    document_classification_max_chars_per_chunk: int = 1500
+    analysis_retrieval_top_k: int = 12
+    analysis_retrieval_query: str = (
+        "Material mortgage-document facts: parties, obligations, amounts, dates, terms, "
+        "approvals, disclosures, settlement details, and compliance-relevant statements."
+    )
+
+    watch_poll_interval_seconds: float = 1.0
+    watch_stable_after_seconds: float = 1.0
+    watch_retry_delay_seconds: float = 5.0
+    watch_pile_limit: int = 200
+
+    worker_poll_interval_seconds: float = 1.0
+    worker_batch_size: int = 100
+    worker_max_advances_per_run: int = 8
 
     # Legacy OpenAI adapter configuration remains available for backwards
     # compatibility/tests, but production external wiring no longer requires it.
@@ -84,6 +102,20 @@ class Settings(BaseSettings):
         return value
 
     @field_validator(
+        "document_classification_max_chunks",
+        "document_classification_max_chars_per_chunk",
+        "analysis_retrieval_top_k",
+        "watch_pile_limit",
+        "worker_batch_size",
+        "worker_max_advances_per_run",
+    )
+    @classmethod
+    def require_positive_runtime_integer(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("runtime limits must be positive")
+        return value
+
+    @field_validator(
         "groq_min_request_interval_seconds",
         "groq_backoff_base_seconds",
         "groq_backoff_max_seconds",
@@ -96,6 +128,25 @@ class Settings(BaseSettings):
                 raise ValueError("Groq minimum request interval must be non-negative")
         elif value <= 0:
             raise ValueError("Groq backoff/token-estimate values must be positive")
+        return value
+
+    @field_validator(
+        "watch_poll_interval_seconds",
+        "watch_stable_after_seconds",
+        "watch_retry_delay_seconds",
+        "worker_poll_interval_seconds",
+    )
+    @classmethod
+    def require_positive_runtime_number(cls, value: float) -> float:
+        if value <= 0:
+            raise ValueError("watch runtime intervals must be positive")
+        return value
+
+    @field_validator("analysis_retrieval_query")
+    @classmethod
+    def require_nonempty_retrieval_query(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("analysis retrieval query must not be empty")
         return value
 
     model_config = SettingsConfigDict(

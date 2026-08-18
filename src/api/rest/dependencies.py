@@ -2,6 +2,7 @@
 
 from api.external_dependencies import (
     ExternalServiceConfigurationError,
+    get_change_history_service,
     get_create_pile_service,
     get_create_rule_set_service,
     get_external_advance_run_service,
@@ -17,6 +18,7 @@ RestServiceConfigurationError = ExternalServiceConfigurationError
 
 __all__ = [
     "RestServiceConfigurationError",
+    "get_change_history_service",
     "get_create_pile_service",
     "get_create_rule_set_service",
     "get_external_advance_run_service",

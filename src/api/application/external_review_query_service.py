@@ -21,8 +21,10 @@ from domain.review_decision import ReviewDecisionType
 from domain.run import RunStatus, RunType
 from domain.run_membership import RunMembershipRelation
 from domain.update_review import (
+    UpdateChangeItemKind,
     UpdateChangeSetInputIntegrityError,
     UpdateChangeSetIntegrityError,
+    UpdateFactDeltaKind,
     UpdateReviewDecisionType,
     update_change_set_fingerprint,
 )
@@ -33,7 +35,9 @@ from repositories.output_repository import OutputRepository
 from repositories.review_decision_repository import ReviewDecisionRepository
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_repository import RunRecord, RunRepository
+from repositories.update_change_item_repository import UpdateChangeItemRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from repositories.update_item_review_decision_repository import UpdateItemReviewDecisionRepository
 from repositories.update_review_decision_repository import UpdateReviewDecisionRepository
 from services.local_artifact_storage import ArtifactIntegrityError, LocalArtifactStorage
 
@@ -106,11 +110,32 @@ class UpdateReviewDecisionProjection:
 
 
 @dataclass(frozen=True)
+class UpdateItemReviewDecisionProjection:
+    update_item_review_decision_id: str
+    item_id: str
+    decision: UpdateReviewDecisionType
+    actor_type: str
+    actor_id: str
+    idempotency_key: str
+    decided_at: datetime
+
+
+@dataclass(frozen=True)
+class UpdateChangeItemProjection:
+    item_id: str | None
+    fact_id: str
+    kind: UpdateChangeItemKind
+    payload: JsonValue
+    decision: UpdateItemReviewDecisionProjection | None
+
+
+@dataclass(frozen=True)
 class UpdateChangeSetProjection:
     change_set_id: str | None
     durable: bool
     change_set_fingerprint: str
     manifest: JsonValue
+    items: tuple[UpdateChangeItemProjection, ...]
     decision: UpdateReviewDecisionProjection | None
 
 
@@ -163,22 +188,35 @@ class ExternalReviewQueryService:
                 finding_review_complete,
             )
 
-        update_decision = (
-            update_change_set.decision if update_change_set is not None else None
+        update_decision = update_change_set.decision if update_change_set is not None else None
+        update_items = update_change_set.items if update_change_set is not None else ()
+        item_review_complete = bool(update_items) and all(
+            item.decision is not None for item in update_items
         )
-        review_complete = finding_review_complete and (
-            run.run_type is not RunType.UPDATE or update_decision is not None
+        legacy_itemized_rejection = (
+            bool(update_items)
+            and update_decision is not None
+            and update_decision.decision is UpdateReviewDecisionType.REJECTED
         )
+        update_review_complete = (
+            run.run_type is not RunType.UPDATE
+            or item_review_complete
+            or (not update_items and update_decision is not None)
+        )
+        update_commit_allowed = (
+            run.run_type is not RunType.UPDATE
+            or (item_review_complete and not legacy_itemized_rejection)
+            or (
+                not update_items
+                and update_decision is not None
+                and update_decision.decision is UpdateReviewDecisionType.APPROVED
+            )
+        )
+        review_complete = finding_review_complete and update_review_complete
         commit_ready = (
             run.status is RunStatus.REVIEW_REQUIRED
             and finding_review_complete
-            and (
-                run.run_type is not RunType.UPDATE
-                or (
-                    update_decision is not None
-                    and update_decision.decision is UpdateReviewDecisionType.APPROVED
-                )
-            )
+            and update_commit_allowed
         )
         return RunReviewProjection(
             run_id=run.run_id,
@@ -333,11 +371,47 @@ class ExternalReviewQueryService:
                 if decision_record is not None
                 else None
             )
+            item_decisions = {
+                record.item_id: record
+                for record in UpdateItemReviewDecisionRepository(connection).list_for_change_set(
+                    stored.change_set_id,
+                )
+            }
+            items = []
+            for item in UpdateChangeItemRepository(connection).list_for_change_set(
+                stored.change_set_id,
+            ):
+                item_decision_record = item_decisions.get(item.item_id)
+                item_decision = (
+                    UpdateItemReviewDecisionProjection(
+                        update_item_review_decision_id=(
+                            item_decision_record.update_item_review_decision_id
+                        ),
+                        item_id=item_decision_record.item_id,
+                        decision=item_decision_record.decision,
+                        actor_type=item_decision_record.actor_type,
+                        actor_id=item_decision_record.actor_id,
+                        idempotency_key=item_decision_record.idempotency_key,
+                        decided_at=item_decision_record.decided_at,
+                    )
+                    if item_decision_record is not None
+                    else None
+                )
+                items.append(
+                    UpdateChangeItemProjection(
+                        item_id=item.item_id,
+                        fact_id=item.fact_id,
+                        kind=item.kind,
+                        payload=item.payload,
+                        decision=item_decision,
+                    ),
+                )
             return UpdateChangeSetProjection(
                 change_set_id=stored.change_set_id,
                 durable=True,
                 change_set_fingerprint=stored.change_set_fingerprint,
                 manifest=manifest.model_dump(mode="json"),
+                items=tuple(items),
                 decision=decision,
             )
 
@@ -354,11 +428,28 @@ class ExternalReviewQueryService:
             raise ExternalReviewIntegrityError(
                 "UPDATE review preview cannot be derived from durable state",
             ) from error
+        preview_items = tuple(
+            UpdateChangeItemProjection(
+                item_id=None,
+                fact_id=delta.fact_id,
+                kind=(
+                    UpdateChangeItemKind.FACT_CREATED
+                    if delta.kind is UpdateFactDeltaKind.CREATED
+                    else UpdateChangeItemKind.FACT_REMOVED
+                ),
+                payload=delta.model_dump(mode="json"),
+                decision=None,
+            )
+            for delta in manifest.fact_delta
+            if delta.kind
+            in {UpdateFactDeltaKind.CREATED, UpdateFactDeltaKind.REMOVED_FROM_CURRENT_STATE}
+        )
         return UpdateChangeSetProjection(
             change_set_id=None,
             durable=False,
             change_set_fingerprint=update_change_set_fingerprint(manifest),
             manifest=manifest.model_dump(mode="json"),
+            items=preview_items,
             decision=None,
         )
 

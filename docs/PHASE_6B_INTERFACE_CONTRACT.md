@@ -281,7 +281,7 @@ Typed integrity errors may initially map to 500 with a stable error code and no 
 
 ## 7. MCP tool contract (SDK v2)
 
-Phase 6B-4 implements these locked tool names with the official MCP Python SDK v2. The MCP server calls the same application/use-case services as REST and does not call REST over HTTP.
+Phase 6B-4 implemented the original 14 locked tool names with the official MCP Python SDK v2. Phase 6C-3C adds two read-only history tools without changing or removing any 6B tool. The MCP server calls the same application/use-case services as REST and does not call REST over HTTP.
 
 | MCP tool | REST-equivalent capability |
 |---|---|
@@ -296,13 +296,19 @@ Phase 6B-4 implements these locked tool names with the official MCP Python SDK v
 | `get_run_findings` | GET findings |
 | `get_run_review` | GET review |
 | `review_finding` | POST finding decision |
-| `review_update` | POST UPDATE decision |
+| `review_update` | POST one material UPDATE Fact decision (`fact_id`), or the zero-item whole-set decision |
 | `get_run_report` | GET report metadata/content |
 | `get_run_metrics` | GET metrics |
+| `list_pile_change_history` | GET pile committed UPDATE history |
+| `get_run_change_history` | GET one committed UPDATE history |
+
+Item-level UPDATE review extends the locked `review_update` tool without changing its name: material change sets expose Fact items through `get_run_review`, and callers pass the selected `fact_id` plus the reviewed change-set fingerprint. Mixed decisions are permitted; all items must be decided before COMMIT. Zero-item UPDATEs omit `fact_id` and use the original whole-set approval semantics.
 
 MCP `ingest_document` accepts `pile_id`, `logical_key`, `filename`, `media_type`, and canonical `source_base64`. Base64 is used because MCP tool arguments are JSON-shaped; the decoded bytes are passed unchanged to the same `IngestAndReconcileDocumentService` used by REST. `get_run_report` returns verified final-output metadata plus the exact committed UTF-8 Markdown content in one structured result.
 
 The default server transport is stdio. Set `TASK1_MCP_TRANSPORT=streamable-http` (or `sse`) to select another SDK transport. The installed console entry point is `task1-mcp`. There is intentionally no `commit_run` tool: a machine must call `advance_run`, which preserves the human-review gate and enters COMMIT only when review is complete and approved.
+
+Phase 6C-3C adds the read-only REST routes `GET /api/v1/piles/{pile_id}/change-history` and `GET /api/v1/runs/{run_id}/change-history`. Their MCP equivalents are `list_pile_change_history` and `get_run_change_history`. All four adapters call the same fail-closed `ChangeHistoryService`; no transport derives history independently.
 
 ## 8. Application-layer facades implemented from the interface audit
 
@@ -433,7 +439,7 @@ The skeleton checkpoint is complete when:
 The implemented external surfaces must preserve these properties through final verification:
 
 1. REST and MCP call shared application services; neither transport contains repository SQL or an alternate workflow implementation.
-2. The locked MCP contract contains exactly 14 tools and no `commit_run` bypass.
+2. The Phase-6B baseline contract contains 14 tools; the current additive 6C-3C contract contains 16 tools and still has no `commit_run` bypass.
 3. REST exposes no direct `/commit` writer; fresh finalization is reached only by advancing the durable `COMMIT` RunStep after review.
 4. Finding review remains item-level and mixed APPROVE/REJECT decisions are supported in one Run.
 5. UPDATE approval is bound to the exact reviewed change-set fingerprint.

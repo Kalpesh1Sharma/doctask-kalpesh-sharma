@@ -22,6 +22,11 @@ from api.application.idempotency_claim_takeover import (
 from domain.final_report import FinalReportInput, final_report_input_fingerprint
 from domain.render_input import render_input_fingerprint
 from domain.run import RunStage, RunStatus, RunStepStatus, RunType
+from domain.update_review_application import (
+    UpdateItemDecisionSnapshot,
+    UpdateReviewApplicationIntegrityError,
+    apply_update_item_decisions,
+)
 from repositories.audit_event_repository import AuditEventRepository
 from repositories.idempotency_repository import (
     IdempotencyFailureKind,
@@ -34,7 +39,9 @@ from repositories.output_repository import OutputRecord, OutputRepository
 from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRecord, RunRepository
 from repositories.run_step_repository import RunStepRecord, RunStepRepository
+from repositories.update_change_item_repository import UpdateChangeItemRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from repositories.update_item_review_decision_repository import UpdateItemReviewDecisionRepository
 from services.final_report_renderer import (
     FinalReportRenderIntegrityError,
     FocusedUpdateProof,
@@ -306,7 +313,14 @@ class CommitFinalReportService:
             raise CommitFinalReportNotEligibleError("COMMIT RunStep is not active")
         return step
 
-    def _build_report_input(self, connection: Connection, run: RunRecord) -> FinalReportInput:
+    def _build_report_input(
+        self,
+        connection: Connection,
+        run: RunRecord,
+        ancestors: frozenset[str] = frozenset(),
+    ) -> FinalReportInput:
+        if run.run_id in ancestors:
+            raise CommitFinalReportIntegrityError("UPDATE baseline lineage contains a cycle")
         # Reuse the proven finalizer source builder: this performs the complete
         # review-state and captured-rule-scope validation without the renderer
         # querying mutable tables itself.
@@ -318,6 +332,50 @@ class CommitFinalReportService:
             if stored is None:
                 raise CommitFinalReportIntegrityError("approved UPDATE has no durable change set")
             update_change_set = stored.to_manifest()
+            items = UpdateChangeItemRepository(connection).list_for_change_set(stored.change_set_id)
+            if items:
+                decisions = UpdateItemReviewDecisionRepository(connection).list_for_change_set(
+                    stored.change_set_id,
+                )
+                by_item = {decision.item_id: decision for decision in decisions}
+                if len(by_item) != len(items):
+                    raise CommitFinalReportIntegrityError(
+                        "itemized UPDATE is missing one or more review decisions",
+                    )
+                if run.baseline_run_id is None:
+                    raise CommitFinalReportIntegrityError("itemized UPDATE has no baseline Run")
+                baseline_run = RunRepository(connection).get_by_id(run.baseline_run_id)
+                if (
+                    baseline_run is None
+                    or baseline_run.status is not RunStatus.COMPLETED
+                    or baseline_run.pile_id != run.pile_id
+                ):
+                    raise CommitFinalReportIntegrityError(
+                        "itemized UPDATE baseline is not a completed Run in the same pile",
+                    )
+                baseline_manifest = self._build_report_input(
+                    connection,
+                    baseline_run,
+                    ancestors | {run.run_id},
+                ).render_input
+                try:
+                    manifest = apply_update_item_decisions(
+                        manifest,
+                        baseline_manifest,
+                        update_change_set,
+                        tuple(
+                            UpdateItemDecisionSnapshot(
+                                fact_id=item.fact_id,
+                                kind=item.kind,
+                                decision=by_item[item.item_id].decision,
+                            )
+                            for item in items
+                        ),
+                    )
+                except UpdateReviewApplicationIntegrityError as error:
+                    raise CommitFinalReportIntegrityError(
+                        "item-level UPDATE decisions cannot be applied safely",
+                    ) from error
         return FinalReportInput(render_input=manifest, update_change_set=update_change_set)
 
     def _baseline_output(

@@ -15,6 +15,7 @@ from api.application.external_update_review_service import ExternalUpdateReviewC
 from api.application.ingest_and_reconcile_document_service import IngestAndReconcileDocumentCommand
 from api.application.review_decision_service import ReviewDecisionCommand
 from api.application.run_workflow_service import RunWorkflowCommand
+from api.change_history_presenter import change_history_response
 from api.interface_contract import MCP_TOOL_BY_OPERATION, ExternalOperation
 from api.mcp.presenters import (
     advance_response,
@@ -41,6 +42,7 @@ from api.rest.schemas.core import (
     RunMetricResponse,
     RunResponse,
 )
+from api.rest.schemas.history import ChangeHistoryRunResponse
 from api.rest.schemas.review import (
     FindingDecisionResponse,
     RunReviewResponse,
@@ -55,7 +57,8 @@ _SERVER_INSTRUCTIONS = (
     "Drive the durable Task-1 document workflow. Use advance_run to progress stages. "
     "When a run reaches REVIEW_REQUIRED, inspect get_run_review and explicitly record "
     "the required human decisions before calling advance_run again. Final output is only "
-    "created by the durable COMMIT stage; no MCP tool bypasses that gate."
+    "created by the durable COMMIT stage; no MCP tool bypasses that gate. Use the "
+    "change-history tools to explain completed UPDATEs from committed provenance."
 )
 _ALLOWED_TRANSPORTS = {"stdio", "streamable-http", "sse"}
 
@@ -253,8 +256,9 @@ def create_mcp_server(
         actor_id: str,
         idempotency_key: str,
         expected_change_set_fingerprint: str,
+        fact_id: str | None = None,
     ) -> UpdateDecisionResponse:
-        """Approve or reject an UPDATE only for the exact reviewed change-set fingerprint."""
+        """Review one material UPDATE Fact item, or a zero-item legacy change set."""
 
         result = services.update_review().record(
             ExternalUpdateReviewCommand(
@@ -264,6 +268,7 @@ def create_mcp_server(
                 actor_id=actor_id,
                 idempotency_key=idempotency_key,
                 expected_change_set_fingerprint=expected_change_set_fingerprint,
+                fact_id=fact_id,
             ),
         )
         return update_decision_response(result)
@@ -286,6 +291,24 @@ def create_mcp_server(
             metric_response(item)
             for item in services.query().list_run_metrics(run_id, limit=limit)
         ]
+
+    @server.tool(name=_tool_name(ExternalOperation.LIST_PILE_CHANGE_HISTORY))
+    def list_pile_change_history(
+        pile_id: str,
+        limit: int = 100,
+    ) -> list[ChangeHistoryRunResponse]:
+        """List committed UPDATE history with source, review, and commit provenance."""
+
+        return [
+            change_history_response(item)
+            for item in services.change_history().list_for_pile(pile_id, limit=limit)
+        ]
+
+    @server.tool(name=_tool_name(ExternalOperation.GET_RUN_CHANGE_HISTORY))
+    def get_run_change_history(run_id: str) -> ChangeHistoryRunResponse:
+        """Explain what one completed UPDATE changed, when, and because of which source."""
+
+        return change_history_response(services.change_history().get_for_run(run_id))
 
     return server
 

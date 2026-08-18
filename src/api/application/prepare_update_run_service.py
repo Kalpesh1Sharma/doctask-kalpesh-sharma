@@ -8,6 +8,10 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.effective_run_fact_state import (
+    EffectiveRunFactStateIntegrityError,
+    list_effective_committed_facts,
+)
 from api.application.idempotency_claim_takeover import (
     DEFAULT_STALE_CLAIM_AFTER,
     classify_in_progress,
@@ -211,11 +215,15 @@ def build_current_update_preparation_manifest(
         for change in changes
         if change.kind is UpdateDocumentChangeKind.RETAINED
     }
+    try:
+        baseline_facts = list_effective_committed_facts(connection, baseline.run_id)
+    except EffectiveRunFactStateIntegrityError as error:
+        raise UpdatePreparationBaselineScopeError(
+            "baseline committed Fact state cannot be reconstructed",
+        ) from error
     carried_fact_ids = tuple(
         record.fact_id
-        for record in RunFactRepository(connection).list_reconciliation_input_for_run(
-            baseline.run_id,
-        )
+        for record in baseline_facts
         if record.status in {FactStatus.CONFIRMED, FactStatus.DISPUTED}
         and record.evidence
         and all(item.document_version_id in retained_versions for item in record.evidence)

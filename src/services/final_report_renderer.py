@@ -142,9 +142,9 @@ def render_focused_update(
         if change.kind is UpdateDocumentChangeKind.RETAINED
     }
     carried_facts = {
-        change.fact_id
-        for change in change_set.fact_delta
-        if change.kind is UpdateFactDeltaKind.CARRIED_FORWARD
+        fact.fact_id
+        for fact in value.render_input.source.facts
+        if fact.relation is RunMembershipRelation.CARRIED_FORWARD
     }
     carried_findings = {
         membership.finding_id
@@ -254,8 +254,17 @@ def _render_lines(value: FinalReportInput) -> tuple[str, ...]:
         lines.extend(("", "## Update Delta"))
         for change in value.update_change_set.document_delta:
             lines.append(f"- document_change: {_json(change.model_dump(mode='json'))}")
+        final_fact_ids = {fact.fact_id for fact in source.facts}
         for change in value.update_change_set.fact_delta:
-            lines.append(f"- fact_change: {_json(change.model_dump(mode='json'))}")
+            applied = (
+                change.kind is UpdateFactDeltaKind.CREATED
+                and change.fact_id in final_fact_ids
+            ) or (
+                change.kind is UpdateFactDeltaKind.REMOVED_FROM_CURRENT_STATE
+                and change.fact_id not in final_fact_ids
+            )
+            if applied:
+                lines.append(f"- fact_change: {_json(change.model_dump(mode='json'))}")
 
     lines.extend(("", "## Confirmed Facts"))
     facts = sorted(

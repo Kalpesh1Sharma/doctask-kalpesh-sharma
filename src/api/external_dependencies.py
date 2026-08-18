@@ -5,6 +5,8 @@ from __future__ import annotations
 from functools import lru_cache
 
 from api.application.build_update_change_set_service import BuildUpdateChangeSetService
+from api.application.change_history_service import ChangeHistoryService
+from api.application.classify_document_version_service import ClassifyDocumentVersionService
 from api.application.commit_final_report_service import CommitFinalReportService
 from api.application.create_pile_service import CreatePileService
 from api.application.create_rule_set_service import CreateRuleSetService
@@ -21,13 +23,16 @@ from api.application.ingest_and_reconcile_document_service import IngestAndRecon
 from api.application.ingest_document_service import IngestDocumentService
 from api.application.prepare_update_run_service import PrepareUpdateRunService
 from api.application.review_decision_service import ReviewDecisionService
+from api.application.review_update_change_item_service import ReviewUpdateChangeItemService
 from api.application.review_update_change_set_service import ReviewUpdateChangeSetService
 from api.application.run_rule_scope_service import RunRuleScopeService
 from api.application.run_workflow_service import RunWorkflowService
+from api.application.semantic_chunk_retrieval_service import SemanticChunkRetrievalService
 from config.settings import get_settings
 from db.pool import pool
 from services.document_parser import DocumentParser
 from services.embedding_provider import DeterministicEmbeddingProvider
+from services.groq_document_classification_provider import GroqDocumentClassificationProvider
 from services.groq_structured_transport import GroqRateLimiter, GroqStructuredTransport
 from services.groq_task_providers import (
     GroqContradictionDetectionProvider,
@@ -48,6 +53,45 @@ class ExternalServiceConfigurationError(RuntimeError):
 
 
 @lru_cache
+def get_groq_transport() -> GroqStructuredTransport:
+    settings = get_settings()
+    if not settings.groq_api_key:
+        raise ExternalServiceConfigurationError(
+            "GROQ_API_KEY is required for semantic document processing",
+        )
+    limiter = GroqRateLimiter(
+        max_requests_per_minute=settings.groq_max_requests_per_minute,
+        min_request_interval_seconds=settings.groq_min_request_interval_seconds,
+        reserve_tokens=settings.groq_rate_limit_reserve_tokens,
+    )
+    return GroqStructuredTransport(
+        settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        timeout_seconds=settings.groq_timeout_seconds,
+        max_completion_tokens=settings.groq_max_completion_tokens,
+        max_retries=settings.groq_max_retries,
+        backoff_base_seconds=settings.groq_backoff_base_seconds,
+        backoff_max_seconds=settings.groq_backoff_max_seconds,
+        estimated_chars_per_token=settings.groq_estimated_chars_per_token,
+        rate_limiter=limiter,
+    )
+
+
+@lru_cache
+def get_document_classification_service() -> ClassifyDocumentVersionService:
+    settings = get_settings()
+    return ClassifyDocumentVersionService(
+        pool,
+        GroqDocumentClassificationProvider(
+            get_groq_transport(),
+            settings.groq_document_classification_model,
+        ),
+        max_chunks=settings.document_classification_max_chunks,
+        max_chars_per_chunk=settings.document_classification_max_chars_per_chunk,
+    )
+
+
+@lru_cache
 def get_create_pile_service() -> CreatePileService:
     return CreatePileService(pool)
 
@@ -63,6 +107,11 @@ def get_external_query_service() -> ExternalQueryService:
 
 
 @lru_cache
+def get_change_history_service() -> ChangeHistoryService:
+    return ChangeHistoryService(pool)
+
+
+@lru_cache
 def get_review_decision_service() -> ReviewDecisionService:
     return ReviewDecisionService(pool)
 
@@ -72,6 +121,7 @@ def get_external_update_review_service() -> ExternalUpdateReviewService:
     return ExternalUpdateReviewService(
         BuildUpdateChangeSetService(pool),
         ReviewUpdateChangeSetService(pool),
+        ReviewUpdateChangeItemService(pool),
     )
 
 
@@ -85,20 +135,40 @@ def get_external_review_query_service() -> ExternalReviewQueryService:
 
 
 @lru_cache
+def get_analysis_embedding_provider() -> DeterministicEmbeddingProvider:
+    # Local deterministic embeddings keep retrieval rate-limit-free. The
+    # production analysis path still performs a real pgvector similarity query;
+    # provenance remains grounded in immutable chunk/evidence identities.
+    return DeterministicEmbeddingProvider()
+
+
+@lru_cache
+def get_semantic_chunk_retrieval_service() -> SemanticChunkRetrievalService:
+    settings = get_settings()
+    return SemanticChunkRetrievalService(
+        get_analysis_embedding_provider(),
+        default_limit=settings.analysis_retrieval_top_k,
+    )
+
+
+@lru_cache
 def get_ingest_and_reconcile_document_service() -> IngestAndReconcileDocumentService:
     settings = get_settings()
     arrival = DocumentArrivalService(pool)
-    # Groq does not expose the embedding endpoint used by the legacy OpenAI
-    # adapter. Embeddings are a retrieval accelerator rather than provenance,
-    # so keep ingestion entirely local and rate-limit-free.
-    embedding_provider = DeterministicEmbeddingProvider()
+    # Groq does not expose an embeddings endpoint. Keep ingestion/retrieval
+    # local and rate-limit-free while storing vectors in PostgreSQL/pgvector.
+    embedding_provider = get_analysis_embedding_provider()
     ingestion = IngestDocumentService(
         pool,
         LocalSourceStorage(settings.source_root),
         DocumentParser(),
         embedding_provider,
     )
-    return IngestAndReconcileDocumentService(ingestion, arrival)
+    return IngestAndReconcileDocumentService(
+        ingestion,
+        arrival,
+        get_document_classification_service(),
+    )
 
 
 @lru_cache
@@ -112,31 +182,14 @@ def get_external_advance_run_service() -> ExternalAdvanceRunService:
 @lru_cache
 def get_run_workflow_service() -> RunWorkflowService:
     settings = get_settings()
-    if not settings.groq_api_key:
-        raise ExternalServiceConfigurationError(
-            "GROQ_API_KEY is required to advance the semantic workflow",
-        )
-    limiter = GroqRateLimiter(
-        max_requests_per_minute=settings.groq_max_requests_per_minute,
-        min_request_interval_seconds=settings.groq_min_request_interval_seconds,
-        reserve_tokens=settings.groq_rate_limit_reserve_tokens,
-    )
-    transport = GroqStructuredTransport(
-        settings.groq_api_key,
-        base_url=settings.groq_base_url,
-        timeout_seconds=settings.groq_timeout_seconds,
-        max_completion_tokens=settings.groq_max_completion_tokens,
-        max_retries=settings.groq_max_retries,
-        backoff_base_seconds=settings.groq_backoff_base_seconds,
-        backoff_max_seconds=settings.groq_backoff_max_seconds,
-        estimated_chars_per_token=settings.groq_estimated_chars_per_token,
-        rate_limiter=limiter,
-    )
+    transport = get_groq_transport()
     extraction = ExtractRunFactsService(
         pool,
         GroqFactExtractionProvider(transport, settings.groq_fact_extraction_model),
         _FACT_INSTRUCTIONS,
         _INSTRUCTION_VERSION,
+        retrieval_service=get_semantic_chunk_retrieval_service(),
+        retrieval_query=settings.analysis_retrieval_query,
     )
     contradictions = DetectRunContradictionsService(
         pool,

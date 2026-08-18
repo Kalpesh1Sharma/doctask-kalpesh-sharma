@@ -133,7 +133,8 @@ export const api = {
     runId: string,
     decision: "APPROVED" | "REJECTED",
     actorId: string,
-    fingerprint: string
+    fingerprint: string,
+    factId: string | null = null
   ) =>
     request(`/api/v1/runs/${runId}/update/decision`, {
       method: "POST",
@@ -141,8 +142,11 @@ export const api = {
         decision,
         actor_type: "HUMAN",
         actor_id: actorId,
-        idempotency_key: `update-review:${runId}:${fingerprint.replace("sha256:", "")}`,
-        expected_change_set_fingerprint: fingerprint
+        idempotency_key: factId
+          ? `update-item-review:${runId}:${factId}:${fingerprint.replace("sha256:", "")}`
+          : `update-review:${runId}:${fingerprint.replace("sha256:", "")}`,
+        expected_change_set_fingerprint: fingerprint,
+        fact_id: factId
       })
     }),
 

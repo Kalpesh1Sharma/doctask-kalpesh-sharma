@@ -33,6 +33,8 @@ def test_versioned_router_exposes_phase6b3_review_and_report_routes() -> None:
         "/api/v1/runs/{run_id}/facts",
         "/api/v1/runs/{run_id}/findings",
         "/api/v1/runs/{run_id}/metrics",
+        "/api/v1/piles/{pile_id}/change-history",
+        "/api/v1/runs/{run_id}/change-history",
     }.issubset(paths)
     assert {
         "/api/v1/runs/{run_id}/review",

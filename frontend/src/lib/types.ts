@@ -173,11 +173,30 @@ export type UpdateReviewDecision = {
   decided_at: string;
 };
 
+export type UpdateItemReviewDecision = {
+  update_item_review_decision_id: string;
+  item_id: string;
+  decision: "APPROVED" | "REJECTED";
+  actor_type: string;
+  actor_id: string;
+  idempotency_key: string;
+  decided_at: string;
+};
+
+export type UpdateChangeItem = {
+  item_id: string | null;
+  fact_id: string;
+  kind: "FACT_CREATED" | "FACT_REMOVED";
+  payload: unknown;
+  decision: UpdateItemReviewDecision | null;
+};
+
 export type UpdateChangeSet = {
   change_set_id: string | null;
   durable: boolean;
   change_set_fingerprint: string;
   manifest: unknown;
+  items: UpdateChangeItem[];
   decision: UpdateReviewDecision | null;
 };
 

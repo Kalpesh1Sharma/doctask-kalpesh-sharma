@@ -18,6 +18,7 @@ from api.application.build_update_change_set_service import (
     UpdateChangeSetRunNotEligibleError,
     build_current_update_change_set_manifest,
 )
+from api.application.change_history_service import ChangeHistoryService
 from api.application.commit_final_report_service import (
     CommitFinalReportCommand,
     CommitFinalReportService,
@@ -35,6 +36,10 @@ from api.application.prepare_update_run_service import (
     PrepareUpdateRunCommand,
     PrepareUpdateRunService,
 )
+from api.application.review_update_change_item_service import (
+    ReviewUpdateChangeItemCommand,
+    ReviewUpdateChangeItemService,
+)
 from api.application.review_update_change_set_service import (
     ReviewUpdateChangeSetCommand,
     ReviewUpdateChangeSetService,
@@ -45,6 +50,7 @@ from api.application.review_update_change_set_service import (
     UpdateReviewRunNotEligibleError,
 )
 from db.pool import pool
+from domain.change_history import ChangeHistoryOutcome
 from domain.final_report import FinalReportInput
 from domain.run import RunStage, RunStatus, RunStepStatus
 from domain.update_review import (
@@ -53,11 +59,16 @@ from domain.update_review import (
 )
 from repositories.audit_event_repository import AuditEventRepository
 from repositories.output_repository import OutputRecord, OutputRepository
+from repositories.run_fact_repository import RunFactRepository
 from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRepository
 from repositories.run_rule_scope_repository import RunRuleScopeRepository
 from repositories.run_step_repository import RunStepRepository
+from repositories.update_change_item_repository import UpdateChangeItemRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from repositories.update_item_review_decision_repository import (
+    UpdateItemReviewDecisionRepository,
+)
 from services.final_report_renderer import render_final_report
 from services.local_artifact_storage import LocalArtifactStorage
 
@@ -1263,3 +1274,346 @@ def test_initial_finalization_is_unchanged_by_update_approval_guard(
     with pool.connection() as connection:
         completed = RunRepository(connection).get_by_id(run_id)
     assert completed is not None and completed.status is RunStatus.COMPLETED
+
+
+def add_current_created_facts_with_evidence(
+    resources: UpdateResources,
+    *,
+    count: int = 2,
+) -> tuple[str, ...]:
+    with pool.connection() as connection:
+        text = "Updated source supports approved and rejected proposed facts."
+        content_hash = f"sha256:{sha256(text.encode()).hexdigest()}"
+        chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (
+                document_version_id, chunk_index, content, content_hash, start_offset, end_offset
+            ) VALUES (%s::uuid, 0, %s, %s, 0, %s)
+            RETURNING id
+            """,
+            (resources.trigger_version_id, text, content_hash, len(text)),
+        ).fetchone()
+        assert chunk is not None
+        chunk_id = str(chunk[0])
+        evidence = connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            ) VALUES (%s::uuid, %s::uuid, 0, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                resources.trigger_version_id,
+                chunk_id,
+                len(text),
+                text,
+                f"sha256:{sha256(text.encode()).hexdigest()}",
+            ),
+        ).fetchone()
+        assert evidence is not None
+        evidence_id = str(evidence[0])
+        fact_ids: list[str] = []
+        for index in range(count):
+            fact_id = str(uuid4())
+            connection.execute(
+                """
+                INSERT INTO facts (id, origin_run_id, subject, predicate, object_value, status)
+                VALUES (%s::uuid, %s::uuid, 'loan', %s, %s::jsonb, 'CONFIRMED')
+                """,
+                (
+                    fact_id,
+                    resources.update_run_id,
+                    f"proposed_{index}",
+                    Jsonb({"value": index}),
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO run_facts (run_id, fact_id, relation)
+                VALUES (%s::uuid, %s::uuid, 'CREATED')
+                """,
+                (resources.update_run_id, fact_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO fact_evidence (fact_id, evidence_span_id)
+                VALUES (%s::uuid, %s::uuid)
+                """,
+                (fact_id, evidence_id),
+            )
+            fact_ids.append(fact_id)
+        connection.commit()
+    return tuple(fact_ids)
+
+
+def test_item_review_records_mixed_decisions_and_replays_exact_request(
+    reviewable_update: UpdateResources,
+) -> None:
+    fact_ids = add_current_created_facts_with_evidence(reviewable_update)
+    built = BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+    assert {delta.fact_id for delta in built.manifest.fact_delta if delta.kind.value == "CREATED"} == set(
+        fact_ids,
+    )
+
+    with pool.connection() as connection:
+        items = UpdateChangeItemRepository(connection).list_for_change_set(
+            built.change_set.change_set_id,
+        )
+    assert {item.fact_id for item in items} == set(fact_ids)
+
+    reviewer = ReviewUpdateChangeItemService(pool)
+    first_key = f"update-item-review:{reviewable_update.update_run_id}:{fact_ids[0]}:approve"
+    first = reviewer.record(
+        ReviewUpdateChangeItemCommand(
+            reviewable_update.update_run_id,
+            fact_ids[0],
+            UpdateReviewDecisionType.APPROVED,
+            "human",
+            "reviewer",
+            first_key,
+        ),
+    )
+    assert first.review_complete is False
+    assert first.replayed is False
+
+    replay = reviewer.record(
+        ReviewUpdateChangeItemCommand(
+            reviewable_update.update_run_id,
+            fact_ids[0],
+            UpdateReviewDecisionType.APPROVED,
+            "human",
+            "reviewer",
+            first_key,
+        ),
+    )
+    assert replay.replayed is True
+    assert replay.decision.update_item_review_decision_id == first.decision.update_item_review_decision_id
+
+    second = reviewer.record(
+        ReviewUpdateChangeItemCommand(
+            reviewable_update.update_run_id,
+            fact_ids[1],
+            UpdateReviewDecisionType.REJECTED,
+            "human",
+            "reviewer",
+            f"update-item-review:{reviewable_update.update_run_id}:{fact_ids[1]}:reject",
+        ),
+    )
+    assert second.review_complete is True
+
+    with pool.connection() as connection:
+        decisions = UpdateItemReviewDecisionRepository(connection).list_for_change_set(
+            built.change_set.change_set_id,
+        )
+        legacy = connection.execute(
+            "SELECT count(*) FROM update_review_decisions WHERE change_set_id = %s::uuid",
+            (built.change_set.change_set_id,),
+        ).fetchone()
+    assert {decision.decision for decision in decisions} == {
+        UpdateReviewDecisionType.APPROVED,
+        UpdateReviewDecisionType.REJECTED,
+    }
+    assert legacy == (0,)
+
+
+def test_commit_respects_mixed_item_decisions_in_final_focused_report(
+    reviewable_update: UpdateResources,
+    tmp_path,
+) -> None:
+    approved_fact_id, rejected_fact_id = add_current_created_facts_with_evidence(
+        reviewable_update,
+    )
+    built = BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+    reviewer = ReviewUpdateChangeItemService(pool)
+    for fact_id, decision, token in (
+        (approved_fact_id, UpdateReviewDecisionType.APPROVED, "approve"),
+        (rejected_fact_id, UpdateReviewDecisionType.REJECTED, "reject"),
+    ):
+        reviewer.record(
+            ReviewUpdateChangeItemCommand(
+                reviewable_update.update_run_id,
+                fact_id,
+                decision,
+                "human",
+                "reviewer",
+                f"update-item-review:{reviewable_update.update_run_id}:{fact_id}:{token}",
+            ),
+        )
+
+    storage = LocalArtifactStorage(tmp_path / "mixed-item-artifacts")
+    materialize_baseline_artifact(storage, reviewable_update)
+    activate_commit_step(reviewable_update.update_run_id)
+    result = CommitFinalReportService(
+        pool,
+        storage,
+        FinalizeRunService(pool, storage),
+    ).commit(CommitFinalReportCommand(reviewable_update.update_run_id))
+    content = storage.read_bytes(result.output.storage_uri, result.output.content_hash).decode("utf-8")
+
+    assert approved_fact_id in content
+    assert rejected_fact_id not in content
+    assert built.change_set.change_set_id
+    with pool.connection() as connection:
+        run = RunRepository(connection).get_by_id(reviewable_update.update_run_id)
+    assert run is not None and run.status is RunStatus.COMPLETED
+
+    # The next UPDATE must start from what actually committed, not the model's
+    # rejected proposal preserved in historical run_facts.
+    with pool.connection() as connection:
+        document = connection.execute(
+            "INSERT INTO documents (pile_id, logical_key) VALUES (%s::uuid, %s) RETURNING id",
+            (reviewable_update.pile_id, f"follow-up-{uuid4()}"),
+        ).fetchone()
+        assert document is not None
+        version = connection.execute(
+            """
+            INSERT INTO document_versions (
+                document_id, version_number, content_hash, storage_uri, processing_status
+            ) VALUES (%s::uuid, 1, %s, %s, 'READY') RETURNING id
+            """,
+            (
+                str(document[0]),
+                f"sha256:{uuid4().hex * 2}",
+                f"storage://{uuid4()}",
+            ),
+        ).fetchone()
+        assert version is not None
+        next_run = connection.execute(
+            """
+            INSERT INTO runs (
+                pile_id, run_type, status, trigger_document_version_id, baseline_run_id
+            ) VALUES (%s::uuid, 'UPDATE', 'PENDING', %s::uuid, %s::uuid) RETURNING id
+            """,
+            (reviewable_update.pile_id, str(version[0]), reviewable_update.update_run_id),
+        ).fetchone()
+        assert next_run is not None
+        next_run_id = str(next_run[0])
+        connection.commit()
+
+    PrepareUpdateRunService(pool).prepare(PrepareUpdateRunCommand(next_run_id))
+    with pool.connection() as connection:
+        next_fact_ids = {
+            record.fact_id for record in RunFactRepository(connection).list_for_run(next_run_id)
+        }
+    assert approved_fact_id in next_fact_ids
+    assert rejected_fact_id not in next_fact_ids
+
+
+def test_change_history_projects_applied_and_rejected_update_items(
+    reviewable_update: UpdateResources,
+    tmp_path,
+) -> None:
+    approved_fact_id, rejected_fact_id = add_current_created_facts_with_evidence(reviewable_update)
+    built = BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+    reviewer = ReviewUpdateChangeItemService(pool)
+    for fact_id, decision, token in (
+        (approved_fact_id, UpdateReviewDecisionType.APPROVED, "approve-history"),
+        (rejected_fact_id, UpdateReviewDecisionType.REJECTED, "reject-history"),
+    ):
+        reviewer.record(
+            ReviewUpdateChangeItemCommand(
+                reviewable_update.update_run_id,
+                fact_id,
+                decision,
+                "human",
+                "history-reviewer",
+                f"update-item-review:{reviewable_update.update_run_id}:{fact_id}:{token}",
+            ),
+        )
+
+    storage = LocalArtifactStorage(tmp_path / "change-history-artifacts")
+    materialize_baseline_artifact(storage, reviewable_update)
+    activate_commit_step(reviewable_update.update_run_id)
+    committed = CommitFinalReportService(
+        pool,
+        storage,
+        FinalizeRunService(pool, storage),
+    ).commit(CommitFinalReportCommand(reviewable_update.update_run_id))
+
+    history = ChangeHistoryService(pool).get_for_run(reviewable_update.update_run_id)
+    assert history.run_id == reviewable_update.update_run_id
+    assert history.pile_id == reviewable_update.pile_id
+    assert history.baseline_run_id == reviewable_update.baseline_run_id
+    assert history.change_set_id == built.change_set.change_set_id
+    assert history.output_id == committed.output.output_id
+    assert history.output_content_hash == committed.output.content_hash
+    assert history.committed_at is not None
+    assert history.commit_actor is not None
+    assert history.commit_actor.actor_type == "system"
+    assert history.commit_actor.actor_id == "commit-final-report"
+    assert history.trigger_source.pile_id == reviewable_update.pile_id
+    assert history.trigger_source.document_id == reviewable_update.trigger_document_id
+    assert history.trigger_source.document_version_id == reviewable_update.trigger_version_id
+    assert history.trigger_source.version_number == 2
+    trigger_document_change = next(
+        change
+        for change in history.document_changes
+        if change.target_source.document_version_id == reviewable_update.trigger_version_id
+    )
+    assert trigger_document_change.document_id == reviewable_update.trigger_document_id
+    assert trigger_document_change.kind.value == "REPLACED"
+    assert trigger_document_change.baseline_source is not None
+    assert trigger_document_change.baseline_source.version_number == 1
+
+    by_fact = {item.fact.fact_id: item for item in history.items}
+    assert set(by_fact) == {approved_fact_id, rejected_fact_id}
+    assert by_fact[approved_fact_id].outcome is ChangeHistoryOutcome.APPLIED
+    assert by_fact[rejected_fact_id].outcome is ChangeHistoryOutcome.REJECTED
+    assert by_fact[approved_fact_id].review.decision is UpdateReviewDecisionType.APPROVED
+    assert by_fact[rejected_fact_id].review.decision is UpdateReviewDecisionType.REJECTED
+    assert by_fact[approved_fact_id].review.actor_id == "history-reviewer"
+    assert by_fact[rejected_fact_id].review.actor_id == "history-reviewer"
+    assert by_fact[approved_fact_id].evidence
+    assert by_fact[rejected_fact_id].evidence
+    for item in history.items:
+        assert item.evidence[0].source.document_version_id == reviewable_update.trigger_version_id
+        assert "approved and rejected proposed facts" in item.evidence[0].source_text
+    assert tuple(item.fact.fact_id for item in history.applied_items) == (approved_fact_id,)
+    assert history.whole_update_review is None
+
+    listed = ChangeHistoryService(pool).list_for_pile(reviewable_update.pile_id, limit=10)
+    assert listed[0].run_id == reviewable_update.update_run_id
+
+
+def test_change_history_projects_zero_item_whole_update_approval(
+    reviewable_update: UpdateResources,
+    tmp_path,
+) -> None:
+    built = BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+    with pool.connection() as connection:
+        assert UpdateChangeItemRepository(connection).list_for_change_set(
+            built.change_set.change_set_id,
+        ) == []
+
+    ReviewUpdateChangeSetService(pool).record(
+        ReviewUpdateChangeSetCommand(
+            reviewable_update.update_run_id,
+            UpdateReviewDecisionType.APPROVED,
+            "human",
+            "whole-reviewer",
+            f"update-review:{reviewable_update.update_run_id}:history-zero-item",
+        ),
+    )
+    storage = LocalArtifactStorage(tmp_path / "zero-item-history-artifacts")
+    materialize_baseline_artifact(storage, reviewable_update)
+    activate_commit_step(reviewable_update.update_run_id)
+    CommitFinalReportService(
+        pool,
+        storage,
+        FinalizeRunService(pool, storage),
+    ).commit(CommitFinalReportCommand(reviewable_update.update_run_id))
+
+    history = ChangeHistoryService(pool).get_for_run(reviewable_update.update_run_id)
+    assert history.items == ()
+    assert history.applied_items == ()
+    assert history.whole_update_review is not None
+    assert history.whole_update_review.decision is UpdateReviewDecisionType.APPROVED
+    assert history.whole_update_review.actor_id == "whole-reviewer"

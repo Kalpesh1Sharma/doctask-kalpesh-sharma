@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
+from domain.document_classification import DocumentRole
 from domain.document_version import DocumentProcessingStatus
 from domain.fact import FactStatus
 from domain.finding import FindingStatus, FindingType
@@ -93,6 +94,20 @@ class DocumentVersionResponse(ApiModel):
     created_at: datetime
 
 
+class DocumentClassificationResponse(ApiModel):
+    classification_id: str
+    document_version_id: str
+    role: DocumentRole
+    confidence: float
+    explanation: str
+    evidence_chunk_ids: list[str]
+    provider_name: str
+    model_name: str | None
+    input_tokens: int | None
+    output_tokens: int | None
+    replayed: bool
+
+
 class IngestDocumentResponse(ApiModel):
     document_id: str
     document_version_id: str
@@ -101,6 +116,7 @@ class IngestDocumentResponse(ApiModel):
     replayed: bool
     created_run_ids: list[str]
     reconciled_blocked_run_id: str | None
+    classification: DocumentClassificationResponse | None = None
 
 
 class RunStepResponse(ApiModel):

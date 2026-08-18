@@ -100,6 +100,19 @@ class _Ingest:
             replayed=False,
             created_run_ids=(_RUN_ID,),
             reconciled_blocked_run_id=None,
+            classification=SimpleNamespace(
+                classification_id="88888888-8888-4888-8888-888888888888",
+                document_version_id=_VERSION_ID,
+                role="CLOSING_DISCLOSURE",
+                confidence=0.98,
+                explanation="Grounded classification.",
+                evidence_chunk_ids=("99999999-9999-4999-8999-999999999999",),
+                provider_name="groq",
+                model_name="openai/gpt-oss-20b",
+                input_tokens=20,
+                output_tokens=5,
+                replayed=False,
+            ),
         )
 
 
@@ -185,6 +198,7 @@ def test_multipart_ingestion_passes_exact_source_stream_to_facade() -> None:
 
     assert response.status_code == 201
     assert response.json()["created_run_ids"] == [_RUN_ID]
+    assert response.json()["classification"]["role"] == "CLOSING_DISCLOSURE"
     assert service.source_bytes == b"hello contract"
 
 

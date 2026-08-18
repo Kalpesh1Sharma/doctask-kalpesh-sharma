@@ -56,6 +56,7 @@ const review: RunReview = {
     durable: false,
     change_set_fingerprint: `sha256:${"b".repeat(64)}`,
     manifest: { added_fact_ids: ["fact-1"] },
+    items: [],
     decision: null
   }
 };
@@ -79,4 +80,48 @@ test("shows exact evidence and records an item-level finding decision", async ()
 test("does not enable update approval until finding review is complete", () => {
   render(<ReviewPanel actorId="alice@example.test" onChanged={() => undefined} review={review} />);
   expect(screen.getByRole("button", { name: "Approve update" })).toBeDisabled();
+});
+
+
+test("records UPDATE Fact decisions independently", async () => {
+  const onChanged = vi.fn();
+  const itemized: RunReview = {
+    ...review,
+    findings: [],
+    finding_review_complete: true,
+    update_change_set: {
+      ...review.update_change_set!,
+      durable: true,
+      change_set_id: "88888888-8888-4888-8888-888888888888",
+      items: [
+        {
+          item_id: "99999999-9999-4999-8999-999999999999",
+          fact_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          kind: "FACT_CREATED",
+          payload: { fact_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", kind: "CREATED" },
+          decision: null
+        },
+        {
+          item_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+          kind: "FACT_REMOVED",
+          payload: { fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", kind: "REMOVED_FROM_CURRENT_STATE" },
+          decision: null
+        }
+      ]
+    }
+  };
+
+  render(<ReviewPanel actorId="alice@example.test" onChanged={onChanged} review={itemized} />);
+  const approveButtons = screen.getAllByRole("button", { name: "Approve change" });
+  fireEvent.click(approveButtons[0]);
+
+  await waitFor(() => expect(api.reviewUpdate).toHaveBeenCalledWith(
+    itemized.run_id,
+    "APPROVED",
+    "alice@example.test",
+    itemized.update_change_set!.change_set_fingerprint,
+    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  ));
+  expect(onChanged).toHaveBeenCalled();
 });

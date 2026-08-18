@@ -30,16 +30,21 @@ export function ReviewPanel({
     }
   }
 
-  async function decideUpdate(decision: "APPROVED" | "REJECTED") {
+  async function decideUpdate(
+    decision: "APPROVED" | "REJECTED",
+    factId: string | null = null
+  ) {
     if (!review.update_change_set) return;
-    setPending("update");
+    const pendingKey = factId ? `update:${factId}` : "update";
+    setPending(pendingKey);
     setError(null);
     try {
       await api.reviewUpdate(
         review.run_id,
         decision,
         actorId,
-        review.update_change_set.change_set_fingerprint
+        review.update_change_set.change_set_fingerprint,
+        factId
       );
       await onChanged();
     } catch (caught) {
@@ -123,15 +128,61 @@ export function ReviewPanel({
           <div className="section-heading compact">
             <div>
               <span className="eyebrow">Focused update</span>
-              <h2>Approve the UPDATE change set</h2>
-              <p className="muted">This decision is fingerprint-bound so unseen changes cannot be approved.</p>
+              <h2>Review UPDATE changes item by item</h2>
+              <p className="muted">Each material Fact change is fingerprint-bound and can be approved or rejected independently.</p>
             </div>
             <StatusBadge value={review.update_change_set.durable ? "DURABLE" : "PREVIEW"} />
           </div>
           <div className="fingerprint mono">{review.update_change_set.change_set_fingerprint}</div>
-          <pre className="manifest">{JSON.stringify(review.update_change_set.manifest, null, 2)}</pre>
 
-          {review.update_change_set.decision ? (
+          {review.update_change_set.items.length ? (
+            <div className="review-grid">
+              {review.update_change_set.items.map((item) => {
+                const pendingKey = `update:${item.fact_id}`;
+                return (
+                  <article className="review-card" key={item.fact_id}>
+                    <header>
+                      <div>
+                        <div className="review-tags">
+                          <StatusBadge value={item.kind} />
+                        </div>
+                        <h3>Fact change</h3>
+                      </div>
+                      <span className="mono tiny">{item.fact_id}</span>
+                    </header>
+                    <pre className="manifest">{JSON.stringify(item.payload, null, 2)}</pre>
+                    {item.decision ? (
+                      <div className="decision-summary">
+                        <StatusBadge value={item.decision.decision} />
+                        <span>
+                          by {item.decision.actor_id} · {formatDate(item.decision.decided_at)}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="button-row">
+                        <button
+                          className="button button-primary"
+                          disabled={pending !== null || !review.finding_review_complete}
+                          onClick={() => void decideUpdate("APPROVED", item.fact_id)}
+                          type="button"
+                        >
+                          {pending === pendingKey ? "Saving…" : "Approve change"}
+                        </button>
+                        <button
+                          className="button button-danger-outline"
+                          disabled={pending !== null || !review.finding_review_complete}
+                          onClick={() => void decideUpdate("REJECTED", item.fact_id)}
+                          type="button"
+                        >
+                          Reject change
+                        </button>
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+            </div>
+          ) : review.update_change_set.decision ? (
             <div className="decision-summary">
               <StatusBadge value={review.update_change_set.decision.decision} />
               <span>
@@ -158,6 +209,11 @@ export function ReviewPanel({
               </button>
             </div>
           )}
+
+          <details>
+            <summary>Full immutable change-set manifest</summary>
+            <pre className="manifest">{JSON.stringify(review.update_change_set.manifest, null, 2)}</pre>
+          </details>
         </article>
       ) : null}
     </section>

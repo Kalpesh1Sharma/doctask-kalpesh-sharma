@@ -22,7 +22,7 @@ from services.openai_structured_transport import ProviderUsage
 
 T = TypeVar("T", bound=BaseModel)
 
-_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+_GROQ_BASE_URL = "https://api.groq.com"
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429})
 
 

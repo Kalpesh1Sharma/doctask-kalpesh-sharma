@@ -20,6 +20,10 @@ from api.application.prepare_update_run_service import (
     build_current_update_preparation_manifest,
 )
 from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
+from api.application.semantic_chunk_retrieval_service import (
+    SemanticChunkRetrievalError,
+    SemanticChunkRetrievalService,
+)
 from domain.evidence import EvidenceSpan
 from domain.fact import Fact, FactStatus
 from domain.fact_extraction import (
@@ -62,6 +66,10 @@ _IDEMPOTENCY_SCOPE = "fact-extraction-v1"
 _UPDATE_IDEMPOTENCY_SCOPE = "fact-extraction-update-v2"
 _PREPARATION_SCOPE = "update-preparation-v1"
 _MAX_TRANSACTION_ATTEMPTS = 3
+_DEFAULT_RETRIEVAL_QUERY = (
+    "Material mortgage-document facts: parties, obligations, amounts, dates, terms, "
+    "approvals, disclosures, settlement details, and compliance-relevant statements."
+)
 
 
 class FactExtractionApplicationError(Exception):
@@ -177,12 +185,18 @@ class ExtractRunFactsService:
         instruction_version: str,
         *,
         stale_claim_after: timedelta = DEFAULT_STALE_CLAIM_AFTER,
+        retrieval_service: SemanticChunkRetrievalService | None = None,
+        retrieval_query: str = _DEFAULT_RETRIEVAL_QUERY,
     ) -> None:
         self._connection_pool = connection_pool
         self._provider = provider
         self._trusted_instructions = trusted_instructions
         self._instruction_version = instruction_version
         self._stale_claim_after = validate_stale_claim_after(stale_claim_after)
+        if not retrieval_query.strip():
+            raise ValueError("retrieval_query must not be empty")
+        self._retrieval_service = retrieval_service
+        self._retrieval_query = retrieval_query
 
     def extract(self, command: ExtractRunFactsCommand) -> ExtractRunFactsResult:
         normalized_command = ExtractRunFactsCommand(
@@ -586,7 +600,12 @@ class ExtractRunFactsService:
             for membership in RunDocumentVersionRepository(connection).list_for_run(run_id)
         ]
         chunk_repository = DocumentChunkRepository(connection)
-        chunks = self._list_chunks(chunk_repository, version_ids, for_share=for_share)
+        chunks = self._analysis_chunks(
+            connection,
+            chunk_repository,
+            version_ids,
+            for_share=for_share,
+        )
         return FactExtractionRequest(
             run_id=run_id,
             instruction_version=self._instruction_version,
@@ -662,7 +681,8 @@ class ExtractRunFactsService:
             )
 
         chunk_repository = DocumentChunkRepository(connection)
-        chunks = self._list_chunks(
+        chunks = self._analysis_chunks(
+            connection,
             chunk_repository,
             (run.trigger_document_version_id,),
             for_share=for_share,
@@ -724,6 +744,35 @@ class ExtractRunFactsService:
             raise UpdateFactExtractionTargetStateConflictError(
                 "fresh UPDATE extraction cannot add to an existing created Fact set",
             )
+
+    def _analysis_chunks(
+        self,
+        connection: Connection,
+        repository: DocumentChunkRepository,
+        version_ids: Iterable[str],
+        *,
+        for_share: bool,
+    ) -> list[DocumentChunkRecord]:
+        normalized_version_ids = tuple(version_ids)
+        if self._retrieval_service is None:
+            return self._list_chunks(
+                repository,
+                normalized_version_ids,
+                for_share=for_share,
+            )
+        try:
+            return list(
+                self._retrieval_service.retrieve(
+                    connection,
+                    normalized_version_ids,
+                    self._retrieval_query,
+                    for_share=for_share,
+                ),
+            )
+        except SemanticChunkRetrievalError as error:
+            raise SourceInputDriftError(
+                "analysis retrieval could not derive a grounded source scope",
+            ) from error
 
     def _list_chunks(
         self,

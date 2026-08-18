@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from api.application.classify_document_version_service import (
+    ClassifyDocumentVersionCommand,
+    ClassifyDocumentVersionResult,
+    ClassifyDocumentVersionService,
+)
 from api.application.document_arrival_service import DocumentArrivalService
 from api.application.ingest_document_service import IngestDocumentCommand, IngestDocumentService
 from services.local_source_storage import SourceInput
@@ -25,6 +30,7 @@ class IngestAndReconcileDocumentResult:
     replayed: bool
     created_run_ids: tuple[str, ...]
     reconciled_blocked_run_id: str | None
+    classification: ClassifyDocumentVersionResult | None = None
 
 
 class IngestAndReconcileDocumentService:
@@ -34,9 +40,11 @@ class IngestAndReconcileDocumentService:
         self,
         ingestion_service: IngestDocumentService,
         arrival_service: DocumentArrivalService,
+        classification_service: ClassifyDocumentVersionService | None = None,
     ) -> None:
         self._ingestion = ingestion_service
         self._arrival = arrival_service
+        self._classification = classification_service
 
     def ingest(
         self,
@@ -45,8 +53,15 @@ class IngestAndReconcileDocumentService:
         ingestion = self._ingestion.ingest(
             IngestDocumentCommand(command.pile_id, command.logical_key, command.source),
         )
-        # Always reconcile after a successful exact replay too.  This repairs a
-        # prior process crash between READY persistence and lineage creation.
+        classification = (
+            self._classification.classify(
+                ClassifyDocumentVersionCommand(ingestion.document_version_id),
+            )
+            if self._classification is not None
+            else None
+        )
+        # Always reconcile after successful classification/exact replay too. This
+        # repairs crashes between READY/classification persistence and lineage creation.
         arrival = self._arrival.reconcile_pile(command.pile_id)
         return IngestAndReconcileDocumentResult(
             document_id=ingestion.document_id,
@@ -56,4 +71,5 @@ class IngestAndReconcileDocumentService:
             replayed=ingestion.replayed,
             created_run_ids=arrival.created_run_ids,
             reconciled_blocked_run_id=arrival.reconciled_blocked_run_id,
+            classification=classification,
         )

@@ -22,7 +22,9 @@ from repositories.output_repository import OutputRecord, OutputRepository
 from repositories.render_input_repository import RenderInputRepository
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_repository import RunRecord, RunRepository
+from repositories.update_change_item_repository import UpdateChangeItemRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
+from repositories.update_item_review_decision_repository import UpdateItemReviewDecisionRepository
 from repositories.update_review_decision_repository import UpdateReviewDecisionRepository
 from services.local_artifact_storage import ArtifactIntegrityError, LocalArtifactStorage
 
@@ -209,13 +211,28 @@ class FinalizeRunService:
         if change_set is None:
             raise UpdateApprovalMissingError("UPDATE Run has no durable change set")
         change_set.to_manifest()
+        items = UpdateChangeItemRepository(connection).list_for_change_set(
+            change_set.change_set_id,
+        )
         decision = UpdateReviewDecisionRepository(connection).get_by_change_set_id(
             change_set.change_set_id,
         )
-        if decision is None:
-            raise UpdateApprovalMissingError("UPDATE change set has no approval")
-        if decision.decision is UpdateReviewDecisionType.REJECTED:
-            raise UpdateApprovalRejectedError("UPDATE change set was rejected")
+        if items:
+            # Migration 008 preserves pre-existing whole-set decisions. A legacy
+            # REJECTED decision remains a hard rejection; it must not become a
+            # committable no-op merely because its material items were backfilled.
+            if decision is not None and decision.decision is UpdateReviewDecisionType.REJECTED:
+                raise UpdateApprovalRejectedError("UPDATE change set was rejected")
+            item_decisions = UpdateItemReviewDecisionRepository(connection).list_for_change_set(
+                change_set.change_set_id,
+            )
+            if len(item_decisions) != len(items):
+                raise UpdateApprovalMissingError("UPDATE change items are not fully reviewed")
+        else:
+            if decision is None:
+                raise UpdateApprovalMissingError("UPDATE change set has no approval")
+            if decision.decision is UpdateReviewDecisionType.REJECTED:
+                raise UpdateApprovalRejectedError("UPDATE change set was rejected")
         current_change_set = build_current_update_change_set_manifest(connection, run)
         if update_change_set_fingerprint(current_change_set) != change_set.change_set_fingerprint:
             raise UpdateApprovalStaleError("approved UPDATE change set no longer matches current state")

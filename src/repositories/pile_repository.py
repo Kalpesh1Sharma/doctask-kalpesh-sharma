@@ -77,6 +77,20 @@ class PileRepository:
         ).fetchone()
         return PileRecord.from_row(row) if row is not None else None
 
+    def list_watch_enabled(self, limit: int) -> list[PileRecord]:
+        rows = self._connection.execute(
+            f"""
+            SELECT {_PILE_COLUMNS}
+            FROM piles
+            WHERE watch_enabled = TRUE
+              AND watch_location IS NOT NULL
+            ORDER BY id ASC
+            LIMIT %s
+            """,
+            (limit,),
+        ).fetchall()
+        return [PileRecord.from_row(row) for row in rows]
+
     def list_ids_with_ready_current_versions(self, limit: int) -> tuple[str, ...]:
         rows = self._connection.execute(
             """
