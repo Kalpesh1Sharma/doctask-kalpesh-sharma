@@ -270,7 +270,7 @@ The Playwright E2E suite starts its own FastAPI/Vite processes and uses an isola
 For the Phase 6B closure run, use:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\phase6b_final_verify.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\phase6c_final_verify.ps1
 ```
 
 For the Phase 6C-5 operational behavioral proof, use:
