@@ -64,9 +64,12 @@ export function RunWorkspace({
 
   async function refreshReview() {
     try {
-      const next = await api.getRunReview(runId);
-      setReview(next);
-      await refreshRun();
+      const nextReview = await api.getRunReview(runId);
+      setReview(nextReview);
+      const nextRun = await refreshRun();
+      if (nextReview.commit_ready && nextRun?.status === "REVIEW_REQUIRED") {
+        await reconcileWorkerCommit();
+      }
     } catch (caught) {
       setError(messageFor(caught));
     }
@@ -94,28 +97,65 @@ export function RunWorkspace({
     setBusy(true);
     setError(null);
     try {
+      const current = await refreshRun();
+      if (current?.status === "COMPLETED") {
+        await showCompletedRun();
+        return;
+      }
+
       await api.advanceRun(runId, selectedRuleSetIds, selectedRuleIds);
-      setFacts(null);
-      setFindings(null);
-      setReview(null);
-      setMetrics(null);
-      setReport(null);
-      setReportContent(null);
+      clearDerivedRunState();
       const next = await refreshRun();
       if (next?.status === "REVIEW_REQUIRED") {
         setTab("review");
         setReview(await api.getRunReview(runId));
       } else if (next?.status === "COMPLETED") {
-        setTab("report");
-        const [metadata, content] = await Promise.all([api.getFinalReport(runId), api.getFinalReportContent(runId)]);
-        setReport(metadata);
-        setReportContent(content);
+        await showCompletedRun();
       }
     } catch (caught) {
+      // The background worker may win the COMMIT race between the UI's last
+      // read and this manual advance. Re-read PostgreSQL-backed run state
+      // before surfacing an integrity/conflict error. If COMMIT already won,
+      // the user's requested outcome is complete and the stale POST is benign.
+      const current = await refreshRun();
+      if (current?.status === "COMPLETED") {
+        await showCompletedRun();
+        return;
+      }
       setError(messageFor(caught));
     } finally {
       setBusy(false);
     }
+  }
+
+  async function reconcileWorkerCommit() {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await delay(250);
+      const current = await refreshRun();
+      if (!current || current.status !== "REVIEW_REQUIRED") {
+        if (current?.status === "COMPLETED") await showCompletedRun();
+        return current;
+      }
+    }
+    return run;
+  }
+
+  function clearDerivedRunState() {
+    setFacts(null);
+    setFindings(null);
+    setReview(null);
+    setMetrics(null);
+    setReport(null);
+    setReportContent(null);
+  }
+
+  async function showCompletedRun() {
+    clearDerivedRunState();
+    setTab("report");
+    const [metadata, content] = await Promise.all([api.getFinalReport(runId), api.getFinalReportContent(runId)]);
+    setReport(metadata);
+    setReportContent(content);
+    setError(null);
   }
 
   if (!run) {
@@ -267,6 +307,7 @@ function ReportPanel({ report, content }: { report: FinalReport | null; content:
 }
 
 function LoadingPanel() { return <section className="panel">Loading…</section>; }
+function delay(milliseconds: number) { return new Promise<void>((resolve) => window.setTimeout(resolve, milliseconds)); }
 function Metric({ label, value }: { label: string; value: string }) { return <div className="metric-card"><span>{label}</span><strong>{value}</strong></div>; }
 function shortId(value: string) { return `${value.slice(0, 8)}…${value.slice(-4)}`; }
 function shortHash(value: string) { return `${value.slice(0, 15)}…${value.slice(-8)}`; }

@@ -1,8 +1,10 @@
 """Application use case for grounded immutable Run-rule evaluation."""
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from psycopg import Connection
@@ -18,8 +20,10 @@ from api.application.idempotency_claim_takeover import (
 from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
 from domain.fact import FactStatus
 from domain.fact_extraction import normalize_uuid
+from domain.fact_semantics import canonical_fact_concept, canonical_field_concept
 from domain.finding import Finding, FindingStatus, FindingType
 from domain.rule_evaluation import (
+    RuleEvaluationOutcome,
     RuleEvaluationRequest,
     RuleEvaluationResponse,
     RuleEvaluationRule,
@@ -27,6 +31,7 @@ from domain.rule_evaluation import (
     RuleEvaluationSourceEvidence,
     RuleEvaluationSourceFact,
     RuleOutcomeType,
+    RuleViolationCandidate,
     canonical_json_value,
     rule_evaluation_input_fingerprint,
 )
@@ -57,6 +62,117 @@ _REFERENCE = re.compile(
     r"^rule-evaluation:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{12}:sha256:[0-9a-f]{64}$",
 )
+
+_NUMERIC_TEXT = re.compile(
+    r"^\s*(?:(?P<prefix>[A-Za-z]{3})\s*)?(?P<symbol>[$€£])?\s*"
+    r"(?P<number>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    r"\s*(?P<suffix>[A-Za-z]{3})?\s*$",
+)
+_CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
+_OPERATOR_ALIASES = {
+    "less_than_or_equal": "less_than_or_equal",
+    "less_than_or_equal_to": "less_than_or_equal",
+    "<=": "less_than_or_equal",
+    "lte": "less_than_or_equal",
+    "less_than": "less_than",
+    "<": "less_than",
+    "lt": "less_than",
+    "greater_than_or_equal": "greater_than_or_equal",
+    "greater_than_or_equal_to": "greater_than_or_equal",
+    ">=": "greater_than_or_equal",
+    "gte": "greater_than_or_equal",
+    "greater_than": "greater_than",
+    ">": "greater_than",
+    "gt": "greater_than",
+}
+
+
+@dataclass(frozen=True)
+class _NumericConstraint:
+    field: str | None
+    operator: str
+    threshold: Decimal
+    currency: str | None
+
+
+def _numeric_scalar(value: object) -> tuple[Decimal, str | None] | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return Decimal(str(value)), None
+        except InvalidOperation:
+            return None
+    if not isinstance(value, str):
+        return None
+    match = _NUMERIC_TEXT.fullmatch(value)
+    if match is None:
+        return None
+    prefix = match.group("prefix")
+    suffix = match.group("suffix")
+    symbol = match.group("symbol")
+    currencies = {
+        item.upper()
+        for item in (prefix, suffix, _CURRENCY_SYMBOLS.get(symbol or ""))
+        if item
+    }
+    if len(currencies) > 1:
+        return None
+    try:
+        number = Decimal(match.group("number").replace(",", ""))
+    except InvalidOperation:
+        return None
+    return number, next(iter(currencies), None)
+
+
+def _numeric_constraint(definition: object) -> _NumericConstraint | None:
+    if not isinstance(definition, Mapping):
+        return None
+
+    field_value = definition.get("field")
+    field = field_value if isinstance(field_value, str) and field_value.strip() else None
+    currency_value = definition.get("currency")
+    currency = (
+        currency_value.strip().upper()
+        if isinstance(currency_value, str) and currency_value.strip()
+        else None
+    )
+
+    operator: str | None = None
+    threshold_value: object | None = None
+    if "maximum" in definition:
+        operator = "less_than_or_equal"
+        threshold_value = definition["maximum"]
+    elif "minimum" in definition:
+        operator = "greater_than_or_equal"
+        threshold_value = definition["minimum"]
+    else:
+        raw_operator = definition.get("operator")
+        if isinstance(raw_operator, str):
+            operator = _OPERATOR_ALIASES.get(raw_operator.strip().casefold())
+        threshold_value = definition.get("value")
+
+    if operator is None or threshold_value is None:
+        return None
+    parsed = _numeric_scalar(threshold_value)
+    if parsed is None:
+        return None
+    threshold, threshold_currency = parsed
+    if currency is not None and threshold_currency is not None and currency != threshold_currency:
+        return None
+    return _NumericConstraint(field, operator, threshold, currency or threshold_currency)
+
+
+def _violates_constraint(value: Decimal, operator: str, threshold: Decimal) -> bool:
+    if operator == "less_than_or_equal":
+        return value > threshold
+    if operator == "less_than":
+        return value >= threshold
+    if operator == "greater_than_or_equal":
+        return value < threshold
+    if operator == "greater_than":
+        return value <= threshold
+    raise AssertionError(f"unsupported normalized operator: {operator}")
 
 
 class RuleEvaluationApplicationError(Exception):
@@ -173,23 +289,35 @@ class EvaluateRunRulesService:
             self._persist(claimed, ())
             return EvaluateRunRulesResult(claimed.request.run_id, claimed.fingerprint, replayed=False)
 
-        receipt = start_provider_usage(
-            self._connection_pool,
-            run_id=claimed.request.run_id,
-            stage=RunStage.EXAMINE,
-            operation_scope=_SCOPE,
-            operation_key=self._key(claimed.request.run_id),
-            claim_generation=claimed.token,
-            provider=self._provider,
+        deterministic_request, deterministic_response, provider_request = (
+            self._partition_deterministic_rules(claimed.request)
         )
+        plans: list[_FindingPlan] = []
+        if deterministic_request.rules:
+            plans.extend(
+                self._build_finding_plans(deterministic_request, deterministic_response)
+            )
+
         try:
-            try:
-                response = self._provider.evaluate(claimed.request)
-                plans = self._build_finding_plans(claimed.request, response)
-            finally:
-                finish_provider_usage(
-                    self._connection_pool, receipt, getattr(self._provider, "last_usage", None),
+            if provider_request.rules:
+                receipt = start_provider_usage(
+                    self._connection_pool,
+                    run_id=claimed.request.run_id,
+                    stage=RunStage.EXAMINE,
+                    operation_scope=_SCOPE,
+                    operation_key=self._key(claimed.request.run_id),
+                    claim_generation=claimed.token,
+                    provider=self._provider,
                 )
+                try:
+                    response = self._provider.evaluate(provider_request)
+                    plans.extend(self._build_finding_plans(provider_request, response))
+                finally:
+                    finish_provider_usage(
+                        self._connection_pool,
+                        receipt,
+                        getattr(self._provider, "last_usage", None),
+                    )
         except UnsupportedRuleEvaluationError:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_UNSUPPORTED_EVALUATION)
             raise
@@ -211,7 +339,7 @@ class EvaluateRunRulesService:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_PROVIDER_FAILURE)
             raise RuleEvaluationProviderFailure("rule evaluation provider failed") from error
 
-        self._persist(claimed, plans)
+        self._persist(claimed, tuple(plans))
         return EvaluateRunRulesResult(claimed.request.run_id, claimed.fingerprint, replayed=False)
 
     def _retry_after_failed_from_workflow(
@@ -479,6 +607,8 @@ class EvaluateRunRulesService:
                 if any(fact_id not in facts for fact_id in candidate.supporting_fact_ids):
                     raise InvalidRuleEvaluationResponseError("provider referenced Fact outside evaluation input")
                 support = tuple(facts[fact_id] for fact_id in candidate.supporting_fact_ids)
+                if not self._candidate_is_deterministically_possible(rule, support):
+                    continue
                 evidence_ids = tuple(sorted({
                     *(item.evidence_id for fact in support for item in fact.evidence),
                 }))
@@ -502,6 +632,151 @@ class EvaluateRunRulesService:
                     evidence_ids,
                 ))
         return tuple(plans)
+
+    def _partition_deterministic_rules(
+        self,
+        request: RuleEvaluationRequest,
+    ) -> tuple[RuleEvaluationRequest, RuleEvaluationResponse, RuleEvaluationRequest]:
+        deterministic_rules: list[RuleEvaluationRule] = []
+        deterministic_outcomes: list[RuleEvaluationOutcome] = []
+        provider_rules: list[RuleEvaluationRule] = []
+
+        for rule in request.rules:
+            outcome = self._deterministic_outcome(rule, request.source_facts)
+            if outcome is None:
+                provider_rules.append(rule)
+                continue
+            deterministic_rules.append(rule)
+            deterministic_outcomes.append(outcome)
+
+        deterministic_request = request.model_copy(
+            update={"rules": tuple(deterministic_rules)},
+        )
+        deterministic_response = RuleEvaluationResponse(
+            format="rule-evaluation-v1",
+            outcomes=tuple(deterministic_outcomes),
+        )
+        provider_request = request.model_copy(update={"rules": tuple(provider_rules)})
+        return deterministic_request, deterministic_response, provider_request
+
+    def _deterministic_outcome(
+        self,
+        rule: RuleEvaluationRule,
+        source_facts: tuple[RuleEvaluationSourceFact, ...],
+    ) -> RuleEvaluationOutcome | None:
+        definition = rule.definition
+        if not isinstance(definition, Mapping):
+            return None
+
+        numeric = _numeric_constraint(definition)
+        if numeric is not None and numeric.field is not None:
+            field_concept = canonical_field_concept(numeric.field)
+            matching = tuple(
+                fact
+                for fact in source_facts
+                if canonical_fact_concept(fact.subject, fact.predicate) == field_concept
+            )
+            if not matching:
+                return None
+
+            created = tuple(
+                fact for fact in matching if fact.relation is RunMembershipRelation.CREATED
+            )
+            candidates = created or matching
+            violating_ids: list[str] = []
+            for fact in candidates:
+                parsed = _numeric_scalar(fact.object_value)
+                if parsed is None:
+                    return None
+                value, fact_currency = parsed
+                if (
+                    numeric.currency is not None
+                    and fact_currency is not None
+                    and fact_currency != numeric.currency
+                ):
+                    return None
+                if _violates_constraint(value, numeric.operator, numeric.threshold):
+                    violating_ids.append(fact.fact_id)
+
+            if violating_ids:
+                return RuleEvaluationOutcome(
+                    source_rule_id=rule.source_rule_id,
+                    outcome=RuleOutcomeType.VIOLATIONS,
+                    violations=tuple(
+                        RuleViolationCandidate(supporting_fact_ids=(fact_id,))
+                        for fact_id in violating_ids
+                    ),
+                )
+            return RuleEvaluationOutcome(
+                source_rule_id=rule.source_rule_id,
+                outcome=RuleOutcomeType.NO_VIOLATION,
+            )
+
+        field_value = definition.get("field")
+        requires_grounded = definition.get("require_grounded_value") is True
+        if requires_grounded and isinstance(field_value, str) and field_value.strip():
+            field_concept = canonical_field_concept(field_value)
+            for fact in source_facts:
+                if canonical_fact_concept(fact.subject, fact.predicate) != field_concept:
+                    continue
+                if not fact.evidence:
+                    continue
+                value = fact.object_value
+                if value is None:
+                    continue
+                if isinstance(value, str) and not value.strip():
+                    continue
+                return RuleEvaluationOutcome(
+                    source_rule_id=rule.source_rule_id,
+                    outcome=RuleOutcomeType.NO_VIOLATION,
+                )
+
+        return None
+
+    def _candidate_is_deterministically_possible(
+        self,
+        rule: RuleEvaluationRule,
+        support: tuple[RuleEvaluationSourceFact, ...],
+    ) -> bool:
+        constraint = _numeric_constraint(rule.definition)
+        if constraint is None:
+            return True
+
+        candidates = support
+        if constraint.field is not None:
+            field_concept = canonical_field_concept(constraint.field)
+            candidates = tuple(
+                fact
+                for fact in support
+                if canonical_fact_concept(fact.subject, fact.predicate) == field_concept
+            )
+            # A field mismatch is not enough to second-guess a semantic provider.
+            if not candidates:
+                return True
+
+        comparable_values: list[Decimal] = []
+        for fact in candidates:
+            parsed = _numeric_scalar(fact.object_value)
+            if parsed is None:
+                continue
+            value, fact_currency = parsed
+            if (
+                constraint.currency is not None
+                and fact_currency is not None
+                and fact_currency != constraint.currency
+            ):
+                continue
+            comparable_values.append(value)
+
+        # Preserve provider semantics when deterministic code cannot safely parse
+        # the candidate.  When it can parse the values, impossible numeric
+        # violations are filtered before any durable Finding is created.
+        if not comparable_values:
+            return True
+        return any(
+            _violates_constraint(value, constraint.operator, constraint.threshold)
+            for value in comparable_values
+        )
 
     def _normalize_run_id(self, value: str) -> str:
         try:

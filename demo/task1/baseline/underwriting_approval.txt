@@ -1,0 +1,12 @@
+UNDERWRITING APPROVAL
+File Reference: TASK1-DEMO-001
+
+Borrower: Jordan Lee
+Property Address: 18 Oak Ridge Lane, Austin, TX 78704
+Approved Loan Amount: $320,000
+Approved Interest Rate: 6.250%
+Approved Loan Term: 30 years
+Escrow Required: Yes
+
+Approval status: APPROVED SUBJECT TO STANDARD CLOSING CONDITIONS.
+This document is a synthetic source created only for the Task 1 demonstration.

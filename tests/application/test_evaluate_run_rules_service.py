@@ -1,3 +1,4 @@
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -97,7 +98,12 @@ def create_resources(
     *,
     scope: str = "normal",
     status: str = "RUNNING",
+    rule_definition: object | None = None,
+    fact_value: object = 110,
+    fact_subject: str = "amount",
+    fact_predicate: str = "equals",
 ) -> Resources:
+    definition = {"maximum": 100} if rule_definition is None else rule_definition
     with pool.connection() as connection:
         pile = connection.execute(
             "INSERT INTO piles (name) VALUES (%s) RETURNING id",
@@ -123,12 +129,21 @@ def create_resources(
             INSERT INTO rules (id, rule_set_id, rule_key, title, description, severity, definition)
             VALUES (%s::uuid, %s::uuid, 'amount-max', 'Amount maximum', 'No amount over 100', 'HIGH', %s::jsonb)
             """,
-            (rule_id, rule_set_id, '{"maximum":100}'),
+            (rule_id, rule_set_id, json.dumps(definition)),
         )
+        quote = str(fact_value)
+        content = f"Value: {quote}"
         version_id, chunk_id, evidence_id = create_document_evidence(
-            connection, pile_id, "Amount 110", 7, 10, "110"
+            connection, pile_id, content, 7, 7 + len(quote), quote
         )
-        fact_id = create_fact(connection, run_id, 110, evidence_id)
+        fact_id = create_fact(
+            connection,
+            run_id,
+            fact_value,
+            evidence_id,
+            subject=fact_subject,
+            predicate=fact_predicate,
+        )
         if scope != "none":
             snapshots = RunRuleScopeRepository(connection)
             if scope != "empty":
@@ -148,7 +163,7 @@ def create_resources(
                     title="Amount maximum",
                     description="No amount over 100",
                     severity="HIGH",
-                    definition={"maximum": 100},
+                    definition=definition,
                 ))
             snapshots.complete_scope(run_id)
         connection.commit()
@@ -204,12 +219,14 @@ def create_fact(
     origin_run_id: str | None = None,
     relation: RunMembershipRelation = RunMembershipRelation.CREATED,
     status: FactStatus = FactStatus.CONFIRMED,
+    subject: str = "amount",
+    predicate: str = "equals",
 ) -> str:
     record = FactRepository(connection).create(Fact(
         fact_id=str(uuid4()),
         origin_run_id=origin_run_id or run_id,
-        subject="amount",
-        predicate="equals",
+        subject=subject,
+        predicate=predicate,
         object_value=value,
         status=status,
     ))
@@ -335,6 +352,55 @@ def test_multiple_supporting_facts_cross_document_evidence_and_membership_status
         ).fetchall()
     assert [str(row[0]) for row in rows] == sorted([resources.evidence_id, evidence])
     assert version != resources.document_version_id
+
+
+@pytest.mark.parametrize(
+    ("value", "expected_findings"),
+    [("$18,750", 0), ("$19,250", 1)],
+)
+def test_structured_numeric_rule_filters_impossible_provider_violation(
+    value: str,
+    expected_findings: int,
+) -> None:
+    resources = create_resources(
+        rule_definition={
+            "field": "cash_to_close",
+            "operator": "less_than_or_equal",
+            "value": 19000,
+            "currency": "USD",
+        },
+        fact_value=value,
+        fact_subject="LOAN ESTIMATE",
+        fact_predicate="has Estimated Cash to Close",
+    )
+    provider = FakeProvider(response_for(resources))
+
+    service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+
+    assert provider.calls == []
+    assert finding_count(resources) == expected_findings
+    completed = record(resources)
+    assert completed is not None and completed.status is IdempotencyStatus.COMPLETED
+
+
+def test_grounded_presence_rule_completes_without_provider_when_value_exists() -> None:
+    resources = create_resources(
+        rule_definition={
+            "field": "loan_amount",
+            "require_grounded_value": True,
+        },
+        fact_value="$320,000",
+        fact_subject="Loan Amount",
+        fact_predicate="is",
+    )
+    provider = FailingProvider()
+
+    service(provider).evaluate(EvaluateRunRulesCommand(resources.run_id))
+
+    assert provider.calls == 0
+    assert finding_count(resources) == 0
+    completed = record(resources)
+    assert completed is not None and completed.status is IdempotencyStatus.COMPLETED
 
 
 def test_nonempty_scope_no_violation_completes_with_zero_findings() -> None:

@@ -1,0 +1,31 @@
+{
+  "name": "Task 1 Demo Rules",
+  "description": "Small user-supplied rule set for the Task 1 agentic-system demo.",
+  "version": 1,
+  "rules": [
+    {
+      "rule_key": "cash_to_close_limit",
+      "title": "Cash to close must not exceed 19000 USD",
+      "description": "Flag source-backed cash-to-close values greater than USD 19,000. Cite the exact source value used.",
+      "severity": "HIGH",
+      "definition": {
+        "field": "cash_to_close",
+        "operator": "less_than_or_equal",
+        "value": 19000,
+        "currency": "USD",
+        "instruction": "Only create a finding when a grounded current-source cash-to-close value is greater than 19000 USD. Do not invent missing values."
+      }
+    },
+    {
+      "rule_key": "loan_amount_present",
+      "title": "Loan amount must be grounded in the source pile",
+      "description": "The report must have a source-backed loan amount rather than infer one from unrelated numbers.",
+      "severity": "MEDIUM",
+      "definition": {
+        "field": "loan_amount",
+        "require_grounded_value": true,
+        "instruction": "Create a finding only if no current source supports a loan amount."
+      }
+    }
+  ]
+}

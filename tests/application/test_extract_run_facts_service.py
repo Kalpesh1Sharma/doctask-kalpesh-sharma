@@ -1893,6 +1893,112 @@ def test_extracts_grounded_fact_with_chunk_relative_evidence(resources: Extracti
     assert idempotency.result_reference == f"fact-extraction:{resources.run_id}:{result.input_fingerprint}"
 
 
+def test_unique_exact_quote_repairs_provider_offsets(resources: ExtractionResources) -> None:
+    provider = FakeProvider(
+        FactExtractionResponse(
+            format="fact-extraction-v1",
+            candidates=(
+                FactExtractionCandidate(
+                    subject="invoice amount",
+                    predicate="equals",
+                    object_value={"amount": 100, "currency": "USD"},
+                    evidence=(
+                        FactEvidenceCandidate(
+                            chunk_id=resources.chunk_id,
+                            relative_start_offset=100,
+                            relative_end_offset=107,
+                            quoted_text="100 USD",
+                        ),
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    service(provider).extract(ExtractRunFactsCommand(resources.run_id))
+
+    with pool.connection() as connection:
+        evidence = connection.execute(
+            """
+            SELECT start_offset, end_offset, quoted_text
+            FROM evidence_spans
+            WHERE document_version_id = %s::uuid
+            """,
+            (resources.document_version_id,),
+        ).fetchone()
+        record = IdempotencyRepository(connection).get(
+            "fact-extraction-v1",
+            f"understand:{resources.run_id}",
+        )
+
+    assert evidence == (14, 21, "100 USD")
+    assert record is not None
+    assert record.status is IdempotencyStatus.COMPLETED
+
+
+def test_missing_exact_quote_still_rejects_evidence(resources: ExtractionResources) -> None:
+    invalid = FactExtractionResponse(
+        format="fact-extraction-v1",
+        candidates=(
+            FactExtractionCandidate(
+                subject="amount",
+                predicate="equals",
+                object_value=999,
+                evidence=(
+                    FactEvidenceCandidate(
+                        chunk_id=resources.chunk_id,
+                        relative_start_offset=14,
+                        relative_end_offset=21,
+                        quoted_text="999 USD",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        SourceEvidenceValidationError,
+        match="evidence quote does not match source chunk content",
+    ):
+        service(FakeProvider(invalid)).extract(ExtractRunFactsCommand(resources.run_id))
+
+
+def test_ambiguous_exact_quote_does_not_repair_provider_offsets(
+    resources: ExtractionResources,
+) -> None:
+    with pool.connection() as connection:
+        connection.execute(
+            "UPDATE document_chunks SET content = %s WHERE id = %s::uuid",
+            ("100 USD and 100 USD", resources.chunk_id),
+        )
+        connection.commit()
+
+    ambiguous = FactExtractionResponse(
+        format="fact-extraction-v1",
+        candidates=(
+            FactExtractionCandidate(
+                subject="amount",
+                predicate="equals",
+                object_value=100,
+                evidence=(
+                    FactEvidenceCandidate(
+                        chunk_id=resources.chunk_id,
+                        relative_start_offset=1,
+                        relative_end_offset=8,
+                        quoted_text="100 USD",
+                    ),
+                ),
+            ),
+        ),
+    )
+
+    with pytest.raises(
+        SourceEvidenceValidationError,
+        match="evidence quote is ambiguous within source chunk content",
+    ):
+        service(FakeProvider(ambiguous)).extract(ExtractRunFactsCommand(resources.run_id))
+
+
 def test_completed_same_input_replays_and_changed_input_conflicts(resources: ExtractionResources) -> None:
     provider = FakeProvider(response_for(resources))
     extractor = service(provider)

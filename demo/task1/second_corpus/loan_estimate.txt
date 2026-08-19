@@ -1,0 +1,12 @@
+LOAN ESTIMATE
+File Reference: TASK1-DEMO-002
+
+Borrower: Priya Raman
+Property Address: 442 Cedar Park Drive, Denver, CO 80206
+Loan Amount: $275,000
+Interest Rate: 5.875%
+Loan Term: 15 years
+Escrow Account: No
+Estimated Cash to Close: $12,300
+
+Synthetic Task 1 second-corpus source.

@@ -846,21 +846,26 @@ class ExtractRunFactsService:
         source = source_by_chunk_id.get(evidence.chunk_id)
         if source is None:
             raise SourceEvidenceValidationError("evidence references a chunk outside the request")
-        if evidence.relative_end_offset > len(source.content):
-            raise SourceEvidenceValidationError("evidence offsets exceed source chunk content")
-        if (
-            source.content[evidence.relative_start_offset : evidence.relative_end_offset]
-            != evidence.quoted_text
-        ):
-            raise SourceEvidenceValidationError("evidence quote does not match source chunk content")
+
+        start_offset = evidence.relative_start_offset
+        end_offset = evidence.relative_end_offset
+        offsets_match = (
+            end_offset <= len(source.content)
+            and source.content[start_offset:end_offset] == evidence.quoted_text
+        )
+        if not offsets_match:
+            start_offset, end_offset = self._derive_unique_exact_quote_offsets(
+                source.content,
+                evidence.quoted_text,
+            )
 
         content_hash = sha256_text(evidence.quoted_text)
         identity = (
             source.document_version_id,
             source.chunk_id,
             source.page_number,
-            evidence.relative_start_offset,
-            evidence.relative_end_offset,
+            start_offset,
+            end_offset,
             evidence.quoted_text,
             content_hash,
         )
@@ -869,11 +874,25 @@ class ExtractRunFactsService:
             document_version_id=source.document_version_id,
             chunk_id=source.chunk_id,
             page_number=source.page_number,
-            start_offset=evidence.relative_start_offset,
-            end_offset=evidence.relative_end_offset,
+            start_offset=start_offset,
+            end_offset=end_offset,
             source_text=evidence.quoted_text,
             content_hash=content_hash,
         )
+
+    @staticmethod
+    def _derive_unique_exact_quote_offsets(content: str, quoted_text: str) -> tuple[int, int]:
+        first_start = content.find(quoted_text)
+        if first_start < 0:
+            raise SourceEvidenceValidationError("evidence quote does not match source chunk content")
+
+        second_start = content.find(quoted_text, first_start + 1)
+        if second_start >= 0:
+            raise SourceEvidenceValidationError(
+                "evidence quote is ambiguous within source chunk content",
+            )
+
+        return first_start, first_start + len(quoted_text)
 
     def _normalize_run_id(self, value: str) -> str:
         try:

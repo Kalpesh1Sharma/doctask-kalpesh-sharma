@@ -1,0 +1,12 @@
+UNDERWRITING APPROVAL
+File Reference: TASK1-DEMO-002
+
+Borrower: Priya Raman
+Property Address: 442 Cedar Park Drive, Denver, CO 80206
+Approved Loan Amount: $275,000
+Approved Interest Rate: 5.875%
+Approved Loan Term: 15 years
+Escrow Required: No
+
+Approval status: APPROVED.
+Synthetic Task 1 second-corpus source.

@@ -4,6 +4,7 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from uuid import uuid4
 
 from psycopg import Connection
@@ -28,6 +29,7 @@ from domain.contradiction_detection import (
     normalize_uuid,
 )
 from domain.fact import FactStatus
+from domain.fact_semantics import canonical_fact_concept
 from domain.finding import Finding, FindingStatus, FindingType
 from domain.run import RunStage, RunStatus
 from domain.run_membership import RunMembershipRelation
@@ -51,6 +53,17 @@ from services.contradiction_detection_provider import (
 
 _IDEMPOTENCY_SCOPE = "contradiction-detection-v1"
 _MAX_TRANSACTION_ATTEMPTS = 3
+_DIRECT_LITERAL_PATTERN = re.compile(
+    r"^\s*(?P<prefix>[$€£])?\s*"
+    r"(?P<number>[+-]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)"
+    r"\s*(?P<suffix>%|[A-Za-z]+(?:[ _-]+[A-Za-z]+)*)?\s*$"
+)
+_BOOLEAN_LITERALS = {
+    "false": False,
+    "no": False,
+    "true": True,
+    "yes": True,
+}
 _RESULT_REFERENCE_PATTERN = re.compile(
     r"^contradiction-detection:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{12}:sha256:[0-9a-f]{64}$",
@@ -134,6 +147,13 @@ class _FindingPlan:
     evidence_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _ComparableLiteral:
+    kind: str
+    unit: str
+    value: Decimal | bool
+
+
 class DetectRunContradictionsService:
     def __init__(
         self,
@@ -164,23 +184,8 @@ class DetectRunContradictionsService:
         return self._execute_claimed(claimed)
 
     def _execute_claimed(self, claimed: _ClaimedOperation) -> DetectRunContradictionsResult:
-        receipt = start_provider_usage(
-            self._connection_pool,
-            run_id=claimed.request.run_id,
-            stage=RunStage.EXAMINE,
-            operation_scope=_IDEMPOTENCY_SCOPE,
-            operation_key=self._idempotency_key(claimed.request.run_id),
-            claim_generation=claimed.claim_token,
-            provider=self._provider,
-        )
         try:
-            try:
-                response = self._provider.detect(claimed.request)
-                finding_plans = self._build_finding_plans(claimed.request, response)
-            finally:
-                finish_provider_usage(
-                    self._connection_pool, receipt, getattr(self._provider, "last_usage", None),
-                )
+            finding_plans = self._resolve_finding_plans(claimed)
         except InvalidContradictionDetectionResponseError:
             self._mark_failed(claimed, IdempotencyFailureKind.RETRYABLE_INVALID_RESPONSE)
             raise
@@ -209,6 +214,110 @@ class DetectRunContradictionsService:
             input_fingerprint=claimed.input_fingerprint,
             replayed=False,
         )
+
+    def _resolve_finding_plans(
+        self,
+        claimed: _ClaimedOperation,
+    ) -> tuple[_FindingPlan, ...]:
+        deterministic_pairs, provider_pairs = self._partition_candidate_pairs(claimed.request)
+        deterministic_response = ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=deterministic_pairs,
+        )
+        plans = list(self._build_finding_plans(claimed.request, deterministic_response))
+
+        # Preserve the existing provider lifecycle for the historical zero-candidate
+        # case, which is part of workflow retry/replay/usage accounting. When the
+        # request did contain candidates and every one was resolved deterministically,
+        # however, there is nothing left for the provider to adjudicate.
+        if not provider_pairs and claimed.request.candidate_pairs:
+            return tuple(plans)
+
+        provider_request = claimed.request.model_copy(
+            update={"candidate_pairs": provider_pairs},
+        )
+        receipt = start_provider_usage(
+            self._connection_pool,
+            run_id=claimed.request.run_id,
+            stage=RunStage.EXAMINE,
+            operation_scope=_IDEMPOTENCY_SCOPE,
+            operation_key=self._idempotency_key(claimed.request.run_id),
+            claim_generation=claimed.claim_token,
+            provider=self._provider,
+        )
+        try:
+            response = self._provider.detect(provider_request)
+            plans.extend(self._build_finding_plans(provider_request, response))
+        finally:
+            finish_provider_usage(
+                self._connection_pool,
+                receipt,
+                getattr(self._provider, "last_usage", None),
+            )
+        return tuple(plans)
+
+    def _partition_candidate_pairs(
+        self,
+        request: ContradictionDetectionRequest,
+    ) -> tuple[
+        tuple[ContradictionCandidatePair, ...],
+        tuple[ContradictionCandidatePair, ...],
+    ]:
+        facts_by_id = {fact.fact_id: fact for fact in request.source_facts}
+        deterministic: list[ContradictionCandidatePair] = []
+        provider: list[ContradictionCandidatePair] = []
+        for pair in request.candidate_pairs:
+            classification = self._classify_direct_disagreement(
+                facts_by_id[pair.fact_a_id].object_value,
+                facts_by_id[pair.fact_b_id].object_value,
+            )
+            if classification is True:
+                deterministic.append(pair)
+            elif classification is None:
+                provider.append(pair)
+        return tuple(deterministic), tuple(provider)
+
+    def _classify_direct_disagreement(self, left: object, right: object) -> bool | None:
+        left_literal = self._comparable_literal(left)
+        right_literal = self._comparable_literal(right)
+        if left_literal is None or right_literal is None:
+            return None
+        if (left_literal.kind, left_literal.unit) != (
+            right_literal.kind,
+            right_literal.unit,
+        ):
+            return None
+        return left_literal.value != right_literal.value
+
+    def _comparable_literal(self, value: object) -> _ComparableLiteral | None:
+        if isinstance(value, bool):
+            return _ComparableLiteral("boolean", "", value)
+        if isinstance(value, (int, float)):
+            try:
+                return _ComparableLiteral("number", "", Decimal(str(value)))
+            except InvalidOperation:
+                return None
+        if not isinstance(value, str):
+            return None
+
+        stripped = value.strip()
+        boolean = _BOOLEAN_LITERALS.get(stripped.casefold())
+        if boolean is not None:
+            return _ComparableLiteral("boolean", "", boolean)
+
+        match = _DIRECT_LITERAL_PATTERN.fullmatch(stripped)
+        if match is None:
+            return None
+        try:
+            number = Decimal(match.group("number").replace(",", ""))
+        except InvalidOperation:
+            return None
+        prefix = match.group("prefix") or ""
+        suffix = " ".join(
+            (match.group("suffix") or "").casefold().replace("_", " ").split(),
+        )
+        unit = f"{prefix}|{suffix}"
+        return _ComparableLiteral("number", unit, number)
 
     def _retry_after_failed_from_workflow(
         self,
@@ -470,9 +579,12 @@ class DetectRunContradictionsService:
         self,
         facts: Iterable[ContradictionSourceFact],
     ) -> tuple[ContradictionCandidatePair, ...]:
-        grouped: dict[tuple[str, str], list[ContradictionSourceFact]] = {}
+        grouped: dict[str, list[ContradictionSourceFact]] = {}
         for fact in facts:
-            grouped.setdefault((fact.subject, fact.predicate), []).append(fact)
+            concept = canonical_fact_concept(fact.subject, fact.predicate)
+            if not concept:
+                continue
+            grouped.setdefault(concept, []).append(fact)
 
         pairs: list[ContradictionCandidatePair] = []
         for group in grouped.values():

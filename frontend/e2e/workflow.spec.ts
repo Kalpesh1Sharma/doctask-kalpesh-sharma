@@ -56,16 +56,20 @@ test("browser drives upload, visible stages, evidence review, COMMIT, and report
   await expect(page.getByText("Payment term is 60 days.")).toBeVisible();
 
   await page.getByRole("button", { name: "Approve", exact: true }).click();
-  await expect(page.getByText("COMMIT READY")).toBeVisible();
 
-  const commitResponse = page.waitForResponse(
-    (item) => item.url().includes("/advance") && item.request().method() === "POST"
-  );
-  await page.getByRole("button", { name: "Advance after review" }).click();
-  const committed = await commitResponse;
-  expect(committed.ok()).toBeTruthy();
-  expect((await committed.json()).stage).toBe("COMMIT");
+  // Production runs may be committed by the background worker as soon as the
+  // human gate becomes commit-ready. In worker-less/manual environments the
+  // UI still offers an explicit advance. Support both without racing them.
+  const completedButton = page.getByRole("button", { name: "Run completed" });
+  await page.waitForTimeout(1250);
+  if (!(await completedButton.isVisible().catch(() => false))) {
+    const advanceButton = page.getByRole("button", { name: "Advance after review" });
+    if (await advanceButton.isVisible().catch(() => false)) {
+      await advanceButton.click();
+    }
+  }
 
+  await expect(completedButton).toBeVisible();
   await expect(page.getByRole("heading", { name: "Final report" })).toBeVisible();
   await expect(page.getByText("Verified committed artifact")).toBeVisible();
   await expect(page.locator(".report-content")).toContainText("# Final Report");

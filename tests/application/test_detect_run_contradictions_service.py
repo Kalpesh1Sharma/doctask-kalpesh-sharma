@@ -231,13 +231,15 @@ def create_fact(
     origin_run_id: str | None = None,
     relation: RunMembershipRelation = RunMembershipRelation.CREATED,
     status: FactStatus = FactStatus.CONFIRMED,
+    subject: str = "loan amount",
+    predicate: str = "equals",
 ) -> str:
     record = FactRepository(connection).create(
         Fact(
             fact_id=str(uuid4()),
             origin_run_id=origin_run_id or run_id,
-            subject="loan amount",
-            predicate="equals",
+            subject=subject,
+            predicate=predicate,
             object_value=object_value,
             status=status,
         ),
@@ -319,6 +321,107 @@ def test_persists_grounded_contradiction_and_reversed_pair_once(resources: Resou
     assert [str(row[0]) for row in evidence] == sorted([resources.evidence_a_id, resources.evidence_b_id])
     record = detection_record(resources)
     assert record is not None and record.status is IdempotencyStatus.COMPLETED
+
+
+@pytest.mark.parametrize(
+    ("left_subject", "left_predicate", "left_value", "right_subject", "right_predicate", "right_value"),
+    [
+        ("Interest Rate", "is", "6.375%", "6.250%", "interest rate", "6.250%"),
+        (
+            "Cash to Close",
+            "is",
+            "$19,250",
+            "$18,750",
+            "estimated cash to close",
+            "$18,750",
+        ),
+        (
+            "Interest Rate",
+            "is",
+            "6.375%",
+            "LOAN ESTIMATE",
+            "has Interest Rate",
+            "6.250%",
+        ),
+    ],
+)
+def test_candidate_generation_normalizes_open_schema_concept_wrappers(
+    resources: Resources,
+    left_subject: str,
+    left_predicate: str,
+    left_value: str,
+    right_subject: str,
+    right_predicate: str,
+    right_value: str,
+) -> None:
+    with pool.connection() as connection:
+        left = create_fact(
+            connection,
+            resources.run_id,
+            left_value,
+            resources.evidence_a_id,
+            subject=left_subject,
+            predicate=left_predicate,
+        )
+        right = create_fact(
+            connection,
+            resources.run_id,
+            right_value,
+            resources.evidence_b_id,
+            subject=right_subject,
+            predicate=right_predicate,
+        )
+        connection.commit()
+
+    provider = FakeProvider(
+        ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=(),
+        ),
+    )
+    service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    # The normalized numeric pair is resolved deterministically, so it is not
+    # exposed to the provider. The fixture's original structured-value pair
+    # remains unresolved and is the only reason the provider is called here.
+    assert len(provider.calls) == 1
+    supplied_pairs = {pair.identity for pair in provider.calls[0].candidate_pairs}
+    assert tuple(sorted((left, right))) not in supplied_pairs
+    assert finding_count(resources) == 1
+
+
+def test_generic_is_predicate_uses_subject_instead_of_grouping_unrelated_fields(
+    resources: Resources,
+) -> None:
+    with pool.connection() as connection:
+        rate = create_fact(
+            connection,
+            resources.run_id,
+            "6.375%",
+            resources.evidence_a_id,
+            subject="Interest Rate",
+            predicate="is",
+        )
+        cash = create_fact(
+            connection,
+            resources.run_id,
+            "$19,250",
+            resources.evidence_b_id,
+            subject="Cash to Close",
+            predicate="is",
+        )
+        connection.commit()
+
+    provider = FakeProvider(
+        ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=(),
+        ),
+    )
+    service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    supplied_pairs = {pair.identity for pair in provider.calls[0].candidate_pairs}
+    assert tuple(sorted((rate, cash))) not in supplied_pairs
 
 
 def test_zero_contradictions_is_a_completed_provider_called_success(resources: Resources) -> None:
@@ -865,3 +968,140 @@ def test_persistence_holds_run_lock_until_commit(
             connection.rollback()
         release.set()
         future.result(timeout=5)
+
+
+@pytest.mark.parametrize(
+    (
+        "left_subject",
+        "left_predicate",
+        "left_value",
+        "right_subject",
+        "right_predicate",
+        "right_value",
+    ),
+    [
+        ("Interest Rate", "is", "6.375%", "6.250%", "interest rate", "6.250%"),
+        (
+            "Cash to Close",
+            "is",
+            "$19,250",
+            "$18,750",
+            "estimated cash to close",
+            "$18,750",
+        ),
+    ],
+)
+def test_direct_numeric_disagreement_is_deterministic_and_skips_provider(
+    resources: Resources,
+    left_subject: str,
+    left_predicate: str,
+    left_value: str,
+    right_subject: str,
+    right_predicate: str,
+    right_value: str,
+) -> None:
+    with pool.connection() as connection:
+        left = create_fact(
+            connection,
+            resources.run_id,
+            left_value,
+            resources.evidence_a_id,
+            subject=left_subject,
+            predicate=left_predicate,
+        )
+        right = create_fact(
+            connection,
+            resources.run_id,
+            right_value,
+            resources.evidence_b_id,
+            subject=right_subject,
+            predicate=right_predicate,
+        )
+        connection.commit()
+
+    provider = FakeProvider(
+        ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=(),
+        ),
+    )
+    result = service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    assert result.replayed is False
+    assert len(provider.calls) == 1
+    supplied_pairs = {pair.identity for pair in provider.calls[0].candidate_pairs}
+    assert tuple(sorted((left, right))) not in supplied_pairs
+    assert finding_count(resources) == 1
+    record = detection_record(resources)
+    assert record is not None and record.status is IdempotencyStatus.COMPLETED
+
+
+def test_equivalent_numeric_renderings_are_resolved_without_false_contradiction(
+    resources: Resources,
+) -> None:
+    with pool.connection() as connection:
+        left = create_fact(
+            connection,
+            resources.run_id,
+            "$19,250",
+            resources.evidence_a_id,
+            subject="Cash to Close",
+            predicate="is",
+        )
+        right = create_fact(
+            connection,
+            resources.run_id,
+            "$19,250.00",
+            resources.evidence_b_id,
+            subject="$19,250.00",
+            predicate="estimated cash to close",
+        )
+        connection.commit()
+
+    provider = FakeProvider(
+        ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=(),
+        ),
+    )
+    result = service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    assert result.replayed is False
+    assert len(provider.calls) == 1
+    supplied_pairs = {pair.identity for pair in provider.calls[0].candidate_pairs}
+    assert tuple(sorted((left, right))) not in supplied_pairs
+    assert finding_count(resources) == 0
+    record = detection_record(resources)
+    assert record is not None and record.status is IdempotencyStatus.COMPLETED
+
+
+def test_provider_receives_only_unresolved_pairs_when_deterministic_pair_is_present(
+    resources: Resources,
+) -> None:
+    with pool.connection() as connection:
+        rate_a = create_fact(
+            connection,
+            resources.run_id,
+            "6.375%",
+            resources.evidence_a_id,
+            subject="Interest Rate",
+            predicate="is",
+        )
+        rate_b = create_fact(
+            connection,
+            resources.run_id,
+            "6.250%",
+            resources.evidence_b_id,
+            subject="6.250%",
+            predicate="interest rate",
+        )
+        connection.commit()
+
+    provider = FakeProvider(response_for(resources))
+    service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    assert len(provider.calls) == 1
+    supplied_pairs = {pair.identity for pair in provider.calls[0].candidate_pairs}
+    assert supplied_pairs == {tuple(sorted((resources.fact_a_id, resources.fact_b_id)))}
+    assert tuple(sorted((rate_a, rate_b))) not in supplied_pairs
+    assert finding_count(resources) == 2

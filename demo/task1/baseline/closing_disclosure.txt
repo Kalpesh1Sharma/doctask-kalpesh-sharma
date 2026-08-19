@@ -1,0 +1,12 @@
+CLOSING DISCLOSURE
+File Reference: TASK1-DEMO-001
+
+Borrower: Jordan Lee
+Property Address: 18 Oak Ridge Lane, Austin, TX 78704
+Loan Amount: $320,000
+Interest Rate: 6.375%
+Loan Term: 30 years
+Escrow Account: Yes
+Cash to Close: $19,250
+
+This document is a synthetic source created only for the Task 1 demonstration.
