@@ -19,6 +19,7 @@ def test_compose_starts_full_operational_runtime_with_migration_gate() -> None:
     assert 'command: ["task1-watch"]' in compose
     assert '${TASK1_UI_PORT:-5173}:80' in compose
     assert '${TASK1_API_PORT:-8000}:8000' in compose
+    assert "GROQ_MODEL_PRICING: ${GROQ_MODEL_PRICING:-{}}" in compose
 
 
 def test_compose_shares_source_and_artifact_storage_and_mounts_host_watch_folder() -> None:
@@ -75,4 +76,7 @@ def test_runtime_data_and_secrets_are_excluded_from_build_and_git() -> None:
     assert "var/sources/*" in gitignore
     assert "var/artifacts/*" in gitignore
     assert "var/watch/*" in gitignore
+    assert "frontend/*.tsbuildinfo" in gitignore
+    assert "frontend/vite.config.js" in gitignore
+    assert "frontend/vite.config.d.ts" in gitignore
     assert "*.sh text eol=lf" in _read(".gitattributes")

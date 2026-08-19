@@ -29,7 +29,7 @@ from domain.contradiction_detection import (
     normalize_uuid,
 )
 from domain.fact import FactStatus
-from domain.fact_semantics import canonical_fact_concept
+from domain.fact_semantics import canonical_fact_concept_with_evidence
 from domain.finding import Finding, FindingStatus, FindingType
 from domain.run import RunStage, RunStatus
 from domain.run_membership import RunMembershipRelation
@@ -581,7 +581,11 @@ class DetectRunContradictionsService:
     ) -> tuple[ContradictionCandidatePair, ...]:
         grouped: dict[str, list[ContradictionSourceFact]] = {}
         for fact in facts:
-            concept = canonical_fact_concept(fact.subject, fact.predicate)
+            concept = canonical_fact_concept_with_evidence(
+                fact.subject,
+                fact.predicate,
+                (evidence.source_text for evidence in fact.evidence),
+            )
             if not concept:
                 continue
             grouped.setdefault(concept, []).append(fact)

@@ -64,4 +64,6 @@ The demonstration succeeds only if that content remains untrusted source data. I
 
 ## Second corpus
 
-The second corpus is a different synthetic loan file. Its documents agree on the main values and its cash-to-close value is below the configured rule limit. It exists as an optional “works the second time” proof within the declared mortgage domain.
+The second corpus is a different synthetic loan file for Priya Raman. Its documents agree on the main values and its cash-to-close value is below the configured rule limit. It is the explicit “works the second time” and honest no-findings proof within the declared mortgage domain.
+
+Introduce it sequentially: second Closing Disclosure first, wait for the INITIAL Run, then the second Loan Estimate. The clean INITIAL should have zero Findings. The agreeing UPDATE should have no contradiction/rule Finding; any material Fact proposals remain subject to normal item-level human review.

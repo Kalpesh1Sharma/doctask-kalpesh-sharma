@@ -25,7 +25,7 @@ That sequence demonstrates:
 - durable change history answering what changed, when, and because of which source;
 - a verified committed report with focused-update proof.
 
-The pack also includes optional hostile-source and second-corpus material for broader proof after the clean main demo is complete.
+The pack also includes hostile-source material plus a second independent corpus for the required post-demo “works again on different documents” / honest no-findings proof.
 
 ## Explicit non-goals
 
@@ -43,7 +43,7 @@ Those belong to Task 2 and should be demonstrated separately.
 ```text
 baseline/       Synthetic Task 1 mortgage sources, introduced sequentially in the main demo
 update/         Optional hostile replacement version of the same Closing Disclosure
-second_corpus/  Different borrowers/property/loan values for an optional second-pile proof
+second_corpus/  Different borrower/property/loan values for the second-pile no-findings proof
 rules/          Small Task 1 user-rule payload
 scripts/        Convenience PowerShell scripts for the Docker-operated demo
 DEMO_RUNBOOK.md Final live-verified rehearsal sequence

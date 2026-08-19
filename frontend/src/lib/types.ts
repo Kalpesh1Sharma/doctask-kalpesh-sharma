@@ -183,11 +183,28 @@ export type UpdateItemReviewDecision = {
   decided_at: string;
 };
 
+export type UpdateFactEvidence = Evidence & {
+  logical_key: string;
+};
+
+export type UpdateFactSnapshot = {
+  fact_id: string;
+  subject: string;
+  predicate: string;
+  object_value: unknown;
+  display_value: unknown;
+  status: "CONFIRMED" | "DISPUTED" | "SUPERSEDED";
+  concept: string;
+  evidence: UpdateFactEvidence[];
+};
+
 export type UpdateChangeItem = {
   item_id: string | null;
   fact_id: string;
   kind: "FACT_CREATED" | "FACT_REMOVED";
   payload: unknown;
+  fact: UpdateFactSnapshot;
+  baseline_facts: UpdateFactSnapshot[];
   decision: UpdateItemReviewDecision | null;
 };
 

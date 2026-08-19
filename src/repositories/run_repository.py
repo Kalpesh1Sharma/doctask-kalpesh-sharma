@@ -192,8 +192,85 @@ class RunRepository:
                 'RUNNING'::run_status,
                 'REVIEW_REQUIRED'::run_status
             )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM run_steps
+                WHERE run_steps.run_id = runs.id
+                  AND run_steps.status IN (
+                    'ESCALATED'::run_step_status,
+                    'FAILED'::run_step_status
+                  )
+              )
+              AND (
+                status <> 'REVIEW_REQUIRED'::run_status
+                OR (
+                  -- A run waiting on a human decision is not executable work.
+                  -- Do not let historical REVIEW_REQUIRED rows consume the
+                  -- worker batch until their finding/update review is complete.
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM run_findings
+                    JOIN findings ON findings.id = run_findings.finding_id
+                    WHERE run_findings.run_id = runs.id
+                      AND findings.status = 'PENDING'::finding_status
+                  )
+                  AND (
+                    run_type = 'INITIAL'::run_type
+                    OR EXISTS (
+                      SELECT 1
+                      FROM update_change_sets
+                      WHERE update_change_sets.run_id = runs.id
+                        AND (
+                          (
+                            EXISTS (
+                              SELECT 1
+                              FROM update_change_items
+                              WHERE update_change_items.change_set_id = update_change_sets.id
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1
+                              FROM update_change_items
+                              LEFT JOIN update_item_review_decisions
+                                ON update_item_review_decisions.item_id = update_change_items.id
+                              WHERE update_change_items.change_set_id = update_change_sets.id
+                                AND update_item_review_decisions.id IS NULL
+                            )
+                            AND NOT EXISTS (
+                              SELECT 1
+                              FROM update_review_decisions
+                              WHERE update_review_decisions.change_set_id = update_change_sets.id
+                                AND update_review_decisions.decision = 'REJECTED'::review_decision_type
+                            )
+                          )
+                          OR (
+                            NOT EXISTS (
+                              SELECT 1
+                              FROM update_change_items
+                              WHERE update_change_items.change_set_id = update_change_sets.id
+                            )
+                            AND EXISTS (
+                              SELECT 1
+                              FROM update_review_decisions
+                              WHERE update_review_decisions.change_set_id = update_change_sets.id
+                                AND update_review_decisions.decision = 'APPROVED'::review_decision_type
+                            )
+                          )
+                        )
+                    )
+                  )
+                )
+              )
             ORDER BY
-                CASE WHEN status = 'REVIEW_REQUIRED'::run_status THEN 1 ELSE 0 END ASC,
+                ROW_NUMBER() OVER (
+                    PARTITION BY status
+                    ORDER BY created_at ASC, id ASC
+                ) ASC,
+                CASE status
+                    WHEN 'REVIEW_REQUIRED'::run_status THEN 0
+                    WHEN 'PENDING'::run_status THEN 1
+                    WHEN 'RUNNING'::run_status THEN 2
+                    ELSE 3
+                END ASC,
                 created_at ASC,
                 id ASC
             LIMIT %s

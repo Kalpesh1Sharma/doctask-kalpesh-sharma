@@ -139,18 +139,78 @@ export function ReviewPanel({
             <div className="review-grid">
               {review.update_change_set.items.map((item) => {
                 const pendingKey = `update:${item.fact_id}`;
+                const previousValues = item.baseline_facts.map((fact) => fact.display_value);
+                const duplicateValue = item.baseline_facts.some(
+                  (fact) => jsonEqual(fact.display_value, item.fact.display_value)
+                );
                 return (
                   <article className="review-card" key={item.fact_id}>
                     <header>
                       <div>
                         <div className="review-tags">
                           <StatusBadge value={item.kind} />
+                          {duplicateValue ? <StatusBadge value="SAME_VALUE" /> : null}
                         </div>
-                        <h3>Fact change</h3>
+                        <h3>{displayConcept(item.fact.concept, item.fact.subject, item.fact.predicate)}</h3>
                       </div>
                       <span className="mono tiny">{item.fact_id}</span>
                     </header>
-                    <pre className="manifest">{JSON.stringify(item.payload, null, 2)}</pre>
+
+                    <div className="stack-sm">
+                      {item.kind === "FACT_CREATED" ? (
+                        <>
+                          {previousValues.length ? (
+                            <div>
+                              <div className="eyebrow">Committed baseline</div>
+                              {item.baseline_facts.map((baselineFact) => (
+                                <div className="stack-sm" key={baselineFact.fact_id}>
+                                  <strong>{formatValue(baselineFact.display_value)}</strong>
+                                  {baselineFact.evidence.map((evidence) => (
+                                    <blockquote key={evidence.evidence_id}>
+                                      <div className="mono tiny">{evidence.logical_key}</div>
+                                      <div>{evidence.source_text}</div>
+                                    </blockquote>
+                                  ))}
+                                </div>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="muted">No committed baseline Fact uses this concept.</p>
+                          )}
+                          <div>
+                            <div className="eyebrow">Proposed value</div>
+                            <strong>{formatValue(item.fact.display_value)}</strong>
+                          </div>
+                          {duplicateValue ? (
+                            <p className="muted">Same value already exists in the committed baseline.</p>
+                          ) : null}
+                        </>
+                      ) : (
+                        <div>
+                          <div className="eyebrow">Proposed removal</div>
+                          <strong>{formatValue(item.fact.display_value)}</strong>
+                        </div>
+                      )}
+
+                      {item.fact.evidence.length ? (
+                        <div>
+                          <div className="eyebrow">Exact source evidence</div>
+                          {item.fact.evidence.map((evidence) => (
+                            <blockquote key={evidence.evidence_id}>
+                              <div className="mono tiny">{evidence.logical_key}</div>
+                              <div>{evidence.source_text}</div>
+                            </blockquote>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">No direct evidence is attached to this Fact.</p>
+                      )}
+                    </div>
+
+                    <details>
+                      <summary>Immutable review payload</summary>
+                      <pre className="manifest">{JSON.stringify(item.payload, null, 2)}</pre>
+                    </details>
                     {item.decision ? (
                       <div className="decision-summary">
                         <StatusBadge value={item.decision.decision} />
@@ -227,4 +287,17 @@ function messageFor(error: unknown) {
 
 function formatDate(value: string) {
   return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+}
+
+function formatValue(value: unknown) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function jsonEqual(left: unknown, right: unknown) {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function displayConcept(concept: string, subject: string, predicate: string) {
+  const value = concept || predicate || subject;
+  return value.replace(/\b\w/g, (character) => character.toUpperCase());
 }

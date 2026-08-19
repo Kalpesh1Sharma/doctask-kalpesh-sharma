@@ -23,6 +23,7 @@ from api.application.commit_final_report_service import (
     CommitFinalReportCommand,
     CommitFinalReportService,
 )
+from api.application.external_review_query_service import ExternalReviewQueryService
 from api.application.finalize_run_service import (
     DirectFreshFinalizationDisabledError,
     FinalizeRunOutputCommand,
@@ -538,6 +539,62 @@ def add_current_created_fact(run_id: str) -> str:
     return fact_id
 
 
+def add_changed_notice_fact_with_trigger_evidence(resources: UpdateResources) -> str:
+    with pool.connection() as connection:
+        text = "Notice period: 45 days"
+        content_hash = f"sha256:{sha256(text.encode()).hexdigest()}"
+        chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (
+                document_version_id, chunk_index, content, content_hash, start_offset, end_offset
+            ) VALUES (%s::uuid, 0, %s, %s, 0, %s)
+            RETURNING id
+            """,
+            (resources.trigger_version_id, text, content_hash, len(text)),
+        ).fetchone()
+        assert chunk is not None
+        evidence = connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            ) VALUES (%s::uuid, %s::uuid, 0, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                resources.trigger_version_id,
+                str(chunk[0]),
+                len(text),
+                text,
+                f"sha256:{sha256(text.encode()).hexdigest()}",
+            ),
+        ).fetchone()
+        assert evidence is not None
+        fact_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO facts (id, origin_run_id, subject, predicate, object_value, status)
+            VALUES (%s::uuid, %s::uuid, 'contract', 'notice_days', %s::jsonb, 'CONFIRMED')
+            """,
+            (fact_id, resources.update_run_id, Jsonb({"days": 45})),
+        )
+        connection.execute(
+            """
+            INSERT INTO run_facts (run_id, fact_id, relation)
+            VALUES (%s::uuid, %s::uuid, 'CREATED')
+            """,
+            (resources.update_run_id, fact_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO fact_evidence (fact_id, evidence_span_id)
+            VALUES (%s::uuid, %s::uuid)
+            """,
+            (fact_id, str(evidence[0])),
+        )
+        connection.commit()
+    return fact_id
+
+
 def build_and_approve(resources: UpdateResources, token: str = "approve") -> None:
     BuildUpdateChangeSetService(pool).build(BuildUpdateChangeSetCommand(resources.update_run_id))
     ReviewUpdateChangeSetService(pool).record(
@@ -549,6 +606,108 @@ def build_and_approve(resources: UpdateResources, token: str = "approve") -> Non
             f"update-review:{resources.update_run_id}:{token}",
         ),
     )
+
+
+def test_external_update_review_projection_explains_value_change_and_exact_source(
+    reviewable_update: UpdateResources,
+    tmp_path,
+) -> None:
+    changed_fact_id = add_changed_notice_fact_with_trigger_evidence(reviewable_update)
+    BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+
+    review = ExternalReviewQueryService(
+        pool,
+        LocalArtifactStorage(tmp_path / "artifacts"),
+    ).get_review(reviewable_update.update_run_id)
+
+    assert review.update_change_set is not None
+    item = next(
+        candidate
+        for candidate in review.update_change_set.items
+        if candidate.fact_id == changed_fact_id
+    )
+    assert item.fact.concept == "notice days"
+    assert item.fact.object_value == {"days": 45}
+    assert item.fact.evidence[0].source_text == "Notice period: 45 days"
+    assert item.fact.evidence[0].logical_key.startswith("trigger-document-")
+    assert [(fact.fact_id, fact.object_value) for fact in item.baseline_facts] == [
+        (reviewable_update.carried_fact_id, {"days": 30}),
+    ]
+
+
+def test_external_update_review_uses_exact_evidence_label_for_baseline_matching(
+    reviewable_update: UpdateResources,
+    tmp_path,
+) -> None:
+    with pool.connection() as connection:
+        text = "Notice Days: 30 days"
+        content_hash = f"sha256:{sha256(text.encode()).hexdigest()}"
+        chunk = connection.execute(
+            """
+            INSERT INTO document_chunks (
+                document_version_id, chunk_index, content, content_hash, start_offset, end_offset
+            ) VALUES (%s::uuid, 0, %s, %s, 0, %s)
+            RETURNING id
+            """,
+            (reviewable_update.trigger_version_id, text, content_hash, len(text)),
+        ).fetchone()
+        assert chunk is not None
+        evidence = connection.execute(
+            """
+            INSERT INTO evidence_spans (
+                document_version_id, chunk_id, start_offset, end_offset, quoted_text, content_hash
+            ) VALUES (%s::uuid, %s::uuid, 0, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                reviewable_update.trigger_version_id,
+                str(chunk[0]),
+                len(text),
+                text,
+                content_hash,
+            ),
+        ).fetchone()
+        assert evidence is not None
+        fact_id = str(uuid4())
+        connection.execute(
+            """
+            INSERT INTO facts (id, origin_run_id, subject, predicate, object_value, status)
+            VALUES (%s::uuid, %s::uuid, 'Contract', 'has value', %s::jsonb, 'CONFIRMED')
+            """,
+            (fact_id, reviewable_update.update_run_id, Jsonb({"days": 30})),
+        )
+        connection.execute(
+            """
+            INSERT INTO run_facts (run_id, fact_id, relation)
+            VALUES (%s::uuid, %s::uuid, 'CREATED')
+            """,
+            (reviewable_update.update_run_id, fact_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO fact_evidence (fact_id, evidence_span_id)
+            VALUES (%s::uuid, %s::uuid)
+            """,
+            (fact_id, str(evidence[0])),
+        )
+        connection.commit()
+
+    BuildUpdateChangeSetService(pool).build(
+        BuildUpdateChangeSetCommand(reviewable_update.update_run_id),
+    )
+    review = ExternalReviewQueryService(
+        pool,
+        LocalArtifactStorage(tmp_path / "evidence-aware-review"),
+    ).get_review(reviewable_update.update_run_id)
+
+    assert review.update_change_set is not None
+    item = next(candidate for candidate in review.update_change_set.items if candidate.fact_id == fact_id)
+    assert item.fact.concept == "notice days"
+    assert [(fact.fact_id, fact.object_value) for fact in item.baseline_facts] == [
+        (reviewable_update.carried_fact_id, {"days": 30}),
+    ]
 
 
 def activate_commit_step(run_id: str) -> None:

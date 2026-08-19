@@ -54,6 +54,7 @@ textarea { resize: vertical; }
 
 .panel { border: 1px solid var(--line); border-radius: 18px; background: rgba(255,255,255,.96); box-shadow: var(--shadow); padding: 22px; }
 .stack-lg { display: grid; gap: 20px; }
+.stack-sm { display: grid; gap: 10px; }
 .section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
 .section-heading.compact { margin-bottom: 14px; }
 .section-heading h1, .section-heading h2 { margin-bottom: 5px; }
@@ -164,6 +165,7 @@ textarea { resize: vertical; }
 .review-card header { display: flex; justify-content: space-between; gap: 16px; }
 .review-card h3 { margin: 10px 0 5px; }
 .review-card p { color: #53636a; line-height: 1.55; }
+.review-card blockquote { margin: 6px 0 0; border-left: 3px solid #9fcfc4; border-radius: 0 9px 9px 0; background: #f5faf8; padding: 10px 12px; color: #31454b; font-size: .86rem; line-height: 1.5; }
 .evidence-list { display: grid; gap: 8px; margin: 14px 0; }
 .evidence-card { margin: 0; border-left: 3px solid #9fcfc4; border-radius: 0 10px 10px 0; background: #f5faf8; padding: 12px 13px; }
 .evidence-card blockquote { margin: 0; color: #31454b; font-size: .87rem; line-height: 1.55; }

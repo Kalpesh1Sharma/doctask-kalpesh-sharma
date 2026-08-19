@@ -95,6 +95,61 @@ def test_txt_parse_and_chunking_are_exact_non_overlapping() -> None:
     assert chunks[0].content_hash.startswith("sha256:")
 
 
+def test_parse_path_streams_txt_without_path_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "large.txt"
+    expected = ("mortgage fact line\n" * 80_000) + "final fact"
+    source.write_text(expected, encoding="utf-8", newline="")
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("parse_path must not materialize the whole source with Path.read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    parsed = DocumentParser().parse_path(source)
+    chunks = chunk_document(parsed)
+
+    assert parsed.mime_type == "text/plain; charset=utf-8"
+    assert len(parsed.segments) >= 2
+    assert "".join(chunk.content for chunk in chunks) == expected
+
+
+def test_parse_path_rejects_non_utf8_txt_without_loading_source_bytes(tmp_path: Path) -> None:
+    source = tmp_path / "invalid.txt"
+    source.write_bytes(b"\xff\xfe\x00")
+
+    with pytest.raises(UnsupportedDocumentTypeError, match="strict UTF-8"):
+        DocumentParser().parse_path(source)
+
+
+def test_parse_path_does_not_misclassify_txt_with_pdf_like_prefix(tmp_path: Path) -> None:
+    source = tmp_path / "pdf-like.txt"
+    source.write_text("%PDFnot-a-real-pdf\nLoan Amount: $320,000", encoding="utf-8")
+
+    parsed = DocumentParser().parse_path(source)
+
+    assert parsed.mime_type == "text/plain; charset=utf-8"
+    assert parsed.text.startswith("%PDFnot-a-real-pdf")
+
+
+def test_parse_path_supports_restricted_docx_without_path_read_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "loan.docx"
+    source.write_bytes(_docx_bytes())
+
+    def fail_read_bytes(_path: Path) -> bytes:
+        raise AssertionError("parse_path must not materialize DOCX with Path.read_bytes")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    parsed = DocumentParser().parse_path(source)
+
+    assert parsed.mime_type.startswith("application/vnd.openxmlformats")
+    assert parsed.text == "body paragraph"
+
+
 def test_restricted_docx_body_is_supported_and_header_text_is_rejected() -> None:
     docx = pytest.importorskip("docx")
     document = docx.Document()

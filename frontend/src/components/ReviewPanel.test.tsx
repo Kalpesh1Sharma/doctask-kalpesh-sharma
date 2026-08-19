@@ -99,6 +99,52 @@ test("records UPDATE Fact decisions independently", async () => {
           fact_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
           kind: "FACT_CREATED",
           payload: { fact_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", kind: "CREATED" },
+          fact: {
+            fact_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            subject: "Loan Estimate",
+            predicate: "Interest Rate",
+            object_value: "6.250%",
+            display_value: "6.250%",
+            status: "CONFIRMED",
+            concept: "interest rate",
+            evidence: [
+              {
+                evidence_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                document_version_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                logical_key: "loan_estimate",
+                chunk_id: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+                page_number: null,
+                start_offset: 10,
+                end_offset: 31,
+                source_text: "Interest Rate: 6.250%",
+                content_hash: `sha256:${"c".repeat(64)}`
+              }
+            ]
+          },
+          baseline_facts: [
+            {
+              fact_id: "12121212-1212-4212-8212-121212121212",
+              subject: "Interest Rate",
+              predicate: "is",
+              object_value: "6.375%",
+              display_value: "6.375%",
+              status: "CONFIRMED",
+              concept: "interest rate",
+              evidence: [
+                {
+                  evidence_id: "13131313-1313-4313-8313-131313131313",
+                  document_version_id: "14141414-1414-4414-8414-141414141414",
+                  logical_key: "closing_disclosure",
+                  chunk_id: "15151515-1515-4515-8515-151515151515",
+                  page_number: null,
+                  start_offset: 10,
+                  end_offset: 31,
+                  source_text: "Interest Rate: 6.375%",
+                  content_hash: `sha256:${"d".repeat(64)}`
+                }
+              ]
+            }
+          ],
           decision: null
         },
         {
@@ -106,6 +152,17 @@ test("records UPDATE Fact decisions independently", async () => {
           fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
           kind: "FACT_REMOVED",
           payload: { fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", kind: "REMOVED_FROM_CURRENT_STATE" },
+          fact: {
+            fact_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            subject: "Escrow Account",
+            predicate: "is",
+            object_value: "Yes",
+            display_value: "Yes",
+            status: "CONFIRMED",
+            concept: "escrow account",
+            evidence: []
+          },
+          baseline_facts: [],
           decision: null
         }
       ]
@@ -113,6 +170,13 @@ test("records UPDATE Fact decisions independently", async () => {
   };
 
   render(<ReviewPanel actorId="alice@example.test" onChanged={onChanged} review={itemized} />);
+  expect(screen.getByText("Interest Rate")).toBeInTheDocument();
+  expect(screen.getByText("6.375%")).toBeInTheDocument();
+  expect(screen.getByText("6.250%")).toBeInTheDocument();
+  expect(screen.getByText("closing_disclosure")).toBeInTheDocument();
+  expect(screen.getByText("Interest Rate: 6.375%")).toBeInTheDocument();
+  expect(screen.getByText("loan_estimate")).toBeInTheDocument();
+  expect(screen.getByText("Interest Rate: 6.250%")).toBeInTheDocument();
   const approveButtons = screen.getAllByRole("button", { name: "Approve change" });
   fireEvent.click(approveButtons[0]);
 

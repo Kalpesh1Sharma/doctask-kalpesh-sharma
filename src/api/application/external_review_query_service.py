@@ -15,7 +15,16 @@ from api.application.build_update_change_set_service import (
     UpdateChangeSetApplicationError,
     build_current_update_change_set_manifest,
 )
+from api.application.effective_run_fact_state import (
+    EffectiveRunFactStateIntegrityError,
+    list_effective_committed_facts,
+)
 from api.application.external_query_service import EvidenceProjection
+from domain.fact import FactStatus
+from domain.fact_semantics import (
+    canonical_fact_concept_with_evidence,
+    canonical_fact_display_value,
+)
 from domain.finding import FindingStatus, FindingType
 from domain.review_decision import ReviewDecisionType
 from domain.run import RunStatus, RunType
@@ -29,7 +38,11 @@ from domain.update_review import (
     update_change_set_fingerprint,
 )
 from repositories.audit_event_repository import AuditEventRepository
+from repositories.document_repository import DocumentRepository
+from repositories.document_version_repository import DocumentVersionRepository
 from repositories.evidence_span_repository import EvidenceSpanRepository
+from repositories.fact_evidence_repository import FactEvidenceRepository
+from repositories.fact_repository import FactRepository
 from repositories.finding_evidence_repository import FindingEvidenceRepository
 from repositories.output_repository import OutputRepository
 from repositories.review_decision_repository import ReviewDecisionRepository
@@ -121,11 +134,38 @@ class UpdateItemReviewDecisionProjection:
 
 
 @dataclass(frozen=True)
+class UpdateFactEvidenceProjection:
+    evidence_id: str
+    document_version_id: str
+    logical_key: str
+    chunk_id: str
+    page_number: int | None
+    start_offset: int | None
+    end_offset: int | None
+    source_text: str
+    content_hash: str
+
+
+@dataclass(frozen=True)
+class UpdateFactSnapshotProjection:
+    fact_id: str
+    subject: str
+    predicate: str
+    object_value: JsonValue
+    display_value: JsonValue
+    status: FactStatus
+    concept: str
+    evidence: tuple[UpdateFactEvidenceProjection, ...]
+
+
+@dataclass(frozen=True)
 class UpdateChangeItemProjection:
     item_id: str | None
     fact_id: str
     kind: UpdateChangeItemKind
     payload: JsonValue
+    fact: UpdateFactSnapshotProjection
+    baseline_facts: tuple[UpdateFactSnapshotProjection, ...]
     decision: UpdateItemReviewDecisionProjection | None
 
 
@@ -377,6 +417,7 @@ class ExternalReviewQueryService:
                     stored.change_set_id,
                 )
             }
+            baseline_by_concept = self._baseline_facts_by_concept(connection, run)
             items = []
             for item in UpdateChangeItemRepository(connection).list_for_change_set(
                 stored.change_set_id,
@@ -397,12 +438,19 @@ class ExternalReviewQueryService:
                     if item_decision_record is not None
                     else None
                 )
+                fact = self._fact_snapshot(connection, item.fact_id)
                 items.append(
                     UpdateChangeItemProjection(
                         item_id=item.item_id,
                         fact_id=item.fact_id,
                         kind=item.kind,
                         payload=item.payload,
+                        fact=fact,
+                        baseline_facts=tuple(
+                            baseline
+                            for baseline in baseline_by_concept.get(fact.concept, ())
+                            if baseline.fact_id != fact.fact_id
+                        ),
                         decision=item_decision,
                     ),
                 )
@@ -428,29 +476,130 @@ class ExternalReviewQueryService:
             raise ExternalReviewIntegrityError(
                 "UPDATE review preview cannot be derived from durable state",
             ) from error
-        preview_items = tuple(
-            UpdateChangeItemProjection(
-                item_id=None,
-                fact_id=delta.fact_id,
-                kind=(
-                    UpdateChangeItemKind.FACT_CREATED
-                    if delta.kind is UpdateFactDeltaKind.CREATED
-                    else UpdateChangeItemKind.FACT_REMOVED
+        baseline_by_concept = self._baseline_facts_by_concept(connection, run)
+        preview_items: list[UpdateChangeItemProjection] = []
+        for delta in manifest.fact_delta:
+            if delta.kind not in {
+                UpdateFactDeltaKind.CREATED,
+                UpdateFactDeltaKind.REMOVED_FROM_CURRENT_STATE,
+            }:
+                continue
+            fact = self._fact_snapshot(connection, delta.fact_id)
+            preview_items.append(
+                UpdateChangeItemProjection(
+                    item_id=None,
+                    fact_id=delta.fact_id,
+                    kind=(
+                        UpdateChangeItemKind.FACT_CREATED
+                        if delta.kind is UpdateFactDeltaKind.CREATED
+                        else UpdateChangeItemKind.FACT_REMOVED
+                    ),
+                    payload=delta.model_dump(mode="json"),
+                    fact=fact,
+                    baseline_facts=tuple(
+                        baseline
+                        for baseline in baseline_by_concept.get(fact.concept, ())
+                        if baseline.fact_id != fact.fact_id
+                    ),
+                    decision=None,
                 ),
-                payload=delta.model_dump(mode="json"),
-                decision=None,
             )
-            for delta in manifest.fact_delta
-            if delta.kind
-            in {UpdateFactDeltaKind.CREATED, UpdateFactDeltaKind.REMOVED_FROM_CURRENT_STATE}
-        )
         return UpdateChangeSetProjection(
             change_set_id=None,
             durable=False,
             change_set_fingerprint=update_change_set_fingerprint(manifest),
             manifest=manifest.model_dump(mode="json"),
-            items=preview_items,
+            items=tuple(preview_items),
             decision=None,
+        )
+
+    def _baseline_facts_by_concept(
+        self,
+        connection: Connection,
+        run: RunRecord,
+    ) -> dict[str, tuple[UpdateFactSnapshotProjection, ...]]:
+        if run.run_type is not RunType.UPDATE or run.baseline_run_id is None:
+            return {}
+        try:
+            records = list_effective_committed_facts(connection, run.baseline_run_id)
+        except EffectiveRunFactStateIntegrityError as error:
+            raise ExternalReviewIntegrityError(
+                "UPDATE review cannot reconstruct the committed baseline Fact state",
+            ) from error
+
+        grouped: dict[str, list[UpdateFactSnapshotProjection]] = {}
+        for record in records:
+            snapshot = self._fact_snapshot(connection, record.fact_id)
+            grouped.setdefault(snapshot.concept, []).append(snapshot)
+        return {
+            concept: tuple(sorted(items, key=lambda item: item.fact_id))
+            for concept, items in grouped.items()
+        }
+
+    @staticmethod
+    def _fact_snapshot(
+        connection: Connection,
+        fact_id: str,
+    ) -> UpdateFactSnapshotProjection:
+        fact = FactRepository(connection).get_by_id(fact_id)
+        if fact is None:
+            raise ExternalReviewIntegrityError(
+                f"UPDATE review item references missing Fact {fact_id}",
+            )
+
+        evidence_repository = EvidenceSpanRepository(connection)
+        version_repository = DocumentVersionRepository(connection)
+        document_repository = DocumentRepository(connection)
+        evidence: list[UpdateFactEvidenceProjection] = []
+        for link in FactEvidenceRepository(connection).list_for_fact(fact_id):
+            span = evidence_repository.get_by_id(link.evidence_span_id)
+            if span is None:
+                raise ExternalReviewIntegrityError(
+                    f"Fact {fact_id} references missing evidence {link.evidence_span_id}",
+                )
+            version = version_repository.get_by_id(span.document_version_id)
+            if version is None:
+                raise ExternalReviewIntegrityError(
+                    f"evidence {span.evidence_id} references a missing document version",
+                )
+            document = document_repository.get_by_id(version.document_id)
+            if document is None:
+                raise ExternalReviewIntegrityError(
+                    f"document version {version.document_version_id} references a missing document",
+                )
+            evidence.append(
+                UpdateFactEvidenceProjection(
+                    evidence_id=span.evidence_id,
+                    document_version_id=span.document_version_id,
+                    logical_key=document.logical_key,
+                    chunk_id=span.chunk_id,
+                    page_number=span.page_number,
+                    start_offset=span.start_offset,
+                    end_offset=span.end_offset,
+                    source_text=span.source_text,
+                    content_hash=span.content_hash,
+                ),
+            )
+
+        source_texts = tuple(item.source_text for item in evidence)
+        return UpdateFactSnapshotProjection(
+            fact_id=fact.fact_id,
+            subject=fact.subject,
+            predicate=fact.predicate,
+            object_value=fact.object_value,
+            display_value=canonical_fact_display_value(
+                fact.subject,
+                fact.predicate,
+                fact.object_value,
+                source_texts,
+            ),
+            status=fact.status,
+            concept=canonical_fact_concept_with_evidence(
+                fact.subject,
+                fact.predicate,
+                source_texts,
+            ),
+            evidence=tuple(evidence),
         )
 
     def _report_projection(

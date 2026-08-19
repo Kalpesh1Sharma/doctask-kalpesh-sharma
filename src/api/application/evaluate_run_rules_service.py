@@ -20,7 +20,7 @@ from api.application.idempotency_claim_takeover import (
 from api.application.provider_usage_tracking import finish_provider_usage, start_provider_usage
 from domain.fact import FactStatus
 from domain.fact_extraction import normalize_uuid
-from domain.fact_semantics import canonical_fact_concept, canonical_field_concept
+from domain.fact_semantics import canonical_fact_concept_with_evidence, canonical_field_concept
 from domain.finding import Finding, FindingStatus, FindingType
 from domain.rule_evaluation import (
     RuleEvaluationOutcome,
@@ -93,6 +93,14 @@ class _NumericConstraint:
     operator: str
     threshold: Decimal
     currency: str | None
+
+
+def _source_fact_concept(fact: RuleEvaluationSourceFact) -> str:
+    return canonical_fact_concept_with_evidence(
+        fact.subject,
+        fact.predicate,
+        (evidence.source_text for evidence in fact.evidence),
+    )
 
 
 def _numeric_scalar(value: object) -> tuple[Decimal, str | None] | None:
@@ -674,7 +682,7 @@ class EvaluateRunRulesService:
             matching = tuple(
                 fact
                 for fact in source_facts
-                if canonical_fact_concept(fact.subject, fact.predicate) == field_concept
+                if _source_fact_concept(fact) == field_concept
             )
             if not matching:
                 return None
@@ -717,7 +725,7 @@ class EvaluateRunRulesService:
         if requires_grounded and isinstance(field_value, str) and field_value.strip():
             field_concept = canonical_field_concept(field_value)
             for fact in source_facts:
-                if canonical_fact_concept(fact.subject, fact.predicate) != field_concept:
+                if _source_fact_concept(fact) != field_concept:
                     continue
                 if not fact.evidence:
                     continue
@@ -748,7 +756,7 @@ class EvaluateRunRulesService:
             candidates = tuple(
                 fact
                 for fact in support
-                if canonical_fact_concept(fact.subject, fact.predicate) == field_concept
+                if _source_fact_concept(fact) == field_concept
             )
             # A field mismatch is not enough to second-guess a semantic provider.
             if not candidates:

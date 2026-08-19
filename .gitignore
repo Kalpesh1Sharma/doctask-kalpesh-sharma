@@ -15,6 +15,9 @@ node_modules/
 frontend/dist/
 frontend/test-results/
 frontend/playwright-report/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 # Operational runtime data (keep directory placeholders only)
 var/sources/*
 !var/sources/.gitkeep

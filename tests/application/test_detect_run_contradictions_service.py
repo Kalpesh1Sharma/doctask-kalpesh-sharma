@@ -390,6 +390,59 @@ def test_candidate_generation_normalizes_open_schema_concept_wrappers(
     assert finding_count(resources) == 1
 
 
+def test_exact_evidence_labels_prevent_generic_amount_false_contradiction(
+    resources: Resources,
+) -> None:
+    with pool.connection() as connection:
+        loan_amount_evidence = create_evidence(
+            connection,
+            resources.document_version_id,
+            resources.chunk_id,
+            20,
+            45,
+            "Loan Amount: $275,000",
+        )
+        cash_evidence = create_evidence(
+            connection,
+            resources.document_version_id,
+            resources.chunk_id,
+            50,
+            85,
+            "Estimated Cash to Close: $12,300",
+        )
+        create_fact(
+            connection,
+            resources.run_id,
+            "$275,000",
+            loan_amount_evidence,
+            subject="Loan",
+            predicate="has amount",
+        )
+        create_fact(
+            connection,
+            resources.run_id,
+            "$12,300",
+            cash_evidence,
+            subject="Loan",
+            predicate="has amount",
+        )
+        connection.commit()
+
+    provider = FakeProvider(
+        ContradictionDetectionResponse(
+            format="contradiction-detection-v1",
+            contradictions=(),
+        ),
+    )
+    service(provider).detect(DetectRunContradictionsCommand(resources.run_id))
+
+    # The fixture's original structured-value pair still exercises the provider.
+    # The two numeric Facts above must not become a deterministic contradiction
+    # merely because the extractor used the generic relation ``Loan / has amount``.
+    assert len(provider.calls) == 1
+    assert finding_count(resources) == 0
+
+
 def test_generic_is_predicate_uses_subject_instead_of_grouping_unrelated_fields(
     resources: Resources,
 ) -> None:

@@ -94,11 +94,52 @@ class _ReviewQuery:
             idempotency_key=f"update-review:{_RUN_ID}:one",
             decided_at=_NOW,
         )
+        update_evidence = SimpleNamespace(
+            evidence_id="12121212-1212-4212-8212-121212121212",
+            document_version_id="13131313-1313-4313-8313-131313131313",
+            logical_key="loan_estimate",
+            chunk_id="14141414-1414-4414-8414-141414141414",
+            page_number=None,
+            start_offset=10,
+            end_offset=31,
+            source_text="Interest Rate: 6.250%",
+            content_hash="sha256:" + "d" * 64,
+        )
+        update_fact = SimpleNamespace(
+            fact_id="15151515-1515-4515-8515-151515151515",
+            subject="Loan Estimate",
+            predicate="Interest Rate",
+            object_value="6.250%",
+            display_value="6.250%",
+            status="CONFIRMED",
+            concept="interest rate",
+            evidence=(update_evidence,),
+        )
+        baseline_fact = SimpleNamespace(
+            fact_id="16161616-1616-4616-8616-161616161616",
+            subject="Interest Rate",
+            predicate="is",
+            object_value="6.375%",
+            display_value="6.375%",
+            status="CONFIRMED",
+            concept="interest rate",
+            evidence=(),
+        )
+        update_item = SimpleNamespace(
+            item_id="17171717-1717-4717-8717-171717171717",
+            fact_id=update_fact.fact_id,
+            kind=UpdateChangeItemKind.FACT_CREATED,
+            payload={"fact_id": update_fact.fact_id, "kind": "CREATED"},
+            fact=update_fact,
+            baseline_facts=(baseline_fact,),
+            decision=None,
+        )
         change_set = SimpleNamespace(
             change_set_id=_CHANGE_SET_ID,
             durable=True,
             change_set_fingerprint=_FINGERPRINT,
             manifest={"format": "update-change-set-v1", "run_id": _RUN_ID},
+            items=(update_item,),
             decision=update_decision,
         )
         return SimpleNamespace(
@@ -243,6 +284,11 @@ def test_review_get_exposes_evidence_decisions_and_update_approval() -> None:
     assert payload["findings"][0]["decision"]["decision"] == "APPROVED"
     assert payload["update_change_set"]["change_set_fingerprint"] == _FINGERPRINT
     assert payload["update_change_set"]["decision"]["decision"] == "APPROVED"
+    item = payload["update_change_set"]["items"][0]
+    assert item["fact"]["concept"] == "interest rate"
+    assert item["fact"]["evidence"][0]["logical_key"] == "loan_estimate"
+    assert item["baseline_facts"][0]["object_value"] == "6.375%"
+    assert item["baseline_facts"][0]["display_value"] == "6.375%"
 
 
 def test_finding_decision_route_preserves_scoped_idempotency_and_actor() -> None:

@@ -4,9 +4,14 @@ import pytest
 from psycopg.errors import CheckViolation, LockNotAvailable, RaiseException, UniqueViolation
 
 from db.pool import pool
-from domain.run import Run, RunStage, RunStatus, RunType
+from domain.finding import Finding, FindingStatus, FindingType
+from domain.run import Run, RunStage, RunStatus, RunStepStatus, RunType
+from domain.run_membership import RunMembershipRelation
+from repositories.finding_repository import FindingRepository
+from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_metric_repository import RunMetricRepository
 from repositories.run_repository import RunRepository
+from repositories.run_step_repository import RunStepRepository
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -177,6 +182,282 @@ def test_update_status_updates_normal_status(pile_id: str) -> None:
     assert record is not None
     assert record.status is RunStatus.RUNNING
     assert record.completed_at is None
+
+
+def test_worker_candidates_prioritize_review_required_over_older_running_run(
+    pile_id: str,
+) -> None:
+    older_running = create_run(pile_id, run_type=RunType.INITIAL)
+
+    with pool.connection() as connection:
+        second_pile_row = connection.execute(
+            "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+            (f"Worker priority test {uuid4()}",),
+        ).fetchone()
+        connection.commit()
+    assert second_pile_row is not None
+    second_pile_id = str(second_pile_row[0])
+
+    review_ready = create_run(second_pile_id, run_type=RunType.INITIAL)
+    try:
+        with pool.connection() as connection:
+            runs = RunRepository(connection)
+            runs.update_status(older_running.run_id, RunStatus.RUNNING)
+            runs.update_status(review_ready.run_id, RunStatus.RUNNING)
+            runs.update_status(review_ready.run_id, RunStatus.REVIEW_REQUIRED)
+            # Force both test Runs to rank first inside their respective status
+            # partitions. The fair scheduler guarantees status priority within
+            # a rank/round, not that every REVIEW_REQUIRED Run globally precedes
+            # every older RUNNING Run in a database containing unrelated backlog.
+            connection.execute(
+                """
+                UPDATE runs
+                SET created_at = TIMESTAMPTZ '1800-01-01 00:00:00+00'
+                WHERE id IN (%s::uuid, %s::uuid)
+                """,
+                (review_ready.run_id, older_running.run_id),
+            )
+            connection.commit()
+
+            candidates = runs.list_worker_candidates(limit=100_000)
+
+        our_ids = [
+            candidate.run_id
+            for candidate in candidates
+            if candidate.run_id in {older_running.run_id, review_ready.run_id}
+        ]
+        assert our_ids == [review_ready.run_id, older_running.run_id]
+    finally:
+        with pool.connection() as connection:
+            connection.execute("DELETE FROM runs WHERE pile_id = %s::uuid", (second_pile_id,))
+            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (second_pile_id,))
+            connection.commit()
+
+
+def test_worker_candidates_exclude_review_required_run_waiting_on_finding_decision(
+    pile_id: str,
+) -> None:
+    waiting_review = create_run(pile_id, run_type=RunType.INITIAL)
+    finding_id = str(uuid4())
+
+    try:
+        with pool.connection() as connection:
+            runs = RunRepository(connection)
+            runs.update_status(waiting_review.run_id, RunStatus.RUNNING)
+            runs.update_status(waiting_review.run_id, RunStatus.REVIEW_REQUIRED)
+            FindingRepository(connection).create(
+                Finding(
+                    finding_id=finding_id,
+                    origin_run_id=waiting_review.run_id,
+                    finding_type=FindingType.CONTRADICTION,
+                    title="Pending human decision",
+                    description="This finding still requires review.",
+                    severity="MEDIUM",
+                    status=FindingStatus.PENDING,
+                ),
+            )
+            RunFindingRepository(connection).add(
+                waiting_review.run_id,
+                finding_id,
+                RunMembershipRelation.CREATED,
+            )
+            connection.commit()
+
+            candidates = runs.list_worker_candidates(limit=100_000)
+
+        assert waiting_review.run_id not in {candidate.run_id for candidate in candidates}
+    finally:
+        with pool.connection() as connection:
+            connection.execute(
+                "DELETE FROM run_findings WHERE finding_id = %s::uuid",
+                (finding_id,),
+            )
+            connection.execute(
+                "DELETE FROM findings WHERE id = %s::uuid",
+                (finding_id,),
+            )
+            connection.commit()
+
+
+def test_worker_candidates_include_review_required_initial_when_review_is_complete(
+    pile_id: str,
+) -> None:
+    review_ready = create_run(pile_id, run_type=RunType.INITIAL)
+
+    with pool.connection() as connection:
+        runs = RunRepository(connection)
+        runs.update_status(review_ready.run_id, RunStatus.RUNNING)
+        runs.update_status(review_ready.run_id, RunStatus.REVIEW_REQUIRED)
+        connection.commit()
+
+        candidates = runs.list_worker_candidates(limit=100_000)
+
+    assert review_ready.run_id in {candidate.run_id for candidate in candidates}
+
+
+def test_worker_candidates_prioritize_pending_over_older_running_run(
+    pile_id: str,
+) -> None:
+    older_running = create_run(pile_id, run_type=RunType.INITIAL)
+
+    with pool.connection() as connection:
+        second_pile_row = connection.execute(
+            "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+            (f"Worker pending priority test {uuid4()}",),
+        ).fetchone()
+        connection.commit()
+    assert second_pile_row is not None
+    second_pile_id = str(second_pile_row[0])
+
+    pending = create_run(second_pile_id, run_type=RunType.INITIAL)
+    try:
+        with pool.connection() as connection:
+            runs = RunRepository(connection)
+            runs.update_status(older_running.run_id, RunStatus.RUNNING)
+            # Put both Runs in the first scheduler round so this assertion
+            # exercises PENDING-before-RUNNING priority without depending on
+            # unrelated historical rows in the shared integration database.
+            connection.execute(
+                """
+                UPDATE runs
+                SET created_at = TIMESTAMPTZ '1800-01-01 00:00:00+00'
+                WHERE id IN (%s::uuid, %s::uuid)
+                """,
+                (pending.run_id, older_running.run_id),
+            )
+            connection.commit()
+
+            candidates = runs.list_worker_candidates(limit=100_000)
+
+        our_ids = [
+            candidate.run_id
+            for candidate in candidates
+            if candidate.run_id in {older_running.run_id, pending.run_id}
+        ]
+        assert our_ids == [pending.run_id, older_running.run_id]
+    finally:
+        with pool.connection() as connection:
+            connection.execute("DELETE FROM runs WHERE pile_id = %s::uuid", (second_pile_id,))
+            connection.execute("DELETE FROM piles WHERE id = %s::uuid", (second_pile_id,))
+            connection.commit()
+
+
+def test_worker_candidates_interleave_statuses_so_review_backlog_does_not_starve_pending(
+    pile_id: str,
+) -> None:
+    del pile_id  # This test needs separate piles because INITIAL is unique per pile.
+    created_pile_ids: list[str] = []
+    review_run_ids: list[str] = []
+
+    try:
+        for index in range(3):
+            with pool.connection() as connection:
+                pile_row = connection.execute(
+                    "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+                    (f"Worker fair review {index} {uuid4()}",),
+                ).fetchone()
+                connection.commit()
+            assert pile_row is not None
+            review_pile_id = str(pile_row[0])
+            created_pile_ids.append(review_pile_id)
+            review_run = create_run(review_pile_id, run_type=RunType.INITIAL)
+            review_run_ids.append(review_run.run_id)
+            with pool.connection() as connection:
+                runs = RunRepository(connection)
+                runs.update_status(review_run.run_id, RunStatus.RUNNING)
+                runs.update_status(review_run.run_id, RunStatus.REVIEW_REQUIRED)
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET created_at = TIMESTAMPTZ '1900-01-01 00:00:00+00'
+                        + (%s * INTERVAL '1 second')
+                    WHERE id = %s::uuid
+                    """,
+                    (index, review_run.run_id),
+                )
+                connection.commit()
+
+        with pool.connection() as connection:
+            pile_row = connection.execute(
+                "INSERT INTO piles (name) VALUES (%s) RETURNING id",
+                (f"Worker fair pending {uuid4()}",),
+            ).fetchone()
+            connection.commit()
+        assert pile_row is not None
+        pending_pile_id = str(pile_row[0])
+        created_pile_ids.append(pending_pile_id)
+        pending = create_run(pending_pile_id, run_type=RunType.INITIAL)
+        with pool.connection() as connection:
+            connection.execute(
+                """
+                UPDATE runs
+                SET created_at = TIMESTAMPTZ '1900-01-01 00:00:00+00'
+                WHERE id = %s::uuid
+                """,
+                (pending.run_id,),
+            )
+            connection.commit()
+
+        with pool.connection() as connection:
+            candidates = RunRepository(connection).list_worker_candidates(limit=100_000)
+
+        our_ids = [
+            candidate.run_id
+            for candidate in candidates
+            if candidate.run_id in {*review_run_ids, pending.run_id}
+        ]
+        assert our_ids == [
+            review_run_ids[0],
+            pending.run_id,
+            review_run_ids[1],
+            review_run_ids[2],
+        ]
+    finally:
+        with pool.connection() as connection:
+            for created_pile_id in created_pile_ids:
+                connection.execute(
+                    "DELETE FROM runs WHERE pile_id = %s::uuid",
+                    (created_pile_id,),
+                )
+                connection.execute(
+                    "DELETE FROM piles WHERE id = %s::uuid",
+                    (created_pile_id,),
+                )
+            connection.commit()
+
+
+def test_worker_candidates_exclude_run_with_terminal_escalated_step(pile_id: str) -> None:
+    run = create_run(pile_id, run_type=RunType.INITIAL)
+
+    with pool.connection() as connection:
+        runs = RunRepository(connection)
+        runs.update_status(run.run_id, RunStatus.RUNNING)
+        steps = RunStepRepository(connection)
+        step = steps.create(run.run_id, RunStage.EXAMINE, 1)
+        running = steps.update_execution_state(
+            step.step_id,
+            RunStepStatus.RUNNING,
+            mark_started=True,
+        )
+        assert running is not None
+        escalated = steps.update_execution_state(
+            step.step_id,
+            RunStepStatus.ESCALATED,
+            mark_completed=True,
+            error_code="TEST_ESCALATED",
+            error_message="terminal test escalation",
+        )
+        assert escalated is not None
+        RunMetricRepository(connection).create_for_closed_step(
+            run.run_id,
+            RunStage.EXAMINE,
+            1,
+        )
+        connection.commit()
+
+        candidates = runs.list_worker_candidates(limit=10_000)
+
+    assert run.run_id not in {candidate.run_id for candidate in candidates}
 
 
 def test_update_status_rejects_completion_without_commit_proof(pile_id: str) -> None:

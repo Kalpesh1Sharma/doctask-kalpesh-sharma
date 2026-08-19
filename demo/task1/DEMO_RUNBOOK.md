@@ -186,9 +186,28 @@ powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\copy_update.ps1
 
 The hostile text is document content, not workflow authority. The success condition is that it cannot auto-approve findings, skip human review, reveal environment variables, or directly mark a Run completed.
 
-## 9. Optional second independent corpus
+## 9. Second independent corpus proof
 
-A second synthetic corpus is provided under `second_corpus/` to prove the system works again on different documents. Use `scripts/setup_second_corpus.ps1` only if the main demo is already complete and there is enough time.
+After the primary demo is complete, keep that successful pile intact and create the independent Priya Raman pile:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\setup_second_corpus.ps1
+powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\copy_second_baseline.ps1
+```
+
+The second Closing Disclosure is below the configured cash-to-close threshold and should produce an honest zero-Finding result. Verify it with the Run id shown in the UI/API:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\verify_no_findings.ps1 -RunId <RUN_ID>
+```
+
+After that INITIAL Run is complete, add the agreeing Loan Estimate as a focused UPDATE:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\copy_second_loan_estimate.ps1
+```
+
+It should introduce no contradiction/rule Finding for the agreeing values. Review any proposed Fact items normally using the baseline/proposed/source details shown on each review card.
 
 ## 10. Regression proof
 

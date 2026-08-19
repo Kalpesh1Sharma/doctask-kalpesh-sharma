@@ -7,6 +7,7 @@ from datetime import datetime
 from pydantic import Field, JsonValue
 
 from api.rest.schemas.core import ApiModel, EvidenceResponse
+from domain.fact import FactStatus
 from domain.finding import FindingStatus, FindingType
 from domain.review_decision import ReviewDecisionType
 from domain.run import RunStatus, RunType
@@ -79,11 +80,28 @@ class UpdateItemReviewDecisionResponse(ApiModel):
     decided_at: datetime
 
 
+class UpdateFactEvidenceResponse(EvidenceResponse):
+    logical_key: str
+
+
+class UpdateFactSnapshotResponse(ApiModel):
+    fact_id: str
+    subject: str
+    predicate: str
+    object_value: JsonValue
+    display_value: JsonValue | None = None
+    status: FactStatus
+    concept: str
+    evidence: list[UpdateFactEvidenceResponse] = Field(default_factory=list)
+
+
 class UpdateChangeItemResponse(ApiModel):
     item_id: str | None
     fact_id: str
     kind: UpdateChangeItemKind
     payload: JsonValue
+    fact: UpdateFactSnapshotResponse
+    baseline_facts: list[UpdateFactSnapshotResponse] = Field(default_factory=list)
     decision: UpdateItemReviewDecisionResponse | None
 
 

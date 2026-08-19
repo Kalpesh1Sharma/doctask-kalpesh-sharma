@@ -32,6 +32,7 @@ from api.rest.schemas.review import (
     UpdateChangeSetResponse,
     UpdateDecisionRequest,
     UpdateDecisionResponse,
+    UpdateFactSnapshotResponse,
     UpdateItemReviewDecisionResponse,
     UpdateReviewDecisionResponse,
 )
@@ -104,6 +105,23 @@ def _review_response(item: object) -> RunReviewResponse:
                     fact_id=update_item.fact_id,
                     kind=update_item.kind,
                     payload=update_item.payload,
+                    fact=UpdateFactSnapshotResponse.model_validate(
+                        {
+                            **update_item.fact.__dict__,
+                            "evidence": [
+                                evidence.__dict__ for evidence in update_item.fact.evidence
+                            ],
+                        },
+                    ),
+                    baseline_facts=[
+                        UpdateFactSnapshotResponse.model_validate(
+                            {
+                                **fact.__dict__,
+                                "evidence": [evidence.__dict__ for evidence in fact.evidence],
+                            },
+                        )
+                        for fact in update_item.baseline_facts
+                    ],
                     decision=item_decision,
                 ),
             )

@@ -12,6 +12,7 @@ _WORD = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 _DRAWING = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _OFFICE = "urn:schemas-microsoft-com:office:office"
 _NS = {"w": _WORD}
+_TXT_READ_CHARS = 1024 * 1024
 
 
 class DocumentParseError(RuntimeError):
@@ -43,6 +44,8 @@ class ParsedDocument:
 
     @property
     def text(self) -> str:
+        if all(segment.page_number is None for segment in self.segments):
+            return "".join(segment.text for segment in self.segments)
         return "\n".join(segment.text for segment in self.segments)
 
 
@@ -69,11 +72,43 @@ def detect_source_type(data: bytes) -> str:
     return "text/plain; charset=utf-8"
 
 
+def detect_source_type_path(path: Path) -> str:
+    """Detect a stored source without materializing the whole file as bytes."""
+
+    source = Path(path)
+    try:
+        with source.open("rb") as stream:
+            signature = stream.read(5)
+    except OSError as error:
+        raise DocumentParseError("source cannot be opened") from error
+
+    if signature.startswith(b"%PDF-"):
+        return "application/pdf"
+    if signature.startswith((b"PK\x03\x04", b"PK\x05\x06")):
+        try:
+            with zipfile.ZipFile(source) as archive:
+                names = set(archive.namelist())
+                if "[Content_Types].xml" in names and "word/document.xml" in names:
+                    return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        except zipfile.BadZipFile as error:
+            raise UnsupportedDocumentTypeError("ZIP source is not a valid DOCX") from error
+
+    # TXT validation is performed by the path parser itself so the file is read
+    # through a text decoder rather than duplicated as one large bytes object.
+    return "text/plain; charset=utf-8"
+
+
 class DocumentParser:
     """Parse the limited supported set while rejecting omitted DOCX content."""
 
     def parse_path(self, path: Path) -> ParsedDocument:
-        return self.parse_bytes(Path(path).read_bytes())
+        source = Path(path)
+        mime_type = detect_source_type_path(source)
+        if mime_type == "application/pdf":
+            return self._parse_pdf_path(source)
+        if mime_type.startswith("application/vnd.openxmlformats"):
+            return self._parse_docx_path(source)
+        return self._parse_txt_path(source)
 
     def parse_bytes(self, data: bytes) -> ParsedDocument:
         mime_type = detect_source_type(data)
@@ -90,6 +125,23 @@ class DocumentParser:
         except UnicodeDecodeError as error:
             raise UnsupportedDocumentTypeError("TXT source must be strict UTF-8") from error
         return ParsedDocument("text/plain; charset=utf-8", (ParsedSegment(text, None),))
+
+    @staticmethod
+    def _parse_txt_path(path: Path) -> ParsedDocument:
+        try:
+            with path.open("r", encoding="utf-8-sig", errors="strict", newline="") as stream:
+                segments: list[ParsedSegment] = []
+                while text := stream.read(_TXT_READ_CHARS):
+                    if not segments and text.startswith("\ufeff"):
+                        raise UnsupportedDocumentTypeError(
+                            "TXT accepts only an optional UTF-8 byte-order mark",
+                        )
+                    segments.append(ParsedSegment(text, None))
+        except UnicodeDecodeError as error:
+            raise UnsupportedDocumentTypeError("TXT source must be strict UTF-8") from error
+        except OSError as error:
+            raise DocumentParseError("TXT source cannot be read") from error
+        return ParsedDocument("text/plain; charset=utf-8", tuple(segments))
 
     @staticmethod
     def _parse_pdf(data: bytes) -> ParsedDocument:
@@ -109,6 +161,24 @@ class DocumentParser:
             raise ScannedPdfError("PDF contains no extractable text; OCR is not supported")
         return ParsedDocument("application/pdf", segments)
 
+    @staticmethod
+    def _parse_pdf_path(path: Path) -> ParsedDocument:
+        try:
+            from pypdf import PdfReader
+        except ImportError as error:  # pragma: no cover - packaging assertion
+            raise DocumentParseError("pypdf must be installed for PDF ingestion") from error
+        try:
+            reader = PdfReader(str(path))
+            segments = tuple(
+                ParsedSegment(page.extract_text() or "", index + 1)
+                for index, page in enumerate(reader.pages)
+            )
+        except Exception as error:  # pypdf exposes several parse-specific exceptions
+            raise DocumentParseError("PDF cannot be parsed") from error
+        if not any(segment.text.strip() for segment in segments):
+            raise ScannedPdfError("PDF contains no extractable text; OCR is not supported")
+        return ParsedDocument("application/pdf", segments)
+
     def _parse_docx(self, data: bytes) -> ParsedDocument:
         # Keep python-docx as an explicit dependency / supported format parser,
         # while OOXML inspection below supplies the fail-closed coverage rule.
@@ -118,6 +188,40 @@ class DocumentParser:
             raise DocumentParseError("python-docx must be installed for DOCX ingestion") from error
         try:
             with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                names = set(archive.namelist())
+                if "word/document.xml" not in names:
+                    raise UnsupportedDocumentTypeError("DOCX is missing word/document.xml")
+                self._reject_unsupported_docx_parts(archive, names)
+                root = ElementTree.fromstring(archive.read("word/document.xml"))
+        except zipfile.BadZipFile as error:
+            raise UnsupportedDocumentTypeError("DOCX archive is malformed") from error
+        except ElementTree.ParseError as error:
+            raise DocumentParseError("DOCX XML is malformed") from error
+        self._reject_unsupported_docx_markup(root)
+        body = root.find(f"{{{_WORD}}}body")
+        if body is None:
+            raise DocumentParseError("DOCX has no main body")
+        blocks: list[str] = []
+        for child in body:
+            if child.tag == f"{{{_WORD}}}p":
+                blocks.append(self._paragraph_text(child))
+            elif child.tag == f"{{{_WORD}}}tbl":
+                blocks.extend(self._table_blocks(child))
+            elif child.tag != f"{{{_WORD}}}sectPr":
+                raise UnsupportedDocxContentError("DOCX body contains an unsupported construct")
+        text = "\n".join(block for block in blocks if block != "")
+        return ParsedDocument(
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            (ParsedSegment(text, None),),
+        )
+
+    def _parse_docx_path(self, path: Path) -> ParsedDocument:
+        try:
+            import docx  # noqa: F401
+        except ImportError as error:  # pragma: no cover - packaging assertion
+            raise DocumentParseError("python-docx must be installed for DOCX ingestion") from error
+        try:
+            with zipfile.ZipFile(path) as archive:
                 names = set(archive.namelist())
                 if "word/document.xml" not in names:
                     raise UnsupportedDocumentTypeError("DOCX is missing word/document.xml")
