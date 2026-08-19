@@ -195,7 +195,7 @@ powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\setup_second_corpu
 powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\copy_second_baseline.ps1
 ```
 
-The second Closing Disclosure is below the configured cash-to-close threshold and should produce an honest zero-Finding result. Verify it with the Run id shown in the UI/API:
+The second Closing Disclosure is below the configured cash-to-close threshold and should produce an honest zero-Finding result. When the INITIAL reaches `REVIEW_REQUIRED`, confirm the empty Finding list and click **Acknowledge zero findings**. This explicit human action is required before COMMIT; zero Findings are never treated as implicit approval. After the worker completes the Run, verify it with the Run id shown in the UI/API:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\verify_no_findings.ps1 -RunId <RUN_ID>

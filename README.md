@@ -181,6 +181,7 @@ POST /api/v1/piles/{pile_id}/documents
 GET  /api/v1/runs/{run_id}
 POST /api/v1/runs/{run_id}/advance
 GET  /api/v1/runs/{run_id}/review
+POST /api/v1/runs/{run_id}/review/acknowledgement
 POST /api/v1/runs/{run_id}/findings/{finding_id}/decision
 POST /api/v1/runs/{run_id}/update/decision
 GET  /api/v1/runs/{run_id}/report
@@ -188,7 +189,7 @@ GET  /api/v1/runs/{run_id}/report/content
 GET  /api/v1/runs/{run_id}/metrics
 ```
 
-There is intentionally no direct REST `commit` endpoint. A client advances the durable workflow, completes human review, then advances again into `COMMIT`.
+There is intentionally no direct REST `commit` endpoint. A client advances the durable workflow, completes human review, then advances again into `COMMIT`. A non-UPDATE Run with zero Findings still requires an explicit human `POST /review/acknowledgement`; an empty Finding list is never treated as implicit approval.
 
 For UPDATE Runs, `GET /review` exposes material Fact changes as `update_change_set.items`. Call `POST /update/decision` once per item with its `fact_id`; APPROVED and REJECTED decisions may be mixed in the same review. UPDATEs with no material Fact items keep the legacy whole-change-set approval call without `fact_id`.
 
@@ -209,7 +210,7 @@ $env:TASK1_MCP_TRANSPORT = "streamable-http"
 task1-mcp
 ```
 
-The MCP server exposes the original 14 workflow operations plus two read-only 6C-3 change-history tools (`list_pile_change_history` and `get_run_change_history`) and deliberately has no `commit_run` bypass tool. `advance_run` preserves the same human-review gate as REST.
+The MCP server exposes the workflow operations, including explicit `acknowledge_run_review` for zero-Finding non-UPDATE gates, plus the two read-only 6C-3 change-history tools (`list_pile_change_history` and `get_run_change_history`). It deliberately has no `commit_run` bypass tool; `advance_run` preserves the same human-review gate as REST.
 
 ## 4. React review UI
 
@@ -228,7 +229,7 @@ npm run dev
 
 Open `http://127.0.0.1:5173`.
 
-The UI supports pile/rule/document setup, immutable version history, five-stage Run status, exact evidence review, mixed Finding approve/reject decisions, fingerprint-bound UPDATE review, COMMIT readiness, metrics, verified report retrieval, and focused-update proof display.
+The UI supports pile/rule/document setup, immutable version history, five-stage Run status, exact evidence review, mixed Finding approve/reject decisions, explicit zero-Finding acknowledgement, fingerprint-bound UPDATE review, COMMIT readiness, metrics, verified report retrieval, and focused-update proof display.
 
 
 ## 5. Watched-folder ingestion
@@ -275,7 +276,7 @@ Start it from the repository root:
 task1-worker
 ```
 
-The worker may drive `PENDING/RUNNING` through `INGEST -> UNDERSTAND -> EXAMINE -> REVIEW`, but it **always yields when the Run first reaches `REVIEW_REQUIRED`**. On later polls it calls the guarded external advance service: incomplete human review remains waiting, while a review-complete Run may enter `COMMIT`. The worker never writes Finding or UPDATE review decisions itself. Blocked UPDATE children are resumed only after their durable parent is `COMPLETED`.
+The worker may drive `PENDING/RUNNING` through `INGEST -> UNDERSTAND -> EXAMINE -> REVIEW`, but it **always yields when the Run first reaches `REVIEW_REQUIRED`**. On later polls it calls the guarded external advance service: incomplete human review remains waiting, while a review-complete Run may enter `COMMIT`. A zero-Finding INITIAL remains non-actionable until a human explicitly acknowledges that clean result. The worker never writes Finding, run-review acknowledgement, or UPDATE review decisions itself. Blocked UPDATE children are resumed only after their durable parent is `COMPLETED`.
 
 Multiple worker processes are safe to run. Before driving a candidate, each process takes a **session-scoped PostgreSQL advisory claim keyed by Run id**. Only one worker process can hold that transient claim at a time; the durable `runs` / `run_steps` / idempotency records remain authoritative. If a worker process or PostgreSQL session dies, PostgreSQL releases the advisory claim automatically and another worker can resume the Run from durable workflow state. Both the watcher and worker retry their polling loop after transient scan/database failures instead of exiting, and their CLI entry points explicitly open/close the shared database pool. No Redis queue or second durable lock store is introduced.
 
@@ -385,8 +386,7 @@ the primary demo:
 powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\copy_second_baseline.ps1
 ```
 
-After its INITIAL Run settles, verify the honest no-findings result with the Run id shown in the UI
-or API:
+After its INITIAL Run reaches `REVIEW_REQUIRED`, the Review tab should show zero Findings and an **Acknowledge zero findings** action. Click that explicit human gate; only then may the worker enter COMMIT. After completion, verify the honest no-findings result with the Run id shown in the UI or API:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\demo\task1\scripts\verify_no_findings.ps1 -RunId <RUN_ID>

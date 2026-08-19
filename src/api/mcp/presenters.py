@@ -22,6 +22,8 @@ from api.rest.schemas.review import (
     FindingDecisionResponse,
     ReviewDecisionResponse,
     ReviewFindingResponse,
+    RunReviewAcknowledgementResponse,
+    RunReviewAcknowledgementState,
     RunReviewResponse,
     UpdateChangeItemResponse,
     UpdateChangeSetResponse,
@@ -120,6 +122,19 @@ def metric_response(item: object) -> RunMetricResponse:
     return RunMetricResponse.model_validate(item.__dict__)
 
 
+def run_review_acknowledgement_response(item: object) -> RunReviewAcknowledgementResponse:
+    event = item.audit_event
+    payload = event.payload if isinstance(event.payload, dict) else {}
+    return RunReviewAcknowledgementResponse(
+        audit_event_id=event.audit_event_id,
+        actor_type=event.actor_type,
+        actor_id=event.actor_id,
+        idempotency_key=str(payload.get("idempotency_key", "")),
+        acknowledged_at=event.created_at,
+        replayed=item.replayed,
+    )
+
+
 def review_response(item: object) -> RunReviewResponse:
     findings = []
     for finding in item.findings:
@@ -196,6 +211,12 @@ def review_response(item: object) -> RunReviewResponse:
             decision=update_decision,
         )
 
+    acknowledgement_item = getattr(item, "run_review_acknowledgement", None)
+    acknowledgement = (
+        RunReviewAcknowledgementState.model_validate(acknowledgement_item.__dict__)
+        if acknowledgement_item is not None
+        else None
+    )
     return RunReviewResponse(
         run_id=item.run_id,
         run_type=item.run_type,
@@ -203,6 +224,7 @@ def review_response(item: object) -> RunReviewResponse:
         findings=findings,
         finding_review_complete=item.finding_review_complete,
         update_change_set=update_change_set,
+        run_review_acknowledgement=acknowledgement,
         review_complete=item.review_complete,
         commit_ready=item.commit_ready,
     )

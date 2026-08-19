@@ -41,6 +41,7 @@ def _provider(**overrides: object) -> McpServiceProvider:
         "advance": _unused,
         "review_query": _unused,
         "review_decision": _unused,
+        "acknowledge_run_review": _unused,
         "update_review": _unused,
         "change_history": _unused,
     }
@@ -85,6 +86,25 @@ class _AdvanceBlocked:
     def advance(self, _command):
         raise ExternalHumanReviewRequiredError(
             "Run cannot enter COMMIT until required human review is complete and approved",
+        )
+
+
+
+
+class _RunReviewAcknowledgement:
+    command = None
+
+    def record(self, command):
+        self.command = command
+        return SimpleNamespace(
+            audit_event=SimpleNamespace(
+                audit_event_id="66666666-6666-4666-8666-666666666666",
+                actor_type=command.actor_type,
+                actor_id=command.actor_id,
+                payload={"idempotency_key": command.idempotency_key},
+                created_at=_NOW,
+            ),
+            replayed=False,
         )
 
 
@@ -326,3 +346,25 @@ def test_get_run_change_history_tool_explains_one_committed_update() -> None:
     assert result.structured_content is not None
     assert result.structured_content["run_id"] == _RUN_ID
     assert result.structured_content["commit_actor"]["actor_id"] == "task1-worker"
+
+
+def test_acknowledge_run_review_tool_records_explicit_zero_finding_gate() -> None:
+    service = _RunReviewAcknowledgement()
+    server = create_mcp_server(_provider(acknowledge_run_review=lambda: service))
+    key = f"run-review:{_RUN_ID}:zero-findings"
+
+    result = _call(
+        server,
+        "acknowledge_run_review",
+        {
+            "run_id": _RUN_ID,
+            "actor_type": "HUMAN",
+            "actor_id": "reviewer@example.test",
+            "idempotency_key": key,
+        },
+    )
+
+    assert result.is_error is False
+    assert result.structured_content is not None
+    assert result.structured_content["idempotency_key"] == key
+    assert service.command.run_id == _RUN_ID

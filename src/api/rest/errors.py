@@ -9,6 +9,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from api.application.acknowledge_run_review_service import (
+    InvalidRunReviewAcknowledgementKeyError,
+    RunReviewAcknowledgementConflictError,
+    RunReviewAcknowledgementIntegrityError,
+    RunReviewAcknowledgementNotEligibleError,
+    RunReviewAcknowledgementRunNotFoundError,
+)
 from api.application.build_update_change_set_service import (
     UpdateChangeSetConflictError,
     UpdateChangeSetPreparationError,
@@ -274,6 +281,26 @@ def install_error_handlers(app: FastAPI) -> None:
         (ExternalReviewIntegrityError, _integrity_handler("REVIEW_STATE_INTEGRITY")),
         (FinalReportNotFoundError, _simple_handler(404, "FINAL_REPORT_NOT_FOUND")),
         (FinalReportIntegrityError, _integrity_handler("FINAL_REPORT_INTEGRITY")),
+        (
+            InvalidRunReviewAcknowledgementKeyError,
+            _simple_handler(400, "INVALID_RUN_REVIEW_ACKNOWLEDGEMENT_KEY"),
+        ),
+        (
+            RunReviewAcknowledgementRunNotFoundError,
+            _simple_handler(404, "RUN_NOT_FOUND"),
+        ),
+        (
+            RunReviewAcknowledgementNotEligibleError,
+            _simple_handler(409, "RUN_REVIEW_ACKNOWLEDGEMENT_NOT_ELIGIBLE"),
+        ),
+        (
+            RunReviewAcknowledgementConflictError,
+            _simple_handler(409, "RUN_REVIEW_ACKNOWLEDGEMENT_CONFLICT"),
+        ),
+        (
+            RunReviewAcknowledgementIntegrityError,
+            _integrity_handler("RUN_REVIEW_ACKNOWLEDGEMENT_INTEGRITY"),
+        ),
         (InvalidReviewIdempotencyKeyError, _simple_handler(400, "INVALID_REVIEW_IDEMPOTENCY_KEY")),
         (ReviewRunNotFoundError, _simple_handler(404, "RUN_NOT_FOUND")),
         (FindingNotFoundError, _simple_handler(404, "FINDING_NOT_FOUND")),

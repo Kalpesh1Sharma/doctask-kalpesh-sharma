@@ -215,7 +215,24 @@ class RunRepository:
                       AND findings.status = 'PENDING'::finding_status
                   )
                   AND (
-                    run_type = 'INITIAL'::run_type
+                    (
+                      run_type = 'INITIAL'::run_type
+                      AND (
+                        EXISTS (
+                          SELECT 1
+                          FROM run_findings
+                          WHERE run_findings.run_id = runs.id
+                        )
+                        OR EXISTS (
+                          SELECT 1
+                          FROM audit_events
+                          WHERE audit_events.run_id = runs.id
+                            AND audit_events.entity_type = 'run'
+                            AND audit_events.entity_id = runs.id
+                            AND audit_events.event_type = 'RUN_REVIEW_ACKNOWLEDGED'
+                        )
+                      )
+                    )
                     OR EXISTS (
                       SELECT 1
                       FROM update_change_sets

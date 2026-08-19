@@ -12,6 +12,7 @@ vi.mock("../lib/api", async () => {
     api: {
       ...actual.api,
       reviewFinding: vi.fn(),
+      acknowledgeRunReview: vi.fn(),
       reviewUpdate: vi.fn()
     }
   };
@@ -51,6 +52,7 @@ const review: RunReview = {
       decision: null
     }
   ],
+  run_review_acknowledgement: null,
   update_change_set: {
     change_set_id: null,
     durable: false,
@@ -186,6 +188,30 @@ test("records UPDATE Fact decisions independently", async () => {
     "alice@example.test",
     itemized.update_change_set!.change_set_fingerprint,
     "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+  ));
+  expect(onChanged).toHaveBeenCalled();
+});
+
+
+test("requires explicit acknowledgement for a zero-finding INITIAL review", async () => {
+  const onChanged = vi.fn();
+  const cleanInitial: RunReview = {
+    ...review,
+    run_type: "INITIAL",
+    findings: [],
+    finding_review_complete: true,
+    update_change_set: null,
+    run_review_acknowledgement: null,
+    review_complete: false,
+    commit_ready: false
+  };
+
+  render(<ReviewPanel actorId="alice@example.test" onChanged={onChanged} review={cleanInitial} />);
+  fireEvent.click(screen.getByRole("button", { name: "Acknowledge zero findings" }));
+
+  await waitFor(() => expect(api.acknowledgeRunReview).toHaveBeenCalledWith(
+    cleanInitial.run_id,
+    "alice@example.test"
   ));
   expect(onChanged).toHaveBeenCalled();
 });

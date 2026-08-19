@@ -11,6 +11,7 @@ from psycopg import Connection
 from psycopg_pool import ConnectionPool
 from pydantic import JsonValue
 
+from api.application.acknowledge_run_review_service import find_run_review_acknowledgement
 from api.application.build_update_change_set_service import (
     UpdateChangeSetApplicationError,
     build_current_update_change_set_manifest,
@@ -180,6 +181,15 @@ class UpdateChangeSetProjection:
 
 
 @dataclass(frozen=True)
+class RunReviewAcknowledgementProjection:
+    audit_event_id: str
+    actor_type: str
+    actor_id: str
+    idempotency_key: str
+    acknowledged_at: datetime
+
+
+@dataclass(frozen=True)
 class RunReviewProjection:
     run_id: str
     run_type: RunType
@@ -187,6 +197,7 @@ class RunReviewProjection:
     findings: tuple[ReviewFindingProjection, ...]
     finding_review_complete: bool
     update_change_set: UpdateChangeSetProjection | None
+    run_review_acknowledgement: RunReviewAcknowledgementProjection | None
     review_complete: bool
     commit_ready: bool
 
@@ -227,6 +238,27 @@ class ExternalReviewQueryService:
                 run,
                 finding_review_complete,
             )
+            acknowledgement_event = find_run_review_acknowledgement(connection, run.run_id)
+
+        acknowledgement = None
+        if acknowledgement_event is not None:
+            payload = (
+                acknowledgement_event.payload
+                if isinstance(acknowledgement_event.payload, dict)
+                else {}
+            )
+            idempotency_key = payload.get("idempotency_key")
+            if not isinstance(idempotency_key, str):
+                raise ExternalReviewIntegrityError(
+                    "run review acknowledgement lacks idempotency key",
+                )
+            acknowledgement = RunReviewAcknowledgementProjection(
+                audit_event_id=acknowledgement_event.audit_event_id,
+                actor_type=acknowledgement_event.actor_type,
+                actor_id=acknowledgement_event.actor_id,
+                idempotency_key=idempotency_key,
+                acknowledged_at=acknowledgement_event.created_at,
+            )
 
         update_decision = update_change_set.decision if update_change_set is not None else None
         update_items = update_change_set.items if update_change_set is not None else ()
@@ -252,10 +284,18 @@ class ExternalReviewQueryService:
                 and update_decision.decision is UpdateReviewDecisionType.APPROVED
             )
         )
-        review_complete = finding_review_complete and update_review_complete
+        empty_non_update_review_requires_ack = (
+            run.run_type is not RunType.UPDATE and not findings
+        )
+        run_review_complete = (
+            not empty_non_update_review_requires_ack or acknowledgement is not None
+        )
+        review_complete = (
+            finding_review_complete and update_review_complete and run_review_complete
+        )
         commit_ready = (
             run.status is RunStatus.REVIEW_REQUIRED
-            and finding_review_complete
+            and review_complete
             and update_commit_allowed
         )
         return RunReviewProjection(
@@ -265,6 +305,7 @@ class ExternalReviewQueryService:
             findings=findings,
             finding_review_complete=finding_review_complete,
             update_change_set=update_change_set,
+            run_review_acknowledgement=acknowledgement,
             review_complete=review_complete,
             commit_ready=commit_ready,
         )

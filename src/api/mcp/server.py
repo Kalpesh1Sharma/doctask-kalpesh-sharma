@@ -9,6 +9,7 @@ from io import BytesIO
 
 from mcp.server import MCPServer
 
+from api.application.acknowledge_run_review_service import RunReviewAcknowledgementCommand
 from api.application.create_pile_service import CreatePileCommand
 from api.application.create_rule_set_service import CreateRuleCommand, CreateRuleSetCommand
 from api.application.external_update_review_service import ExternalUpdateReviewCommand
@@ -28,6 +29,7 @@ from api.mcp.presenters import (
     review_response,
     rule_response,
     run_response,
+    run_review_acknowledgement_response,
     update_decision_response,
 )
 from api.mcp.schemas import McpFinalReportResult, McpRuleInput
@@ -45,6 +47,7 @@ from api.rest.schemas.core import (
 from api.rest.schemas.history import ChangeHistoryRunResponse
 from api.rest.schemas.review import (
     FindingDecisionResponse,
+    RunReviewAcknowledgementResponse,
     RunReviewResponse,
     UpdateDecisionResponse,
 )
@@ -247,6 +250,25 @@ def create_mcp_server(
             ),
         )
         return finding_decision_response(result)
+
+    @server.tool(name=_tool_name(ExternalOperation.ACKNOWLEDGE_RUN_REVIEW))
+    def acknowledge_run_review(
+        run_id: str,
+        actor_type: str,
+        actor_id: str,
+        idempotency_key: str,
+    ) -> RunReviewAcknowledgementResponse:
+        """Explicitly acknowledge a zero-finding non-UPDATE human review gate."""
+
+        result = services.acknowledge_run_review().record(
+            RunReviewAcknowledgementCommand(
+                run_id=run_id,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                idempotency_key=idempotency_key,
+            ),
+        )
+        return run_review_acknowledgement_response(result)
 
     @server.tool(name=_tool_name(ExternalOperation.REVIEW_UPDATE))
     def review_update(

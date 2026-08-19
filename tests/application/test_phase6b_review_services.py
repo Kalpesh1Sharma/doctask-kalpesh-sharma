@@ -4,6 +4,10 @@ from uuid import uuid4
 
 import pytest
 
+from api.application.acknowledge_run_review_service import (
+    AcknowledgeRunReviewService,
+    RunReviewAcknowledgementCommand,
+)
 from api.application.external_review_query_service import ExternalReviewQueryService
 from api.application.review_decision_service import (
     ReviewDecisionCommand,
@@ -86,6 +90,50 @@ def _create_finding(run_id: str, title: str) -> str:
         )
         connection.commit()
     return created.finding_id
+
+
+
+
+def test_zero_finding_review_requires_explicit_acknowledgement(
+    review_pile: tuple[str, str],
+    tmp_path,
+) -> None:
+    _pile_id, run_id = review_pile
+    query = ExternalReviewQueryService(pool, LocalArtifactStorage(tmp_path / "artifacts"))
+
+    gated = query.get_review(run_id)
+    assert gated.findings == ()
+    assert gated.finding_review_complete is True
+    assert gated.run_review_acknowledgement is None
+    assert gated.review_complete is False
+    assert gated.commit_ready is False
+
+    service = AcknowledgeRunReviewService(pool)
+    key = f"run-review:{run_id}:zero-findings"
+    first = service.record(
+        RunReviewAcknowledgementCommand(
+            run_id=run_id,
+            actor_type="HUMAN",
+            actor_id="reviewer@example.test",
+            idempotency_key=key,
+        ),
+    )
+    replay = service.record(
+        RunReviewAcknowledgementCommand(
+            run_id=run_id,
+            actor_type="HUMAN",
+            actor_id="reviewer@example.test",
+            idempotency_key=key,
+        ),
+    )
+
+    assert first.replayed is False
+    assert replay.replayed is True
+    ready = query.get_review(run_id)
+    assert ready.run_review_acknowledgement is not None
+    assert ready.run_review_acknowledgement.actor_id == "reviewer@example.test"
+    assert ready.review_complete is True
+    assert ready.commit_ready is True
 
 
 def test_review_projection_tracks_mixed_item_decisions_and_commit_readiness(

@@ -17,6 +17,19 @@ export function ReviewPanel({
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  async function acknowledgeEmptyReview() {
+    setPending("run-review");
+    setError(null);
+    try {
+      await api.acknowledgeRunReview(review.run_id, actorId);
+      await onChanged();
+    } catch (caught) {
+      setError(messageFor(caught));
+    } finally {
+      setPending(null);
+    }
+  }
+
   async function decideFinding(findingId: string, decision: "APPROVED" | "REJECTED") {
     setPending(findingId);
     setError(null);
@@ -71,7 +84,31 @@ export function ReviewPanel({
       {error ? <div className="alert alert-error">{error}</div> : null}
 
       {review.findings.length === 0 ? (
-        <div className="empty-state">No findings require item-level review for this run.</div>
+        <div className="empty-state stack-sm">
+          <div>No findings require item-level review for this run.</div>
+          {review.run_type !== "UPDATE" ? (
+            review.run_review_acknowledgement ? (
+              <div className="decision-summary">
+                <StatusBadge value="ACKNOWLEDGED" />
+                <span>
+                  by {review.run_review_acknowledgement.actor_id} · {formatDate(review.run_review_acknowledgement.acknowledged_at)}
+                </span>
+              </div>
+            ) : (
+              <div>
+                <p className="muted">A human must explicitly acknowledge the zero-finding result before COMMIT.</p>
+                <button
+                  className="button button-primary"
+                  disabled={pending !== null || review.run_status !== "REVIEW_REQUIRED"}
+                  onClick={() => void acknowledgeEmptyReview()}
+                  type="button"
+                >
+                  {pending === "run-review" ? "Saving…" : "Acknowledge zero findings"}
+                </button>
+              </div>
+            )
+          ) : null}
+        </div>
       ) : (
         <div className="review-grid">
           {review.findings.map((finding) => (

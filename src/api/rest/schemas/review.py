@@ -45,6 +45,24 @@ class ReviewDecisionResponse(ApiModel):
     decided_at: datetime
 
 
+class RunReviewAcknowledgementRequest(ApiModel):
+    actor_type: str = Field(min_length=1, max_length=100)
+    actor_id: str = Field(min_length=1, max_length=255)
+    idempotency_key: str = Field(min_length=1, max_length=256)
+
+
+class RunReviewAcknowledgementState(ApiModel):
+    audit_event_id: str
+    actor_type: str
+    actor_id: str
+    idempotency_key: str
+    acknowledged_at: datetime
+
+
+class RunReviewAcknowledgementResponse(RunReviewAcknowledgementState):
+    replayed: bool
+
+
 class ReviewFindingResponse(ApiModel):
     run_id: str
     finding_id: str
@@ -121,6 +139,7 @@ class RunReviewResponse(ApiModel):
     findings: list[ReviewFindingResponse]
     finding_review_complete: bool
     update_change_set: UpdateChangeSetResponse | None
+    run_review_acknowledgement: RunReviewAcknowledgementState | None
     review_complete: bool
     commit_ready: bool
 

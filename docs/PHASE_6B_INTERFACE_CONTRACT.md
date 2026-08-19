@@ -181,6 +181,7 @@ Advance response:
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/v1/runs/{run_id}/review` | Read the complete frozen review payload needed by a human or machine driver |
+| POST | `/api/v1/runs/{run_id}/review/acknowledgement` | Explicitly acknowledge a zero-Finding non-UPDATE review |
 | POST | `/api/v1/runs/{run_id}/findings/{finding_id}/decision` | Approve/reject one Finding |
 | POST | `/api/v1/runs/{run_id}/update/decision` | Approve/reject the UPDATE change set |
 
@@ -195,7 +196,17 @@ Finding decision request:
 }
 ```
 
-The same review may contain both approved and rejected Findings. A decision only resolves the addressed Finding.
+The same review may contain both approved and rejected Findings. A decision only resolves the addressed Finding. For a non-UPDATE Run with zero Findings, `finding_review_complete=true` does not imply approval: `review_complete` and `commit_ready` remain false until `POST /review/acknowledgement` records an explicit durable human acknowledgement. The acknowledgement uses `run-review:<run-uuid>:<caller-token>` idempotency and is also exposed as the MCP `acknowledge_run_review` operation.
+
+Zero-Finding acknowledgement request:
+
+```json
+{
+  "actor_type": "HUMAN",
+  "actor_id": "reviewer@example.test",
+  "idempotency_key": "run-review:<run-uuid>:<caller-token>"
+}
+```
 
 UPDATE decision request:
 
@@ -296,6 +307,7 @@ Phase 6B-4 implemented the original 14 locked tool names with the official MCP P
 | `get_run_findings` | GET findings |
 | `get_run_review` | GET review |
 | `review_finding` | POST finding decision |
+| `acknowledge_run_review` | POST zero-Finding non-UPDATE review acknowledgement |
 | `review_update` | POST one material UPDATE Fact decision (`fact_id`), or the zero-item whole-set decision |
 | `get_run_report` | GET report metadata/content |
 | `get_run_metrics` | GET metrics |

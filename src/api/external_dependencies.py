@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from api.application.acknowledge_run_review_service import AcknowledgeRunReviewService
 from api.application.build_update_change_set_service import BuildUpdateChangeSetService
 from api.application.change_history_service import ChangeHistoryService
 from api.application.classify_document_version_service import ClassifyDocumentVersionService
@@ -114,6 +115,11 @@ def get_change_history_service() -> ChangeHistoryService:
 @lru_cache
 def get_review_decision_service() -> ReviewDecisionService:
     return ReviewDecisionService(pool)
+
+
+@lru_cache
+def get_acknowledge_run_review_service() -> AcknowledgeRunReviewService:
+    return AcknowledgeRunReviewService(pool)
 
 
 @lru_cache

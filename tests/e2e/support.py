@@ -12,6 +12,7 @@ from psycopg import connect
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg_pool import ConnectionPool
 
+from api.application.acknowledge_run_review_service import AcknowledgeRunReviewService
 from api.application.build_update_change_set_service import BuildUpdateChangeSetService
 from api.application.change_history_service import ChangeHistoryService
 from api.application.classify_document_version_service import ClassifyDocumentVersionService
@@ -39,6 +40,7 @@ from api.application.semantic_chunk_retrieval_service import SemanticChunkRetrie
 from api.mcp.server import create_mcp_server
 from api.mcp.service_provider import McpServiceProvider
 from api.rest.dependencies import (
+    get_acknowledge_run_review_service,
     get_change_history_service,
     get_create_pile_service,
     get_create_rule_set_service,
@@ -243,6 +245,7 @@ class _Services:
     advance: ExternalAdvanceRunService
     review_query: ExternalReviewQueryService
     review_decision: ReviewDecisionService
+    acknowledge_run_review: AcknowledgeRunReviewService
     update_review: ExternalUpdateReviewService
     change_history: ChangeHistoryService
 
@@ -323,6 +326,7 @@ def _services(pool: ConnectionPool, root: Path) -> _Services:
         advance=ExternalAdvanceRunService(review_query, workflow),
         review_query=review_query,
         review_decision=ReviewDecisionService(pool),
+        acknowledge_run_review=AcknowledgeRunReviewService(pool),
         update_review=ExternalUpdateReviewService(
             BuildUpdateChangeSetService(pool),
             ReviewUpdateChangeSetService(pool),
@@ -345,6 +349,7 @@ def _rest_app(pool: ConnectionPool, services: _Services) -> FastAPI:
             get_external_advance_run_service: lambda: services.advance,
             get_external_review_query_service: lambda: services.review_query,
             get_review_decision_service: lambda: services.review_decision,
+            get_acknowledge_run_review_service: lambda: services.acknowledge_run_review,
             get_external_update_review_service: lambda: services.update_review,
             get_change_history_service: lambda: services.change_history,
         },
@@ -368,6 +373,7 @@ def _mcp_server(services: _Services):
         advance=lambda: services.advance,
         review_query=lambda: services.review_query,
         review_decision=lambda: services.review_decision,
+        acknowledge_run_review=lambda: services.acknowledge_run_review,
         update_review=lambda: services.update_review,
         change_history=lambda: services.change_history,
     )
@@ -467,6 +473,7 @@ def _operational_services(
         advance=ExternalAdvanceRunService(review_query, workflow),
         review_query=review_query,
         review_decision=ReviewDecisionService(pool),
+        acknowledge_run_review=AcknowledgeRunReviewService(pool),
         update_review=ExternalUpdateReviewService(
             BuildUpdateChangeSetService(pool),
             ReviewUpdateChangeSetService(pool),

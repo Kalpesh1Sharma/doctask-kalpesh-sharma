@@ -18,6 +18,7 @@ class ExternalOperation(StrEnum):
     GET_RUN_FINDINGS = "get_run_findings"
     GET_RUN_REVIEW = "get_run_review"
     REVIEW_FINDING = "review_finding"
+    ACKNOWLEDGE_RUN_REVIEW = "acknowledge_run_review"
     REVIEW_UPDATE = "review_update"
     GET_RUN_REPORT = "get_run_report"
     GET_RUN_METRICS = "get_run_metrics"
@@ -75,6 +76,11 @@ REST_OPERATIONS: tuple[RestOperationContract, ...] = (
         ExternalOperation.REVIEW_FINDING,
         "POST",
         "/api/v1/runs/{run_id}/findings/{finding_id}/decision",
+    ),
+    RestOperationContract(
+        ExternalOperation.ACKNOWLEDGE_RUN_REVIEW,
+        "POST",
+        "/api/v1/runs/{run_id}/review/acknowledgement",
     ),
     RestOperationContract(
         ExternalOperation.REVIEW_UPDATE,

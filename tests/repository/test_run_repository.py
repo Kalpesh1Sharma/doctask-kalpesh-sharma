@@ -7,6 +7,7 @@ from db.pool import pool
 from domain.finding import Finding, FindingStatus, FindingType
 from domain.run import Run, RunStage, RunStatus, RunStepStatus, RunType
 from domain.run_membership import RunMembershipRelation
+from repositories.audit_event_repository import AuditEventRepository
 from repositories.finding_repository import FindingRepository
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_metric_repository import RunMetricRepository
@@ -42,6 +43,15 @@ def pile_id() -> str:
             connection.execute(
                 """
                 DELETE FROM run_metrics
+                WHERE run_id IN (
+                    SELECT id FROM runs WHERE pile_id = %s::uuid
+                )
+                """,
+                (created_pile_id,),
+            )
+            connection.execute(
+                """
+                DELETE FROM audit_events
                 WHERE run_id IN (
                     SELECT id FROM runs WHERE pile_id = %s::uuid
                 )
@@ -99,6 +109,22 @@ def create_run(pile_id: str, **overrides: object) -> Run:
         connection.commit()
 
     return run
+
+
+def _acknowledge_zero_finding_review(connection, run_id: str) -> None:
+    AuditEventRepository(connection).create(
+        run_id,
+        "run",
+        run_id,
+        "RUN_REVIEW_ACKNOWLEDGED",
+        "HUMAN",
+        "reviewer@example.test",
+        {
+            "run_id": run_id,
+            "decision": "ACKNOWLEDGED",
+            "idempotency_key": f"run-review:{run_id}:test",
+        },
+    )
 
 
 def test_create_persists_run_and_returns_record(pile_id: str) -> None:
@@ -205,6 +231,7 @@ def test_worker_candidates_prioritize_review_required_over_older_running_run(
             runs.update_status(older_running.run_id, RunStatus.RUNNING)
             runs.update_status(review_ready.run_id, RunStatus.RUNNING)
             runs.update_status(review_ready.run_id, RunStatus.REVIEW_REQUIRED)
+            _acknowledge_zero_finding_review(connection, review_ready.run_id)
             # Force both test Runs to rank first inside their respective status
             # partitions. The fair scheduler guarantees status priority within
             # a rank/round, not that every REVIEW_REQUIRED Run globally precedes
@@ -229,6 +256,15 @@ def test_worker_candidates_prioritize_review_required_over_older_running_run(
         assert our_ids == [review_ready.run_id, older_running.run_id]
     finally:
         with pool.connection() as connection:
+            connection.execute(
+                """
+                DELETE FROM audit_events
+                WHERE run_id IN (
+                    SELECT id FROM runs WHERE pile_id = %s::uuid
+                )
+                """,
+                (second_pile_id,),
+            )
             connection.execute("DELETE FROM runs WHERE pile_id = %s::uuid", (second_pile_id,))
             connection.execute("DELETE FROM piles WHERE id = %s::uuid", (second_pile_id,))
             connection.commit()
@@ -279,6 +315,22 @@ def test_worker_candidates_exclude_review_required_run_waiting_on_finding_decisi
             connection.commit()
 
 
+def test_worker_candidates_exclude_zero_finding_initial_until_review_acknowledged(
+    pile_id: str,
+) -> None:
+    review_waiting = create_run(pile_id, run_type=RunType.INITIAL)
+
+    with pool.connection() as connection:
+        runs = RunRepository(connection)
+        runs.update_status(review_waiting.run_id, RunStatus.RUNNING)
+        runs.update_status(review_waiting.run_id, RunStatus.REVIEW_REQUIRED)
+        connection.commit()
+
+        candidates = runs.list_worker_candidates(limit=100_000)
+
+    assert review_waiting.run_id not in {candidate.run_id for candidate in candidates}
+
+
 def test_worker_candidates_include_review_required_initial_when_review_is_complete(
     pile_id: str,
 ) -> None:
@@ -288,6 +340,7 @@ def test_worker_candidates_include_review_required_initial_when_review_is_comple
         runs = RunRepository(connection)
         runs.update_status(review_ready.run_id, RunStatus.RUNNING)
         runs.update_status(review_ready.run_id, RunStatus.REVIEW_REQUIRED)
+        _acknowledge_zero_finding_review(connection, review_ready.run_id)
         connection.commit()
 
         candidates = runs.list_worker_candidates(limit=100_000)
@@ -366,6 +419,7 @@ def test_worker_candidates_interleave_statuses_so_review_backlog_does_not_starve
                 runs = RunRepository(connection)
                 runs.update_status(review_run.run_id, RunStatus.RUNNING)
                 runs.update_status(review_run.run_id, RunStatus.REVIEW_REQUIRED)
+                _acknowledge_zero_finding_review(connection, review_run.run_id)
                 connection.execute(
                     """
                     UPDATE runs
@@ -415,6 +469,15 @@ def test_worker_candidates_interleave_statuses_so_review_backlog_does_not_starve
     finally:
         with pool.connection() as connection:
             for created_pile_id in created_pile_ids:
+                connection.execute(
+                    """
+                    DELETE FROM audit_events
+                    WHERE run_id IN (
+                        SELECT id FROM runs WHERE pile_id = %s::uuid
+                    )
+                    """,
+                    (created_pile_id,),
+                )
                 connection.execute(
                     "DELETE FROM runs WHERE pile_id = %s::uuid",
                     (created_pile_id,),

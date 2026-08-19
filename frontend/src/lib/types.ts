@@ -217,6 +217,15 @@ export type UpdateChangeSet = {
   decision: UpdateReviewDecision | null;
 };
 
+
+export type RunReviewAcknowledgement = {
+  audit_event_id: string;
+  actor_type: string;
+  actor_id: string;
+  idempotency_key: string;
+  acknowledged_at: string;
+};
+
 export type RunReview = {
   run_id: string;
   run_type: Run["run_type"];
@@ -224,6 +233,7 @@ export type RunReview = {
   findings: ReviewFinding[];
   finding_review_complete: boolean;
   update_change_set: UpdateChangeSet | null;
+  run_review_acknowledgement: RunReviewAcknowledgement | null;
   review_complete: boolean;
   commit_ready: boolean;
 };

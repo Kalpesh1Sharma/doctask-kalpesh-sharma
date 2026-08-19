@@ -10,6 +10,7 @@ from api.application.external_advance_run_service import ExternalHumanReviewRequ
 from api.application.external_update_review_service import ExternalUpdateReviewStaleError
 from api.application.review_decision_service import RunNotReviewableError
 from api.rest.dependencies import (
+    get_acknowledge_run_review_service,
     get_external_advance_run_service,
     get_external_review_query_service,
     get_external_update_review_service,
@@ -149,6 +150,7 @@ class _ReviewQuery:
             findings=(finding,),
             finding_review_complete=True,
             update_change_set=change_set,
+            run_review_acknowledgement=None,
             review_complete=True,
             commit_ready=True,
         )
@@ -173,6 +175,22 @@ class _ReviewQuery:
             render_input_fingerprint=_FINGERPRINT,
             focused_update={"baseline_run_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
         )
+
+
+
+
+class _RunReviewAcknowledgement:
+    command = None
+
+    def record(self, command):
+        self.command = command
+        event = SimpleNamespace(
+            audit_event_id="99999999-9999-4999-8999-999999999999",
+            actor_type=command.actor_type,
+            actor_id=command.actor_id,
+            created_at=_NOW,
+        )
+        return SimpleNamespace(audit_event=event, replayed=False)
 
 
 class _FindingReview:
@@ -423,3 +441,24 @@ def test_update_decision_can_target_one_material_fact_item() -> None:
     assert response.json()["item_kind"] == "FACT_CREATED"
     assert response.json()["review_complete"] is False
     assert service.command.fact_id == _FINDING_ID
+
+
+def test_zero_finding_review_acknowledgement_is_explicit_rest_operation() -> None:
+    service = _RunReviewAcknowledgement()
+    app = _app({get_acknowledge_run_review_service: service})
+    key = f"run-review:{_RUN_ID}:zero-findings"
+
+    with TestClient(app) as client:
+        response = client.post(
+            f"/api/v1/runs/{_RUN_ID}/review/acknowledgement",
+            json={
+                "actor_type": "HUMAN",
+                "actor_id": "reviewer@example.test",
+                "idempotency_key": key,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["idempotency_key"] == key
+    assert response.json()["replayed"] is False
+    assert service.command.run_id == _RUN_ID

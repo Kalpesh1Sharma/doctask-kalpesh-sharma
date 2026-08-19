@@ -6,6 +6,10 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Response
 
+from api.application.acknowledge_run_review_service import (
+    AcknowledgeRunReviewService,
+    RunReviewAcknowledgementCommand,
+)
 from api.application.external_review_query_service import ExternalReviewQueryService
 from api.application.external_update_review_service import (
     ExternalUpdateReviewCommand,
@@ -16,6 +20,7 @@ from api.application.review_decision_service import (
     ReviewDecisionService,
 )
 from api.rest.dependencies import (
+    get_acknowledge_run_review_service,
     get_external_review_query_service,
     get_external_update_review_service,
     get_review_decision_service,
@@ -27,6 +32,9 @@ from api.rest.schemas.review import (
     FindingDecisionResponse,
     ReviewDecisionResponse,
     ReviewFindingResponse,
+    RunReviewAcknowledgementRequest,
+    RunReviewAcknowledgementResponse,
+    RunReviewAcknowledgementState,
     RunReviewResponse,
     UpdateChangeItemResponse,
     UpdateChangeSetResponse,
@@ -50,6 +58,10 @@ ReviewDecisionDependency = Annotated[
 UpdateReviewDependency = Annotated[
     ExternalUpdateReviewService,
     Depends(get_external_update_review_service),
+]
+RunReviewAcknowledgementDependency = Annotated[
+    AcknowledgeRunReviewService,
+    Depends(get_acknowledge_run_review_service),
 ]
 
 
@@ -134,6 +146,12 @@ def _review_response(item: object) -> RunReviewResponse:
             decision=update_decision,
         )
 
+    acknowledgement_item = getattr(item, "run_review_acknowledgement", None)
+    acknowledgement = (
+        RunReviewAcknowledgementState.model_validate(acknowledgement_item.__dict__)
+        if acknowledgement_item is not None
+        else None
+    )
     return RunReviewResponse(
         run_id=item.run_id,
         run_type=item.run_type,
@@ -141,6 +159,7 @@ def _review_response(item: object) -> RunReviewResponse:
         findings=findings,
         finding_review_complete=item.finding_review_complete,
         update_change_set=update_change_set,
+        run_review_acknowledgement=acknowledgement,
         review_complete=item.review_complete,
         commit_ready=item.commit_ready,
     )
@@ -149,6 +168,36 @@ def _review_response(item: object) -> RunReviewResponse:
 @router.get("/runs/{run_id}/review", response_model=RunReviewResponse)
 def get_run_review(run_id: str, service: ReviewQueryDependency) -> RunReviewResponse:
     return _review_response(service.get_review(run_id))
+
+
+
+
+@router.post(
+    "/runs/{run_id}/review/acknowledgement",
+    response_model=RunReviewAcknowledgementResponse,
+)
+def acknowledge_run_review(
+    run_id: str,
+    payload: RunReviewAcknowledgementRequest,
+    service: RunReviewAcknowledgementDependency,
+) -> RunReviewAcknowledgementResponse:
+    result = service.record(
+        RunReviewAcknowledgementCommand(
+            run_id=run_id,
+            actor_type=payload.actor_type,
+            actor_id=payload.actor_id,
+            idempotency_key=payload.idempotency_key,
+        ),
+    )
+    event = result.audit_event
+    return RunReviewAcknowledgementResponse(
+        audit_event_id=event.audit_event_id,
+        actor_type=event.actor_type,
+        actor_id=event.actor_id,
+        idempotency_key=payload.idempotency_key,
+        acknowledged_at=event.created_at,
+        replayed=result.replayed,
+    )
 
 
 @router.post(

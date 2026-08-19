@@ -113,6 +113,16 @@ export const api = {
       })
     }),
 
+  acknowledgeRunReview: (runId: string, actorId: string) =>
+    request(`/api/v1/runs/${runId}/review/acknowledgement`, {
+      method: "POST",
+      body: JSON.stringify({
+        actor_type: "HUMAN",
+        actor_id: actorId,
+        idempotency_key: `run-review:${runId}:zero-findings`
+      })
+    }),
+
   reviewFinding: (
     runId: string,
     findingId: string,

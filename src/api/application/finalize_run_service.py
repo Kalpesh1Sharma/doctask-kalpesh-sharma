@@ -6,6 +6,7 @@ from psycopg import Connection
 from psycopg.errors import DeadlockDetected, SerializationFailure
 from psycopg_pool import ConnectionPool
 
+from api.application.acknowledge_run_review_service import find_run_review_acknowledgement
 from api.application.build_update_change_set_service import (
     build_current_update_change_set_manifest,
 )
@@ -15,13 +16,14 @@ from domain.render_input import (
     render_input_fingerprint,
 )
 from domain.review_state import ReviewStateMembership, build_review_state_snapshot
-from domain.run import RunStatus, RunType
+from domain.run import RunStage, RunStatus, RunStepStatus, RunType
 from domain.update_review import UpdateReviewDecisionType, update_change_set_fingerprint
 from repositories.audit_event_repository import AuditEventRecord, AuditEventRepository
 from repositories.output_repository import OutputRecord, OutputRepository
 from repositories.render_input_repository import RenderInputRepository
 from repositories.run_finding_repository import RunFindingRepository
 from repositories.run_repository import RunRecord, RunRepository
+from repositories.run_step_repository import RunStepRepository
 from repositories.update_change_item_repository import UpdateChangeItemRepository
 from repositories.update_change_set_repository import UpdateChangeSetRepository
 from repositories.update_item_review_decision_repository import UpdateItemReviewDecisionRepository
@@ -291,6 +293,23 @@ class FinalizeRunService:
         )
         if not review_state.is_complete:
             raise ReviewIncompleteError("run has pending finding memberships")
+        run = RunRepository(connection).get_by_id(run_id)
+        if run is None:
+            raise FinalizeRunNotFoundError(f"run {run_id} does not exist")
+        completed_review_stage = any(
+            step.stage is RunStage.REVIEW and step.status is RunStepStatus.COMPLETED
+            for step in RunStepRepository(connection).list_for_run(run_id)
+        )
+        if (
+            run.status is RunStatus.REVIEW_REQUIRED
+            and run.run_type is RunType.INITIAL
+            and not review_state_records
+            and completed_review_stage
+            and find_run_review_acknowledgement(connection, run_id) is None
+        ):
+            raise ReviewIncompleteError(
+                "zero-finding run requires explicit human review acknowledgement",
+            )
         source_record = RenderInputRepository(connection).load_for_run(run_id, review_state)
         if source_record.rule_scope is None:
             raise MissingRunRuleScopeError("run has no closed rule scope")
